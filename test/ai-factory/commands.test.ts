@@ -544,6 +544,26 @@ describe("AI Factory — /factory-status compactness", () => {
     expect(text).toContain("Run: factory_metrics");
     expect(text).toMatch(/Total\s+2/);
     expect(text).toMatch(/Input\s+100/);
+    expect(text).toContain("p/lead"); // canonical identity, from the role aggregate
     expect(b.spawns).toHaveLength(0);
+  });
+
+  it("E-metrics. /factory-metrics performs no model call", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const state = completedState(cwd, "factory_metrics_ro", "s");
+    state.metrics.roles.lead.attempts = 1;
+    state.metrics.roles.lead.modelId = "opencode-go/deepseek-v4.1-flash";
+    store.save(state);
+
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-metrics").handler("factory_metrics_ro", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory metrics"))?.message ?? "";
+    expect(text).toContain("opencode-go/deepseek-v4.1-flash");
+    expect(b.spawns).toHaveLength(0);
+    expect(b.emitted).not.toContain("subagents:rpc:spawn");
   });
 });

@@ -143,6 +143,14 @@ export function appendCallMetric(
 /* Run metrics report                                                        */
 /* -------------------------------------------------------------------------- */
 
+/** One settled call's model identity, in call order. */
+export interface CallModelEntry {
+  phase: string;
+  /** Canonical model identity (`modelId`, else target, else display name). */
+  model?: string;
+  ok: boolean;
+}
+
 /** Per-role aggregate for `/factory-metrics`, derived from per-call records. */
 export interface RoleCallSummary {
   role: RoleName;
@@ -150,8 +158,17 @@ export interface RoleCallSummary {
   calls: number;
   /** Settled calls that actually reported usage. */
   usageCalls: number;
+  /** Canonical model identity: `modelId`, else target, else display name. */
   model?: string;
   target?: string;
+  /** Ordered per-call model identities (calls-based runs only). */
+  callModels: CallModelEntry[];
+  /** Ordered configured targets attempted (persisted role aggregate). */
+  targetsAttempted: string[];
+  /** Transient retries on the same target. */
+  retries: number;
+  /** Advances to a fallback target. */
+  fallbacks: number;
   input?: number;
   output?: number;
   cacheRead?: number;
@@ -160,6 +177,20 @@ export interface RoleCallSummary {
   cost?: number;
   durationMs?: number;
   toolUses?: number;
+}
+
+/** Canonical identity for a call, preferring the resolved id over the display name. */
+function callModel(call: CallMetric): string | undefined {
+  return call.modelId ?? call.target ?? call.modelName;
+}
+
+/**
+ * Whether a role's calls should be listed individually. A single aggregate row
+ * is enough when every call used the same model with no retries or fallbacks.
+ */
+function needsModelSequence(role: RoleCallSummary): boolean {
+  const distinct = new Set(role.callModels.map((c) => c.model).filter((m): m is string => m !== undefined));
+  return distinct.size > 1 || role.retries > 0 || role.fallbacks > 0 || role.targetsAttempted.length > 1;
 }
 
 export interface RunMetricsSummary {
@@ -229,12 +260,24 @@ export function buildRunMetrics(state: FactoryRunState): RunMetricsSummary {
       role,
       calls: roleMetrics.attempts,
       usageCalls: roleCalls.filter((c) => c.input !== undefined || c.output !== undefined).length,
+      callModels: roleCalls.map((c) => {
+        const model = callModel(c);
+        return { phase: c.phase, ok: c.ok, ...(model !== undefined ? { model } : {}) };
+      }),
+      targetsAttempted: [...roleMetrics.targetsAttempted],
+      retries: roleMetrics.retries,
+      fallbacks: roleMetrics.fallbacks,
     };
-    let model: CallMetric | undefined;
+    // Canonical model identity: prefer the resolved id over the display name.
+    // Calls-based runs use the last settled call; a legacy run falls back to
+    // the persisted role aggregate.
+    let model: string | undefined;
     for (const c of roleCalls) {
-      if (c.modelName || c.modelId || c.target) model = c;
+      const canonical = callModel(c);
+      if (canonical !== undefined) model = canonical;
     }
-    if (model) summary.model = model.modelName ?? model.modelId ?? model.target;
+    if (model === undefined) model = roleMetrics.modelId ?? roleMetrics.targetUsed ?? roleMetrics.modelName;
+    if (model !== undefined) summary.model = model;
     if (roleMetrics.targetUsed !== undefined) summary.target = roleMetrics.targetUsed;
 
     if (legacyTelemetry) {
@@ -298,9 +341,6 @@ export function buildRunMetrics(state: FactoryRunState): RunMetricsSummary {
   totals.durationMs = metrics.runDurationMs ?? totalSums.durationMs;
   if (!legacyTelemetry && !anyUsage) {
     notes.push("No call reported usage; token and cost figures are unavailable (n/a).");
-  }
-  if (legacyTelemetry) {
-    notes.push("Per-call telemetry is unavailable for this run; token/cost figures reflect the last reported call per role, not totals.");
   }
 
   // Request context ≈ full prompt: uncached input + cache read + cache write.
@@ -373,13 +413,40 @@ export function formatDuration(ms: number): string {
  */
 export function formatRunMetrics(state: FactoryRunState): string {
   const m = buildRunMetrics(state);
-  const lines: string[] = ["Factory metrics", `Run: ${m.runId}`, `State: ${m.state}`, ""];
+  const lines: string[] = ["Factory metrics", `Run: ${m.runId}`, `State: ${m.state}`];
+  if (m.legacyTelemetry) {
+    // Make the degraded mode impossible to miss: these figures are the last
+    // reported call per role, not totals.
+    lines.push("");
+    lines.push("Telemetry mode: legacy role aggregates");
+    lines.push("Model shown: last reported model per role");
+    lines.push("Token/cost figures may not equal true run totals");
+  }
+  lines.push("");
 
   const invoked = m.roles.filter((r) => r.calls > 0 || r.usageCalls > 0);
   lines.push("Calls");
-  for (const r of invoked) lines.push(`  ${pad(r.role, 12)} ${r.calls}`);
+  for (const r of invoked) lines.push(`  ${pad(r.role, 12)} ${r.calls}   ${r.model ?? "n/a"}`);
   lines.push(`  ${pad("Total", 12)} ${m.totals.calls}`);
   lines.push("");
+
+  // Per-call model sequence, shown only where the aggregate row would hide a
+  // model change or a recovery (retries, fallbacks, or more than one target).
+  const sequenced = invoked.filter((r) => needsModelSequence(r));
+  if (sequenced.length > 0) {
+    lines.push("Model sequence");
+    for (const r of sequenced) {
+      const tags: string[] = [];
+      if (r.retries > 0) tags.push(`retries: ${r.retries}`);
+      if (r.fallbacks > 0) tags.push(`fallbacks: ${r.fallbacks}`);
+      lines.push(`  ${r.role}${tags.length > 0 ? ` (${tags.join(", ")})` : ""}`);
+      if (r.targetsAttempted.length > 1) lines.push(`    targets: ${r.targetsAttempted.join(" -> ")}`);
+      for (const c of r.callModels) {
+        lines.push(`    ${pad(c.phase, 24)} ${c.model ?? "n/a"}${c.ok ? "" : " [failed]"}`);
+      }
+    }
+    lines.push("");
+  }
 
   lines.push("Tokens");
   const tokenLines: string[] = [];
