@@ -22,7 +22,13 @@ import type { FactoryController } from "./controller.js";
 import { formatDuration, formatRunMetrics } from "./metrics.js";
 import { isTerminal } from "./state.js";
 import { FACTORY_DIR } from "./store.js";
-import { type FactoryRunState, ROLE_NAMES, type RoleName } from "./types.js";
+import {
+  type ArchitectFinalResult,
+  type FactoryRunState,
+  type LeadIntegrationPacket,
+  ROLE_NAMES,
+  type RoleName,
+} from "./types.js";
 
 export interface FactoryRunListItem {
   runId: string;
@@ -118,25 +124,127 @@ function section(lines: string[], title: string, items: string[]): void {
   for (const item of items) lines.push(`- ${item}`);
 }
 
-/** Body used when a run predates the final Lead synthesis. */
-function legacyReportBody(state: FactoryRunState): string {
-  const accepted = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+/**
+ * A legacy view: the authoritative result/source for the header plus the body.
+ * Used only when `results.finalReport` is absent (the run predates the final
+ * Lead synthesis).
+ */
+interface LegacyReportView {
+  result: string;
+  source: string;
+  body: string[];
+}
+
+/** The Architect gate that actually accepted the run, if any. A recheck always
+ * outranks the initial final gate because it is the later decision. */
+interface AcceptedGate {
+  packet: ArchitectFinalResult;
+  label: "Final Architect recheck" | "Final Architect";
+}
+
+function acceptedGate(state: FactoryRunState): AcceptedGate | undefined {
+  const recheck = state.results.finalRecheck?.packet;
+  if (recheck?.verdict === "ACCEPT") return { packet: recheck, label: "Final Architect recheck" };
+  const finalGate = state.results.finalArchitect?.packet;
+  if (finalGate?.verdict === "ACCEPT") return { packet: finalGate, label: "Final Architect" };
+  return undefined;
+}
+
+/** Short history for a run accepted only after remediation. Empty when no
+ * remediation cycle is recorded. The pre-remediation integration is NOT
+ * accepted, and is never rendered as the final outcome. */
+function remediationHistory(state: FactoryRunState): string[] {
+  const recheck = state.results.finalRecheck?.packet;
+  const remediation = state.results.remediation;
+  if (!recheck && !remediation) return [];
+  const lines = ["Remediation history"];
+  if (state.results.integration) lines.push("- Initial integration: NOT ACCEPTED");
+  if (remediation) {
+    lines.push("- Remediation completed");
+    if (remediation.reviewer) lines.push(`- Reviewer: ${remediation.reviewer.packet.verdict}`);
+  }
+  if (recheck) lines.push(`- Final Architect recheck: ${recheck.verdict}`);
+  return lines;
+}
+
+/** Concise rendering of the accepted Architect gate packet. */
+function renderGateEvidence(gate: AcceptedGate): string[] {
+  const lines = ["Final accepted evidence", `${gate.label}: ${gate.packet.verdict}`];
+  for (const issue of gate.packet.blockingIssues) lines.push(`- Blocking issue: ${issue}`);
+  for (const change of gate.packet.requiredChanges) lines.push(`- Required change: ${change}`);
+  for (const item of gate.packet.doNotChange) lines.push(`- Do not change: ${item}`);
+  for (const item of gate.packet.requiredEvidence) lines.push(`- Required evidence: ${item}`);
+  return lines;
+}
+
+/** An integration artifact treated as accepted only when no gate rejected it. */
+function renderAcceptedIntegration(integration: LeadIntegrationPacket): string[] {
+  const lines = ["Final accepted evidence", "Accepted integration"];
+  lines.push(`- System verification: ${integration.systemVerification}`);
+  lines.push(`- Factual assessment: ${integration.factualAssessment}`);
+  for (const finding of integration.reviewerFindingsUnresolved) lines.push(`- Unresolved reviewer finding: ${finding}`);
+  return lines;
+}
+
+/** No accepted final artifact: show the latest result and label it rejected. */
+function renderUnacceptedEvidence(state: FactoryRunState): string[] {
   const integration = state.results.integration?.packet;
-  const lines: string[] = [];
+  const finalGate = state.results.finalArchitect?.packet;
+  const lines = [`Run state: ${state.state}`, "No accepted final artifact exists for this run."];
   if (integration) {
-    lines.push("Accepted integration (preserved):");
+    lines.push("");
+    lines.push("Latest integration (NOT accepted)");
     lines.push(`- System verification: ${integration.systemVerification}`);
     lines.push(`- Factual assessment: ${integration.factualAssessment}`);
     for (const finding of integration.reviewerFindingsUnresolved) lines.push(`- Unresolved reviewer finding: ${finding}`);
   }
-  if (accepted) {
-    if (lines.length > 0) lines.push("");
-    const gate = state.results.finalRecheck ? "recheck" : "final gate";
-    lines.push(`Final Architect verdict (${gate}): ${accepted.verdict}`);
-    for (const change of accepted.requiredChanges) lines.push(`- Required change: ${change}`);
+  if (finalGate) {
+    lines.push("");
+    lines.push(`Final Architect verdict: ${finalGate.verdict}`);
+    for (const issue of finalGate.blockingIssues) lines.push(`- Blocking issue: ${issue}`);
+    for (const change of finalGate.requiredChanges) lines.push(`- Required change: ${change}`);
   }
-  if (lines.length === 0) lines.push("No accepted artifact is available for this run.");
-  return lines.join("\n");
+  return lines;
+}
+
+/**
+ * Legacy fallback precedence:
+ *   1. a final recheck/final-Architect ACCEPT is authoritative (later packet
+ *      wins, and the pre-remediation integration is only history);
+ *   2. otherwise a `DONE` run with an integration artifact uses that artifact;
+ *   3. otherwise the run has no accepted artifact and is labelled rejected.
+ */
+function legacyReportView(state: FactoryRunState): LegacyReportView {
+  const gate = acceptedGate(state);
+  if (gate) {
+    const body: string[] = [];
+    const history = remediationHistory(state);
+    if (history.length > 0) {
+      body.push(...history);
+      body.push("");
+    }
+    body.push(...renderGateEvidence(gate));
+    if (state.results.finalRecheck) {
+      body.push("");
+      body.push("No post-remediation Lead synthesis exists for this historical run.");
+    }
+    return { result: gate.packet.verdict, source: `LEGACY FALLBACK — ${gate.label}`, body };
+  }
+
+  const integration = state.results.integration?.packet;
+  if (integration && state.state === "DONE") {
+    return {
+      result: "ACCEPT",
+      source: "LEGACY FALLBACK — accepted integration",
+      body: renderAcceptedIntegration(integration),
+    };
+  }
+
+  return {
+    result: "NOT ACCEPTED",
+    source: "LEGACY FALLBACK — no accepted final artifact",
+    body: renderUnacceptedEvidence(state),
+  };
 }
 
 /**
@@ -149,11 +257,13 @@ function legacyReportBody(state: FactoryRunState): string {
  */
 export function formatFactoryReport(state: FactoryRunState): string {
   const finalReport = state.results.finalReport?.packet;
+  const legacy = finalReport ? undefined : legacyReportView(state);
   const lines: string[] = ["Factory final report", `Run: ${state.runId}`];
   if (finalReport) {
     lines.push(`Result: ${finalReport.result}`);
   } else {
-    lines.push("Result: (LEGACY FALLBACK — this run has no final Lead synthesis recorded)");
+    lines.push(`Result: ${legacy!.result}`);
+    lines.push(`Source: ${legacy!.source}`);
   }
   if (state.metrics.runDurationMs !== undefined) lines.push(`Duration: ${formatDuration(state.metrics.runDurationMs)}`);
   lines.push(`Remediation rounds: ${state.remediationRounds}`);
@@ -173,7 +283,7 @@ export function formatFactoryReport(state: FactoryRunState): string {
     section(lines, "Warnings / limitations", finalReport.warnings);
   } else {
     lines.push("");
-    lines.push(legacyReportBody(state));
+    lines.push(...legacy!.body);
   }
   lines.push("");
   lines.push(`Full report persisted: ${FACTORY_DIR}/${state.runId}.json`);

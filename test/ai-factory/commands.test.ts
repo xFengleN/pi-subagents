@@ -383,15 +383,29 @@ describe("AI Factory — /factory-report", () => {
     expect(b.spawns).toHaveLength(0);
   });
 
-  it("G. legacy run without finalReport falls back to the finalRecheck packet", async () => {
+  it("G. legacy remediation run uses the ACCEPT recheck, not the stale integration", async () => {
     const cwd = workdir();
     const store = new FactoryStore(cwd);
-    store.save(completedState(cwd, "factory_legacy", "", {
+    // `factory_mu7ct43l_Vqof08` shape: integration produced BEFORE remediation
+    // (explicitly not accepted), then a later recheck ACCEPT. No finalReport.
+    const staleIntegration = {
+      ...packets.integration,
+      systemVerification: "pre-remediation checks failed",
+      factualAssessment: "NOT ACCEPTED - remediation required",
+    };
+    store.save(completedState(cwd, "factory_mu7ct43l_Vqof08", "", {
+      remediationRounds: 1,
+      metrics: { ...emptyFactoryMetrics(1_000), runEndedAt: 2_000, runDurationMs: 1_777_000 },
       results: {
-        engineers: [],
+        engineers: [{ round: 0, outcome: { packet: packets.engineer, agentId: "e0" } }],
         reviewers: [],
-        integration: { packet: packets.integration, agentId: "i" },
-        finalRecheck: { packet: packets.accept, agentId: "r" },
+        integration: { packet: staleIntegration, agentId: "i" },
+        finalArchitect: { packet: packets.remediate, agentId: "fa" },
+        remediation: {
+          engineer: { packet: packets.engineer, agentId: "re" },
+          reviewer: { packet: packets.reviewerPass, agentId: "rr" },
+        },
+        finalRecheck: { packet: packets.accept, agentId: "fr" },
       },
     }));
     const b = await boot(cwd);
@@ -400,9 +414,71 @@ describe("AI Factory — /factory-report", () => {
     await b.commands.get("factory-report").handler("", ctx);
 
     const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
-    expect(text).toContain("LEGACY FALLBACK");
-    expect(text).toContain("Final Architect verdict (recheck): ACCEPT");
-    expect(text).toContain("npm test green"); // the preserved integration packet
+    // The later ACCEPT is authoritative; the stale rejection is only history.
+    expect(text).toContain("Result: ACCEPT");
+    expect(text).toContain("Source: LEGACY FALLBACK — Final Architect recheck");
+    expect(text).toContain("Duration: 29m 37s");
+    expect(text).toContain("Remediation rounds: 1");
+    expect(text).toContain("Remediation history");
+    expect(text).toContain("- Initial integration: NOT ACCEPTED");
+    expect(text).toContain("- Reviewer: PASS");
+    expect(text).toContain("- Final Architect recheck: ACCEPT");
+    expect(text).toContain("Final accepted evidence");
+    expect(text).toContain("No post-remediation Lead synthesis exists for this historical run.");
+    // Terminology guard: the stale integration must never read as accepted.
+    expect(text).not.toContain("Accepted integration");
+    expect(text).not.toContain("NOT ACCEPTED - remediation required");
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("G2. a legacy run accepted at the initial final gate uses that gate", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_legacy_gate", "", {
+      results: {
+        engineers: [],
+        reviewers: [],
+        integration: { packet: packets.integration, agentId: "i" },
+        finalArchitect: { packet: packets.accept, agentId: "fa" },
+      },
+    }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-report").handler("", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("Result: ACCEPT");
+    expect(text).toContain("Source: LEGACY FALLBACK — Final Architect");
+    expect(text).toContain("Final Architect: ACCEPT");
+    expect(text).not.toContain("Remediation history");
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("G3. a legacy run with no accepted artifact is labelled rejected", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_legacy_rejected", "", {
+      state: "STOPPED",
+      results: {
+        engineers: [],
+        reviewers: [],
+        integration: { packet: packets.integration, agentId: "i" },
+        finalArchitect: { packet: packets.remediate, agentId: "fa" },
+      },
+    }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    // Explicit id: a STOPPED run is not a "latest completed" run, but asking for
+    // it must still render the rejected result honestly.
+    await b.commands.get("factory-report").handler("factory_legacy_rejected", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("Result: NOT ACCEPTED");
+    expect(text).toContain("Source: LEGACY FALLBACK — no accepted final artifact");
+    expect(text).toContain("Latest integration (NOT accepted)");
+    expect(text).not.toContain("Accepted integration");
     expect(b.spawns).toHaveLength(0);
   });
 });
