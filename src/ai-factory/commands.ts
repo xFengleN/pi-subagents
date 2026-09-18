@@ -8,9 +8,16 @@
  * starts a run (which then spawns role agents through the existing controller).
  */
 
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  getSelectListTheme,
+  getSettingsListTheme,
+} from "@earendil-works/pi-coding-agent";
+import { Container, getKeybindings, Input, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { loadFactoryConfig, validateFactoryConfig } from "./config.js";
-import { type ConfigUI, showFactoryConfigUI } from "./config-ui.js";
+import { type ConfigUI, filterModels, type MenuRow, type ModelOption, showFactoryConfigUI } from "./config-ui.js";
 import type { FactoryController } from "./controller.js";
 import { isTerminal } from "./state.js";
 import { type FactoryRunState, ROLE_NAMES, type RoleName } from "./types.js";
@@ -147,9 +154,11 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
         ctx.ui.notify("/factory-config needs the interactive UI.", "error");
         return;
       }
+      const modelOptions = modelOptionsFrom(ctx);
       await showFactoryConfigUI(commandUIContext(ctx), {
         cwd: ctx.cwd,
-        models: availableModels(ctx),
+        models: modelOptions.map((m) => m.value),
+        modelOptions,
         ...(ctx.model ? { chatModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
         // Explicit-only: called solely from the "Pi chat model" submenu. Never on
         // preset activation, so Factory presets cannot silently change the chat model.
@@ -162,10 +171,132 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
   });
 }
 
-/** Adapt Pi's `ctx.ui` dialog surface to the config UI's minimal interface. */
+/** Searchable model options from Pi's registry (canonical value + search text). */
+function modelOptionsFrom(ctx: ExtensionContext): ModelOption[] {
+  try {
+    return ctx.modelRegistry.getAvailable().map((m) => ({
+      value: `${m.provider}/${m.id}`,
+      label: `${m.provider}/${m.id}`,
+      ...(m.name && m.name !== m.id ? { description: m.name } : {}),
+      search: `${m.provider} ${m.id} ${m.name ?? ""}`,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Render a menu with Pi's `SettingsList` — it wraps around natively (down on the
+ * last row goes to the first, and vice versa) and gives label/value columns for
+ * compact section grouping. Informational rows carry no `values`, so Enter on
+ * them is a no-op.
+ */
+async function showMenu(ctx: ExtensionCommandContext, title: string, rows: MenuRow[]): Promise<string | undefined> {
+  const items: SettingItem[] = rows.map((row) => ({
+    id: row.id,
+    label: row.label,
+    currentValue: row.value ?? "",
+    ...(row.description ? { description: row.description } : {}),
+    ...(row.info ? {} : { values: [""] }),
+  }));
+  return await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+    const list = new SettingsList(
+      items,
+      Math.min(Math.max(items.length, 1), 14),
+      getSettingsListTheme(),
+      (id) => done(id),
+      () => done(undefined),
+    );
+    const container = new Container();
+    container.addChild(new Text(title, 0, 0));
+    container.addChild(new Spacer(1));
+    container.addChild(list);
+    return {
+      render: (width: number) => container.render(width),
+      invalidate: () => container.invalidate(),
+      handleInput: (data: string) => list.handleInput?.(data),
+    };
+  });
+}
+
+/**
+ * Searchable model picker: a thin glue over Pi's public primitives — `Input`,
+ * `SelectList` (native wrap-around) and `fuzzyFilter`. Pi's own
+ * `ModelSelectorComponent` is not reusable from an extension (its constructor
+ * needs a `SettingsManager` and `ModelRuntime` the public context does not
+ * expose), so this reuses the same building blocks instead.
+ */
+async function showModelPicker(
+  ctx: ExtensionCommandContext,
+  title: string,
+  models: ModelOption[],
+  current?: string,
+): Promise<string | undefined> {
+  return await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+    const input = new Input();
+    const listHost = new Container();
+    const container = new Container();
+    container.addChild(new Text(title, 0, 0));
+    container.addChild(new Spacer(1));
+    container.addChild(input);
+    container.addChild(new Spacer(1));
+    container.addChild(listHost);
+    let list: SelectList | undefined;
+
+    const rebuild = (): void => {
+      const matched = filterModels(models, input.getValue());
+      list = new SelectList(
+        matched.map((m) => ({ value: m.value, label: m.label, description: m.description })),
+        Math.min(Math.max(matched.length, 1), 12),
+        getSelectListTheme(),
+      );
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(undefined);
+      const index = matched.findIndex((m) => m.value === current);
+      if (index >= 0) list.setSelectedIndex(index);
+      listHost.clear();
+      listHost.addChild(list);
+    };
+    rebuild();
+
+    const kb = getKeybindings();
+    return {
+      get focused(): boolean {
+        return input.focused;
+      },
+      set focused(value: boolean) {
+        input.focused = value;
+      },
+      render: (width: number) => container.render(width),
+      invalidate: () => container.invalidate(),
+      handleInput: (data: string) => {
+        if (!list) return;
+        if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
+          list.handleInput(data);
+          return;
+        }
+        if (kb.matches(data, "tui.select.confirm")) {
+          const item = list.getSelectedItem();
+          if (item) done(item.value);
+          return;
+        }
+        if (kb.matches(data, "tui.select.cancel")) {
+          done(undefined);
+          return;
+        }
+        const before = input.getValue();
+        input.handleInput(data);
+        if (input.getValue() !== before) rebuild();
+      },
+    };
+  });
+}
+
+/** Adapt Pi's `ctx.ui` surface to the config UI, including wrapping menus. */
 function commandUIContext(ctx: ExtensionCommandContext): ConfigUI {
   return {
-    select: (title, options) => ctx.ui.select(title, options),
+    menu: (title, rows) => showMenu(ctx, title, rows),
+    pickModel: (title, models, current) => showModelPicker(ctx, title, models, current),
     input: (title, placeholder) => ctx.ui.input(title, placeholder),
     confirm: (title, message) => ctx.ui.confirm(title, message),
     notify: (message, type) => ctx.ui.notify(message, type),

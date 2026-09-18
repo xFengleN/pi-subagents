@@ -135,6 +135,23 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
 | `/factory-config` | Interactive menu: per-role primary/fallback models (chosen from Pi's available-model registry), transient retries/delay/max-turns, limits, and preset management. |
 
+The config menus render on Pi's `SettingsList`, so navigation **wraps** (down on
+the last row goes to the first, up on the first goes to the last). The top level
+is grouped into labelled sections (`ROLES`, `CONFIG`, `EXECUTION`, `PI CHAT`,
+`ACTIONS`) with a per-row `*` marking anything that differs from the base preset.
+Role rows are the controls: entering `Primary`/`Fallbacks`/`Retries`/`Retry
+delay`/`Max turns` edits the working config directly — there are no separate
+"set/add/remove" actions. Fallbacks open a focused screen supporting add,
+remove, and move up/down (stored order is execution priority).
+
+Model selection is a **type-to-filter picker** built on Pi's own `fuzzyFilter`
+(plus `SelectList`/`Input`), accepting forgiving fragments like `v4.1`,
+`glm 5.3`, `codex spark` or `qwen 27`; it searches provider, id and display
+name, wraps around, and writes the canonical `provider/id`. Pi's internal
+`ModelSelectorComponent` is not reusable from an extension (it requires a
+`SettingsManager` and `ModelRuntime` the public context does not expose), so the
+picker reuses the same underlying primitives.
+
 **Presets.** A preset is a complete Factory execution config stored once per
 user at `<getAgentDir()>/factory-presets.json` (thence honoring
 `PI_CODING_AGENT_DIR`, alongside pi-subagents' own `subagents.json`). The

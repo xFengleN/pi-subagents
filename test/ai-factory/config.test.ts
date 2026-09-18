@@ -1,9 +1,9 @@
 /**
- * ai-factory/config.test.ts — config resolution, project writes, presets and
- * validation (spec tests D, E, F, plus backwards compatibility).
+ * ai-factory/config.test.ts — config resolution, project writes, presets,
+ * working-copy semantics, model filtering and validation.
  *
  * All file I/O is hermetic (temp cwd + temp PI_CODING_AGENT_DIR). No model or
- * pi-subagents is involved.
+ * pi-subagents is involved; the UI is a scripted {@link ConfigUI}.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -24,7 +24,13 @@ import {
   validateFactoryConfig,
   writeProjectConfig,
 } from "../../src/ai-factory/config.js";
-import { type ConfigUI, showFactoryConfigUI } from "../../src/ai-factory/config-ui.js";
+import {
+  type ConfigUI,
+  filterModels,
+  type MenuRow,
+  type ModelOption,
+  showFactoryConfigUI,
+} from "../../src/ai-factory/config-ui.js";
 import { deletePreset, getRawPreset, listPresetNames, presetsPath, savePreset } from "../../src/ai-factory/presets.js";
 import { hermeticDir } from "../helpers/boot-extension.js";
 
@@ -44,14 +50,16 @@ interface ScriptedUI extends ConfigUI {
 }
 
 function scriptedUI(handlers: {
-  select: (title: string, options: string[]) => string | undefined;
+  menu: (title: string, rows: MenuRow[]) => string | undefined;
+  pickModel?: (title: string, models: ModelOption[]) => string | undefined;
   input?: (title: string) => string | undefined;
   confirm?: (title: string) => boolean;
 }): ScriptedUI {
   const notifications: Array<{ message: string; type?: string }> = [];
   return {
     notifications,
-    select: async (title, options) => handlers.select(title, options),
+    menu: async (title, rows) => handlers.menu(title, rows),
+    pickModel: async (title, models) => handlers.pickModel?.(title, models),
     input: async (title) => handlers.input?.(title),
     confirm: async (title) => handlers.confirm?.(title) ?? false,
     notify: (message, type) => {
@@ -59,6 +67,60 @@ function scriptedUI(handlers: {
     },
   };
 }
+
+/** Capture the top-level menu rows rendered for a project. */
+async function mainMenuRows(cwd: string, deps: Partial<Parameters<typeof showFactoryConfigUI>[1]> = {}): Promise<MenuRow[]> {
+  let seen: MenuRow[] = [];
+  const ui = scriptedUI({
+    menu: (title, rows) => {
+      if (title.startsWith("Factory configuration")) {
+        seen = rows;
+        return "done";
+      }
+      return undefined;
+    },
+  });
+  await showFactoryConfigUI(ui, { cwd, models: [], modelOptions: [], ...deps });
+  return seen;
+}
+
+const rowById = (rows: MenuRow[], id: string): MenuRow | undefined => rows.find((r) => r.id === id);
+
+/** Save a preset whose Lead points at `model` (everything else default). */
+function saveLeadPreset(name: string, model: string): void {
+  savePreset(name, mergeFactoryConfig(defaultFactoryConfig(), { roles: { lead: { targets: { primary: model } } } }));
+}
+
+const modelOption = (value: string, name = ""): ModelOption => ({
+  value,
+  label: value,
+  ...(name ? { description: name } : {}),
+  search: `${value.replace("/", " ")} ${name}`,
+});
+
+describe("AI Factory — model filtering", () => {
+  const models: ModelOption[] = [
+    modelOption("opencode-go/deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+    modelOption("opencode-go/glm-5.3", "GLM 5.3"),
+    modelOption("openai-codex/gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
+    modelOption("omlx/Qwen3.8-27B-MLX-6bit", "Qwen3.8 27B"),
+  ];
+  const values = (query: string): string[] => filterModels(models, query).map((m) => m.value);
+
+  it("A. partial fragments find the expected models", () => {
+    expect(values("v4.1")).toContain("opencode-go/deepseek-v4.1-flash");
+    expect(values("glm 5.3")).toContain("opencode-go/glm-5.3");
+    expect(values("codex spark")).toContain("openai-codex/gpt-5.3-codex-spark");
+    expect(values("qwen 27")).toContain("omlx/Qwen3.8-27B-MLX-6bit");
+    expect(values("GLM")).toContain("opencode-go/glm-5.3"); // case-insensitive
+  });
+
+  it("C. empty query returns all; no match returns none cleanly", () => {
+    expect(filterModels(models, "")).toHaveLength(models.length);
+    expect(filterModels(models, "   ")).toHaveLength(models.length);
+    expect(filterModels(models, "zzz-nope-not-a-model")).toEqual([]);
+  });
+});
 
 describe("AI Factory — config resolution and validation", () => {
   it("D. the config UI writes valid .pi/factory.json that loadFactoryConfig reflects", async () => {
@@ -68,28 +130,28 @@ describe("AI Factory — config resolution and validation", () => {
     let roleCalls = 0;
     let limitCalls = 0;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          if (main === 1) return options.find((o) => o.startsWith("Engineer "));
-          if (main === 2) return options.find((o) => o.startsWith("Limits "));
-          return "Done";
+          if (main === 1) return "role:engineer";
+          if (main === 2) return "limits";
+          return "done";
         }
         if (title === "Engineer configuration") {
           roleCalls++;
-          return roleCalls === 1 ? "Set primary model" : "Back";
+          return roleCalls === 1 ? "primary" : "back";
         }
-        if (title === "Select model for Engineer") return "p/eng";
         if (title === "Factory limits") {
           limitCalls++;
-          return limitCalls === 1 ? options.find((o) => o.startsWith("maxRepairRounds:")) : "Back";
+          return limitCalls === 1 ? "maxRepairRounds" : "back";
         }
         return undefined;
       },
+      pickModel: (title) => (title === "Select primary model" ? "p/eng" : undefined),
       input: (title) => (title === "maxRepairRounds" ? "3" : undefined),
     });
 
-    await showFactoryConfigUI(ui, { cwd, models });
+    await showFactoryConfigUI(ui, { cwd, models, modelOptions: models.map((m) => modelOption(m)) });
 
     const path = factoryConfigPath(cwd);
     expect(existsSync(path)).toBe(true);
@@ -105,6 +167,56 @@ describe("AI Factory — config resolution and validation", () => {
     expect(effective.maxRepairRounds).toBe(3);
   });
 
+  it("B(filter). a filtered selection writes the canonical provider/id", async () => {
+    const cwd = workdir();
+    const options = [
+      modelOption("opencode-go/deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+      modelOption("opencode-go/glm-5.3", "GLM 5.3"),
+    ];
+    let main = 0;
+    let roleCalls = 0;
+    const ui = scriptedUI({
+      menu: (title) => {
+        if (title.startsWith("Factory configuration")) {
+          main++;
+          return main === 1 ? "role:lead" : "done";
+        }
+        if (title === "Lead configuration") {
+          roleCalls++;
+          return roleCalls === 1 ? "primary" : "back";
+        }
+        return undefined;
+      },
+      // Choose the model a user would get by typing "v4.1".
+      pickModel: (title) => (title === "Select primary model" ? filterModels(options, "v4.1")[0]?.value : undefined),
+    });
+    await showFactoryConfigUI(ui, { cwd, models: options.map((m) => m.value), modelOptions: options });
+
+    expect(loadFactoryConfig(cwd).roles.lead.targets.primary).toBe("opencode-go/deepseek-v4.1-flash");
+  });
+
+  it("C(ui). a cancelled model selection leaves the config unchanged", async () => {
+    const cwd = workdir();
+    let main = 0;
+    let roleCalls = 0;
+    const ui = scriptedUI({
+      menu: (title) => {
+        if (title.startsWith("Factory configuration")) {
+          main++;
+          return main === 1 ? "role:lead" : "done";
+        }
+        if (title === "Lead configuration") {
+          roleCalls++;
+          return roleCalls === 1 ? "primary" : "back";
+        }
+        return undefined;
+      },
+      pickModel: () => undefined, // no match / cancelled
+    });
+    await showFactoryConfigUI(ui, { cwd, models: [], modelOptions: [] });
+    expect(readProjectConfig(cwd)?.roles).toBeUndefined();
+  });
+
   it("E. a preset resolves role models; project overrides win; clearing restores defaults", () => {
     const cwd = workdir();
     const preset = mergeFactoryConfig(defaultFactoryConfig(), {
@@ -118,15 +230,11 @@ describe("AI Factory — config resolution and validation", () => {
     expect(effective.roles.engineer.targets.primary).toBe("preset/eng");
     expect(effective.roles.engineer.targets.fallbacks).toEqual(["preset/eng2"]);
 
-    // A project override wins over the preset, and the preset's fallback survives.
     writeProjectConfig(cwd, { roles: { engineer: { targets: { primary: "project/eng" } } } });
     const overridden = loadFactoryConfig(cwd);
     expect(overridden.roles.engineer.targets.primary).toBe("project/eng");
     expect(overridden.roles.engineer.targets.fallbacks).toEqual(["preset/eng2"]);
 
-    // Clearing the preset selection falls back to built-in defaults once the
-    // project override is cleared too (preset selection and project overrides
-    // are independent).
     setProjectPreset(cwd, undefined);
     expect(projectPresetName(cwd)).toBeUndefined();
     clearProjectRole(cwd, "engineer");
@@ -139,21 +247,21 @@ describe("AI Factory — config resolution and validation", () => {
     let main = 0;
     let presetCalls = 0;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+          return main === 1 ? "presets" : "done";
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Save as new preset…" : "Back";
+          return presetCalls === 1 ? "save-new" : "back";
         }
         return undefined;
       },
       input: (title) => (title === "New preset name" ? "snap" : undefined),
     });
 
-    await showFactoryConfigUI(ui, { cwd, models: ["p/eng"] });
+    await showFactoryConfigUI(ui, { cwd, models: ["p/eng"], modelOptions: [modelOption("p/eng")] });
 
     expect(listPresetNames()).toContain("snap");
     expect(getRawPreset("snap")).toBeDefined();
@@ -167,18 +275,92 @@ describe("AI Factory — config resolution and validation", () => {
     const issues = validateFactoryConfig(loadFactoryConfig(cwd), ["p/eng"]);
     expect(issues.some((i) => i.includes("missing/model") && i.includes("not currently available"))).toBe(true);
 
-    let main = 0;
-    const ui = scriptedUI({
-      select: (title) => {
+    const ui = scriptedUI({ menu: () => "done" });
+    await showFactoryConfigUI(ui, { cwd, models: ["p/eng"], modelOptions: [modelOption("p/eng")] });
+    expect(ui.notifications.some((n) => n.type === "warning" && n.message.includes("not currently available"))).toBe(true);
+  });
+
+  it("G. Pi chat model is displayed/explained and changed only on explicit selection", async () => {
+    const cwd = workdir();
+    const models = ["p/lead", "p/eng"];
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "p/lead" } } } });
+
+    // (a) explanation + "Leave unchanged" calls nothing.
+    let mainA = 0;
+    const leftUnchanged: string[] = [];
+    const uiA = scriptedUI({
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
-          main++;
-          return main === 1 ? "Done" : undefined;
+          mainA++;
+          return mainA === 1 ? "scopes" : mainA === 2 ? "pi-chat" : "done";
         }
+        if (title.startsWith("Pi chat model")) return "leave";
         return undefined;
       },
     });
-    await showFactoryConfigUI(ui, { cwd, models: ["p/eng"] });
-    expect(ui.notifications.some((n) => n.type === "warning" && n.message.includes("not currently available"))).toBe(true);
+    await showFactoryConfigUI(uiA, {
+      cwd,
+      models,
+      modelOptions: models.map((m) => modelOption(m)),
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        leftUnchanged.push(label);
+        return true;
+      },
+    });
+    expect(uiA.notifications.some((n) => n.message.includes("Pi's ordinary chat model are separate"))).toBe(true);
+    expect(leftUnchanged).toEqual([]);
+
+    // (b) "Same as Factory Lead" sets the chat model explicitly.
+    const applied: string[] = [];
+    let mainB = 0;
+    const uiB = scriptedUI({
+      menu: (title) => {
+        if (title.startsWith("Factory configuration")) {
+          mainB++;
+          return mainB === 1 ? "pi-chat" : "done";
+        }
+        if (title.startsWith("Pi chat model")) return "same-as-lead";
+        return undefined;
+      },
+    });
+    await showFactoryConfigUI(uiB, {
+      cwd,
+      models,
+      modelOptions: models.map((m) => modelOption(m)),
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        applied.push(label);
+        return true;
+      },
+    });
+    expect(applied).toEqual(["p/lead"]);
+
+    // (c) an unavailable Lead model is surfaced, not applied.
+    const appliedC: string[] = [];
+    let mainC = 0;
+    const uiC = scriptedUI({
+      menu: (title) => {
+        if (title.startsWith("Factory configuration")) {
+          mainC++;
+          return mainC === 1 ? "pi-chat" : "done";
+        }
+        if (title.startsWith("Pi chat model")) return "same-as-lead";
+        return undefined;
+      },
+    });
+    await showFactoryConfigUI(uiC, {
+      cwd,
+      models: ["p/eng"],
+      modelOptions: [modelOption("p/eng")],
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        appliedC.push(label);
+        return true;
+      },
+    });
+    expect(appliedC).toEqual([]);
+    expect(uiC.notifications.some((n) => n.type === "warning" && n.message.includes("not currently available"))).toBe(true);
   });
 
   it("project writes deep-merge and clearProjectRole removes only that role", () => {
@@ -192,10 +374,10 @@ describe("AI Factory — config resolution and validation", () => {
 
     type Roles = Record<string, { targets?: { primary?: string }; maxTurns?: number }>;
     const raw = readProjectConfig(cwd) as { roles?: Roles; maxRepairRounds?: number } | undefined;
-    expect(raw?.roles?.engineer?.targets?.primary).toBe("p/eng"); // preserved
-    expect(raw?.roles?.engineer?.maxTurns).toBe(42); // merged
-    expect(raw?.roles?.lead?.targets?.primary).toBe("p/lead"); // preserved
-    expect(raw?.maxRepairRounds).toBe(2); // preserved
+    expect(raw?.roles?.engineer?.targets?.primary).toBe("p/eng");
+    expect(raw?.roles?.engineer?.maxTurns).toBe(42);
+    expect(raw?.roles?.lead?.targets?.primary).toBe("p/lead");
+    expect(raw?.maxRepairRounds).toBe(2);
 
     clearProjectRole(cwd, "engineer");
     const after = readProjectConfig(cwd) as { roles?: Roles } | undefined;
@@ -212,93 +394,6 @@ describe("AI Factory — config resolution and validation", () => {
     expect(projectPresetName(cwd)).toBeUndefined();
   });
 
-  it("G. Pi chat model is displayed/explained and changed only on explicit selection", async () => {
-    const cwd = workdir();
-    const models = ["p/lead", "p/eng"];
-    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "p/lead" } } } });
-
-    // (a) The main menu shows the current chat model and the scope explanation;
-    //     "Leave unchanged" calls nothing.
-    const seen: string[][] = [];
-    const leftUnchanged: string[] = [];
-    let mainA = 0;
-    const uiA = scriptedUI({
-      select: (title, options) => {
-        if (title.startsWith("Factory configuration")) {
-          seen.push(options);
-          mainA++;
-          if (mainA === 1) return "Model scopes — Factory roles vs Pi chat";
-          if (mainA === 2) return options.find((o) => o.startsWith("Pi chat model:"));
-          return "Done";
-        }
-        if (title === "Pi chat model (separate from Factory roles)") return "Leave unchanged";
-        return undefined;
-      },
-    });
-    await showFactoryConfigUI(uiA, {
-      cwd,
-      models,
-      chatModel: "omlx/qwen",
-      setChatModel: async (label) => {
-        leftUnchanged.push(label);
-        return true;
-      },
-    });
-    expect(seen[0]).toContain("Pi chat model: omlx/qwen  (separate from Factory)");
-    expect(seen[0].some((o) => o.startsWith("Configuration:"))).toBe(true);
-    expect(uiA.notifications.some((n) => n.message.includes("Pi's ordinary chat model are separate"))).toBe(true);
-    expect(leftUnchanged).toEqual([]);
-
-    // (b) "Same as Factory Lead" explicitly sets the chat model to the Lead primary.
-    const applied: string[] = [];
-    let mainB = 0;
-    const uiB = scriptedUI({
-      select: (title, options) => {
-        if (title.startsWith("Factory configuration")) {
-          mainB++;
-          return mainB === 1 ? options.find((o) => o.startsWith("Pi chat model:")) : "Done";
-        }
-        if (title === "Pi chat model (separate from Factory roles)") return "Same as Factory Lead";
-        return undefined;
-      },
-    });
-    await showFactoryConfigUI(uiB, {
-      cwd,
-      models,
-      chatModel: "omlx/qwen",
-      setChatModel: async (label) => {
-        applied.push(label);
-        return true;
-      },
-    });
-    expect(applied).toEqual(["p/lead"]);
-
-    // (c) An unavailable Lead model is surfaced, not applied.
-    const appliedC: string[] = [];
-    let mainC = 0;
-    const uiC = scriptedUI({
-      select: (title, options) => {
-        if (title.startsWith("Factory configuration")) {
-          mainC++;
-          return mainC === 1 ? options.find((o) => o.startsWith("Pi chat model:")) : "Done";
-        }
-        if (title === "Pi chat model (separate from Factory roles)") return "Same as Factory Lead";
-        return undefined;
-      },
-    });
-    await showFactoryConfigUI(uiC, {
-      cwd,
-      models: ["p/eng"],
-      chatModel: "omlx/qwen",
-      setChatModel: async (label) => {
-        appliedC.push(label);
-        return true;
-      },
-    });
-    expect(appliedC).toEqual([]);
-    expect(uiC.notifications.some((n) => n.type === "warning" && n.message.includes("not currently available"))).toBe(true);
-  });
-
   it("preset store round-trips, reports names and deletes", () => {
     workdir();
     expect(presetsPath().endsWith("factory-presets.json")).toBe(true);
@@ -313,27 +408,6 @@ describe("AI Factory — config resolution and validation", () => {
   });
 });
 
-/** Capture the top-level menu options rendered for a project. */
-async function mainMenuOptions(cwd: string, models: string[] = []): Promise<string[]> {
-  let seen: string[] | undefined;
-  const ui = scriptedUI({
-    select: (title, options) => {
-      if (title.startsWith("Factory configuration")) {
-        seen = options;
-        return "Done";
-      }
-      return undefined;
-    },
-  });
-  await showFactoryConfigUI(ui, { cwd, models });
-  return seen ?? [];
-}
-
-/** Save a preset whose Lead points at `model` (everything else default). */
-function saveLeadPreset(name: string, model: string): void {
-  savePreset(name, mergeFactoryConfig(defaultFactoryConfig(), { roles: { lead: { targets: { primary: model } } } }));
-}
-
 describe("AI Factory — preset base vs effective working copy", () => {
   it("A. an exact preset match shows the configuration with no * marker", async () => {
     const cwd = workdir();
@@ -344,17 +418,15 @@ describe("AI Factory — preset base vs effective working copy", () => {
     expect(state.preset).toBe("go-balanced");
     expect(state.dirty).toBe(false);
 
-    const options = await mainMenuOptions(cwd, ["m/base"]);
-    expect(options).toContain("Configuration: go-balanced");
-    expect(options).not.toContain("Configuration: Modified");
-    expect(options.some((o) => o.startsWith("* differs from"))).toBe(false);
-    expect(options.some((o) => o.startsWith("Lead ") && o.includes("m/base"))).toBe(true);
+    const rows = await mainMenuRows(cwd, { models: ["m/base"] });
+    expect(rowById(rows, "config")?.value).toBe("go-balanced");
+    expect(rowById(rows, "config-based")).toBeUndefined();
+    expect(rowById(rows, "role:lead")?.value).toBe("m/base");
   });
 
   it("A2. loading a preset replaces the working config and clears prior overrides", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    // A previous working config with several overrides and a different Lead.
     writeProjectConfig(cwd, {
       roles: { lead: { targets: { primary: "m/prev" } }, engineer: { targets: { primary: "m/eng" } } },
       maxRepairRounds: 7,
@@ -364,30 +436,30 @@ describe("AI Factory — preset base vs effective working copy", () => {
     let main = 0;
     let presetCalls = 0;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+          return main === 1 ? "presets" : "done";
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Load another preset…" : "Back";
+          return presetCalls === 1 ? "load" : "back";
         }
-        if (title === "Load preset") return "go-balanced";
+        if (title === "Load preset") return "preset:go-balanced";
         return undefined;
       },
       confirm: (title) => title === "Load preset",
     });
-    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/eng"] });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/eng"], modelOptions: [] });
 
     const state = factoryBaseState(cwd);
     expect(state.preset).toBe("go-balanced");
     expect(state.dirty).toBe(false);
     expect(state.effective).toEqual(resolvePresetConfig("go-balanced"));
     expect(state.effective.roles.lead.targets.primary).toBe("m/base");
-    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model"); // old override gone
-    expect(state.effective.maxRepairRounds).toBe(defaultFactoryConfig().maxRepairRounds); // old limit gone
-    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" }); // only the selection remains
+    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model");
+    expect(state.effective.maxRepairRounds).toBe(defaultFactoryConfig().maxRepairRounds);
+    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" });
   });
 
   it("B. editing after loading changes the working config and marks it modified", async () => {
@@ -401,14 +473,14 @@ describe("AI Factory — preset base vs effective working copy", () => {
     const state = factoryBaseState(cwd);
     expect(state.dirty).toBe(true);
     expect(state.effective.roles.lead.targets.primary).toBe("m/next");
-    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/base"); // preset unchanged
+    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/base");
 
-    const options = await mainMenuOptions(cwd, ["m/next"]);
-    expect(options).toContain("Configuration: Modified");
-    expect(options).toContain("Based on: go-balanced");
-    expect(options).toContain("* differs from go-balanced");
-    expect(options.some((o) => o.startsWith("Lead ") && o.includes("m/next") && o.endsWith("*"))).toBe(true);
-    expect(options.some((o) => o.startsWith("Architect ") && o.endsWith("*"))).toBe(false);
+    const rows = await mainMenuRows(cwd, { models: ["m/next"] });
+    expect(rowById(rows, "config")?.value).toBe("Modified");
+    expect(rowById(rows, "config-based")?.value).toBe("go-balanced");
+    expect(rowById(rows, "config-note")?.value).toBe("differs from go-balanced");
+    expect(rowById(rows, "role:lead")?.value?.endsWith("*")).toBe(true);
+    expect(rowById(rows, "role:architect")?.value?.endsWith("*")).toBe(false);
   });
 
   it("C. revert makes the effective config exactly the selected preset", async () => {
@@ -426,8 +498,6 @@ describe("AI Factory — preset base vs effective working copy", () => {
     expect(state.effective).toEqual(resolvePresetConfig("go-balanced"));
     expect(state.effective.roles.lead.targets.primary).toBe("m/base");
     expect(state.effective.maxRepairRounds).toBe(defaultFactoryConfig().maxRepairRounds);
-    const options = await mainMenuOptions(cwd, ["m/base"]);
-    expect(options).toContain("Configuration: go-balanced");
   });
 
   it("C2. loading another preset does not leak the previous overrides", async () => {
@@ -435,49 +505,49 @@ describe("AI Factory — preset base vs effective working copy", () => {
     saveLeadPreset("go-balanced", "m/base");
     saveLeadPreset("other", "m/other");
     loadPresetAsWorkingConfig(cwd, "go-balanced");
-    writeProjectConfig(cwd, { roles: { engineer: { targets: { primary: "m/leak" } } } }); // modify
+    writeProjectConfig(cwd, { roles: { engineer: { targets: { primary: "m/leak" } } } });
     expect(factoryBaseState(cwd).dirty).toBe(true);
 
     let main = 0;
     let presetCalls = 0;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+          return main === 1 ? "presets" : "done";
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Load another preset…" : "Back";
+          return presetCalls === 1 ? "load" : "back";
         }
-        if (title === "Load preset") return "other";
+        if (title === "Load preset") return "preset:other";
         return undefined;
       },
       confirm: (title) => title === "Load preset",
     });
-    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/other", "m/leak"] });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/other", "m/leak"], modelOptions: [] });
 
     const state = factoryBaseState(cwd);
     expect(state.preset).toBe("other");
     expect(state.dirty).toBe(false);
     expect(state.effective).toEqual(resolvePresetConfig("other"));
-    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model"); // leak gone
+    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model");
   });
 
-  it("G. individual rows mark only the changed roles/limits", async () => {
+  it("G(rows). individual rows mark only the changed roles/limits", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
     loadPresetAsWorkingConfig(cwd, "go-balanced");
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } } });
 
-    let options = await mainMenuOptions(cwd, ["m/next"]);
-    expect(options.some((o) => o.startsWith("Lead ") && o.endsWith("*"))).toBe(true);
-    expect(options.some((o) => o.startsWith("Engineer ") && o.endsWith("*"))).toBe(false);
-    expect(options.some((o) => o.startsWith("Limits") && o.endsWith("*"))).toBe(false);
+    let rows = await mainMenuRows(cwd, { models: ["m/next"] });
+    expect(rowById(rows, "role:lead")?.value?.endsWith("*")).toBe(true);
+    expect(rowById(rows, "role:engineer")?.value?.endsWith("*")).toBe(false);
+    expect(rowById(rows, "limits")?.value?.endsWith("*")).toBe(false);
 
     writeProjectConfig(cwd, { maxRepairRounds: 5 });
-    options = await mainMenuOptions(cwd, ["m/next"]);
-    expect(options.some((o) => o.startsWith("Limits") && o.endsWith("*"))).toBe(true);
+    rows = await mainMenuRows(cwd, { models: ["m/next"] });
+    expect(rowById(rows, "limits")?.value?.endsWith("*")).toBe(true);
   });
 
   it("D. saving the working config as a new preset leaves the old preset unchanged", async () => {
@@ -489,24 +559,24 @@ describe("AI Factory — preset base vs effective working copy", () => {
     let main = 0;
     let presetCalls = 0;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+          return main === 1 ? "presets" : "done";
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Save as new preset…" : "Back";
+          return presetCalls === 1 ? "save-new" : "back";
         }
         return undefined;
       },
       input: (title) => (title === "New preset name" ? "snap" : undefined),
     });
 
-    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/next"] });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/next"], modelOptions: [] });
 
-    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/base"); // original untouched
-    expect(resolvePresetConfig("snap").roles.lead.targets.primary).toBe("m/next"); // snapshot of the effective config
+    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/base");
+    expect(resolvePresetConfig("snap").roles.lead.targets.primary).toBe("m/next");
     expect(projectPresetName(cwd)).toBe("snap");
     expect(factoryBaseState(cwd).dirty).toBe(false);
   });
@@ -521,14 +591,14 @@ describe("AI Factory — preset base vs effective working copy", () => {
     let presetCalls = 0;
     let confirmed = false;
     const ui = scriptedUI({
-      select: (title, options) => {
+      menu: (title) => {
         if (title.startsWith("Factory configuration")) {
           main++;
-          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+          return main === 1 ? "presets" : "done";
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? options.find((o) => o.startsWith("Update go-balanced")) : "Back";
+          return presetCalls === 1 ? "update" : "back";
         }
         return undefined;
       },
@@ -541,11 +611,51 @@ describe("AI Factory — preset base vs effective working copy", () => {
       },
     });
 
-    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/next"] });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/next"], modelOptions: [] });
 
     expect(confirmed).toBe(true);
     expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/next");
     expect(factoryBaseState(cwd).dirty).toBe(false);
-    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" }); // redundant overrides dropped
+    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" });
+  });
+
+  it("fallback row management adds, reorders and removes fallbacks", async () => {
+    const cwd = workdir();
+    const options = [modelOption("m/a"), modelOption("m/b"), modelOption("m/c")];
+    let main = 0;
+    let role = 0;
+    let fallbacks = 0;
+    let action = 0;
+    const added = ["m/a", "m/b"];
+    const ui = scriptedUI({
+      menu: (title) => {
+        if (title.startsWith("Factory configuration")) {
+          main++;
+          return main === 1 ? "role:engineer" : "done";
+        }
+        if (title === "Engineer configuration") {
+          role++;
+          return role === 1 ? "fallbacks" : "back";
+        }
+        if (title.startsWith("Engineer fallbacks")) {
+          fallbacks++;
+          // 1: add, 2: add, 3: open m/b (index 1), 4: open m/b (index 0), 5: back
+          if (fallbacks === 1 || fallbacks === 2) return "add";
+          if (fallbacks === 3) return "fb:1";
+          if (fallbacks === 4) return "fb:0";
+          return "back";
+        }
+        if (title.startsWith("Fallback ")) {
+          action++;
+          return action === 1 ? "up" : "remove"; // move m/b up, then remove m/b
+        }
+        return undefined;
+      },
+      pickModel: () => added.shift(),
+    });
+    await showFactoryConfigUI(ui, { cwd, models: options.map((m) => m.value), modelOptions: options });
+
+    // Added [m/a, m/b] → moved m/b up → [m/b, m/a] → removed m/b → [m/a].
+    expect(loadFactoryConfig(cwd).roles.engineer.targets.fallbacks).toEqual(["m/a"]);
   });
 });
