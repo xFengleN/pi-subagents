@@ -17,6 +17,7 @@ import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-
 import { Type } from "@sinclair/typebox";
 import { nanoid } from "nanoid";
 import { systemClock } from "./clock.js";
+import { type FactoryCommandRuntime, type FactoryRunListItem, registerFactoryCommands } from "./commands.js";
 import { loadFactoryConfig } from "./config.js";
 import { FactoryController, type FactoryControllerDeps } from "./controller.js";
 import { buildRunSummary } from "./metrics.js";
@@ -139,6 +140,60 @@ export default function (pi: ExtensionAPI): void {
   }));
 
   /**
+   * Slash-command runtime. Dispatch/status/stop/config are deterministic —
+   * none of them asks a model anything. Only `/factory` starts a run, which
+   * then spawns role agents through the existing controller.
+   */
+  const runtime: FactoryCommandRuntime = {
+    isAvailable: async () => transport.isAvailable() || (await transport.ping(1_000)),
+    launch: (cwd, task) => {
+      const id = runId();
+      const controller = FactoryController.create(depsFor(cwd), id, task, cwd);
+      controllers.set(id, controller);
+      controller.start();
+      return { id, controller };
+    },
+    // Read-only: never restores/drives, so `/factory-status` costs no model calls.
+    peekState: (id, cwd) => controllers.get(id)?.getState() ?? activeStore(cwd).load(id),
+    listRuns: (cwd) => listRuns(cwd),
+    stop: (id, cwd) => {
+      let controller = controllers.get(id);
+      if (!controller) {
+        const persisted = activeStore(cwd).load(id);
+        if (!persisted || isTerminal(persisted.state)) return false;
+        // Restore WITHOUT resuming, so stopping an orphaned run cannot first
+        // spawn a role agent.
+        controller = FactoryController.restore(depsFor(persisted.cwd), id, { resume: false });
+        if (!controller) return false;
+        controllers.set(id, controller);
+      }
+      controller.stop("Stopped via /factory-stop");
+      return true;
+    },
+  };
+  registerFactoryCommands(pi, runtime);
+
+  function activeStore(cwd: string): FactoryStore {
+    return store ?? new FactoryStore(cwd);
+  }
+
+  /** Persisted runs for a project, newest first (for `/factory-status`/`stop`). */
+  function listRuns(cwd: string): FactoryRunListItem[] {
+    const runs: FactoryRunListItem[] = [];
+    for (const id of activeStore(cwd).list()) {
+      const state = activeStore(cwd).load(id);
+      if (!state) continue;
+      runs.push({
+        runId: state.runId,
+        state: state.state,
+        updatedAt: state.updatedAt,
+        ...(state.inFlight ? { role: state.inFlight.role, phase: state.inFlight.phase } : {}),
+      });
+    }
+    return runs.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /**
    * Return the in-process controller for a run, lazily restoring and resuming a
    * persisted non-terminal run that is not currently active (a session switch or
    * process restart orphans it otherwise). A terminal or unknown run is left
@@ -147,7 +202,7 @@ export default function (pi: ExtensionAPI): void {
   function ensureController(id: string, ctx: ExtensionContext | undefined): FactoryController | undefined {
     const active = controllers.get(id);
     if (active) return active;
-    const persisted = (store ?? new FactoryStore(ctx?.cwd ?? process.cwd())).load(id);
+    const persisted = activeStore(ctx?.cwd ?? process.cwd()).load(id);
     if (!persisted || isTerminal(persisted.state)) return undefined;
     const restored = FactoryController.restore(depsFor(persisted.cwd), id);
     if (!restored) return undefined;

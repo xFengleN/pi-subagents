@@ -10,7 +10,7 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { FACTORY_STATE_VERSION, type FactoryRunState } from "./types.js";
 
 export const FACTORY_DIR = ".pi/factory";
@@ -18,6 +18,19 @@ export const FACTORY_DIR = ".pi/factory";
 /** Where Factory run state files live for a project. */
 export function factoryDir(cwd: string): string {
   return join(cwd, FACTORY_DIR);
+}
+
+/**
+ * Write JSON atomically: create the parent directory, write a temp file, then
+ * rename over the target. Reused by the run store, the preset store and the
+ * project config writer so every Factory file write is crash-safe.
+ */
+export function writeJsonAtomic(filePath: string, value: unknown): void {
+  const dir = dirname(filePath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  renameSync(tmp, filePath);
 }
 
 export class FactoryStore {
@@ -29,12 +42,7 @@ export class FactoryStore {
 
   /** Persist a run state atomically (temp file + rename). */
   save(state: FactoryRunState): void {
-    const dir = factoryDir(this.cwd);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const target = this.pathFor(state.runId);
-    const tmp = `${target}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
-    renameSync(tmp, target);
+    writeJsonAtomic(this.pathFor(state.runId), state);
   }
 
   /** Load a persisted run state, or undefined when absent/corrupt. */

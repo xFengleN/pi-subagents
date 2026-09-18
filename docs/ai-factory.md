@@ -123,6 +123,37 @@ tool.
 
 See `examples/ai-factory/` for a full example (including role agent files).
 
+### Slash commands and presets
+
+Factory is usable directly from Pi's command line — the currently selected main
+model plays no part in starting, inspecting, stopping or configuring a run:
+
+| Command | What it does |
+|---|---|
+| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. |
+| `/factory-status` | Read-only status of the latest run for the project (state/phase, active role, repair/remediation counts, retries, fallbacks, capacity waits, per-role last target, last error/parked). Never resumes or spends a request. |
+| `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
+| `/factory-config` | Interactive menu: per-role primary/fallback models (chosen from Pi's available-model registry), transient retries/delay/max-turns, limits, and preset management. |
+
+**Presets.** A preset is a complete Factory execution config stored once per
+user at `<getAgentDir()>/factory-presets.json` (thence honoring
+`PI_CODING_AGENT_DIR`, alongside pi-subagents' own `subagents.json`). The
+`/factory-config` UI can save the current config as a named preset, overwrite
+(with confirmation), delete (with confirmation), and select the active preset.
+
+**Resolution order** (per project):
+
+```
+built-in defaults
+  → preset named by ".pi/factory.json" { "preset": "<name>" }
+  → ".pi/factory.json" overrides
+  → inline `Factory({ config })` overrides
+```
+
+A project file with no `preset` key resolves exactly as before, so existing
+configs are unaffected. Preset selection and project overrides are independent:
+clearing the active preset leaves project overrides in place.
+
 ### Fallback semantics
 
 Per-role ordered targets (`primary` then `fallbacks`). Role identity never
@@ -163,13 +194,20 @@ summary at completion.
 # 1. install this extension into pi
 pi install /path/to/pi-subagents
 
-# 2. configure role targets (project-scoped)
-#    <cwd>/.pi/factory.json — see examples/ai-factory/factory.config.json
+# 2. configure roles interactively (writes <cwd>/.pi/factory.json)
+#    inside a pi session:
+/factory-config
 
-# 3. in a pi session, ask the agent to run a task through the Factory:
-#    "Use Factory to: <task>"
-#    The model calls Factory({task}), gets a runId, then factory_status({run_id, wait: true}).
+# 3. start a run directly — no model has to decide to call Factory
+/factory add a widgets package with tests
+
+# 4. inspect / stop deterministically
+/factory-status
+/factory-stop
 ```
+
+The model-mediated path still exists for programmatic use: the main model can
+call `Factory({ task })`, then `factory_status({ run_id, wait: true })`.
 
 Optionally install the role agent files from `examples/ai-factory/agents/` into
 `.pi/agents/` for role-appropriate tool sets (e.g. read-only Reviewer). Without

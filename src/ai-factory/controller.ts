@@ -135,12 +135,18 @@ export class FactoryController {
     return controller;
   }
 
-  /** Restore a run from its persisted state; returns undefined if absent. */
-  static restore(deps: FactoryControllerDeps, runId: string): FactoryController | undefined {
+  /**
+   * Restore a run from its persisted state; returns undefined if absent.
+   *
+   * `resume: false` loads the controller without driving it — used by
+   * `/factory-stop`, where resuming first would (briefly) spawn a role agent
+   * before the stop lands. Default behavior resumes.
+   */
+  static restore(deps: FactoryControllerDeps, runId: string, opts: { resume?: boolean } = {}): FactoryController | undefined {
     const state = deps.store.load(runId);
     if (!state) return undefined;
     const controller = new FactoryController(deps, state);
-    controller.onRestore();
+    if (opts.resume !== false) controller.onRestore();
     return controller;
   }
 

@@ -10,7 +10,9 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { FactoryConfig, RoleConfig, RoleName } from "./types.js";
+import { getRawPreset } from "./presets.js";
+import { writeJsonAtomic } from "./store.js";
+import { type FactoryConfig, ROLE_NAMES, type RoleConfig, type RoleName } from "./types.js";
 
 /** Default agent type per role. Falls back to `general-purpose` at spawn time
  * when a type is not installed. */
@@ -75,23 +77,117 @@ export function targetsForRole(config: FactoryConfig, role: RoleName): string[] 
 /* Configuration file loading                                                 */
 /* -------------------------------------------------------------------------- */
 
+/** Key in `.pi/factory.json` naming the user-level preset to apply. */
+export const PROJECT_PRESET_KEY = "preset";
+
 /** Project Factory configuration file, next to pi-subagents' own subagents.json. */
 export function factoryConfigPath(cwd: string): string {
   return join(cwd, ".pi", "factory.json");
 }
 
+/** The project config as raw JSON, or undefined when absent/corrupt. */
+export function readProjectConfig(cwd: string): Record<string, unknown> | undefined {
+  const path = factoryConfigPath(cwd);
+  if (!existsSync(path)) return undefined;
+  try {
+    return asRecord(JSON.parse(readFileSync(path, "utf8")) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The preset named by the project config, if any. */
+export function projectPresetName(cwd: string): string | undefined {
+  const name = readProjectConfig(cwd)?.[PROJECT_PRESET_KEY];
+  return typeof name === "string" && name.trim() !== "" ? name : undefined;
+}
+
+function withoutPresetKey(config: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!config) return undefined;
+  const { [PROJECT_PRESET_KEY]: _preset, ...rest } = config;
+  return rest;
+}
+
 /**
- * Load the effective Factory config for a project:
- * defaults <- `<cwd>/.pi/factory.json` <- inline per-call overrides.
- * The file is plain JSON (no model involved) so deployments pin real provider
- * targets without touching code.
+ * Load the effective Factory config for a project, in resolution order:
+ * built-in defaults <- named preset <- `<cwd>/.pi/factory.json` overrides
+ * <- inline per-call overrides.
+ *
+ * A project with no `preset` key resolves exactly as before (defaults <- file),
+ * so existing `.pi/factory.json` files are unaffected.
  */
 export function loadFactoryConfig(cwd: string, inline?: Record<string, unknown>): FactoryConfig {
   const base = defaultFactoryConfig();
-  const fromFile = existsSync(factoryConfigPath(cwd))
-    ? (JSON.parse(readFileSync(factoryConfigPath(cwd), "utf8")) as Record<string, unknown>)
-    : undefined;
-  return mergeFactoryConfig(base, fromFile, inline);
+  const presetName = projectPresetName(cwd);
+  const preset = presetName !== undefined ? getRawPreset(presetName) : undefined;
+  return mergeFactoryConfig(base, preset, withoutPresetKey(readProjectConfig(cwd)), inline);
+}
+
+/** Overwrite the project config file (whole object), atomically. */
+export function writeProjectConfigFile(cwd: string, config: Record<string, unknown>): void {
+  writeJsonAtomic(factoryConfigPath(cwd), config);
+}
+
+/** Deep-merge a partial patch into the project config, preserving other keys. */
+export function writeProjectConfig(cwd: string, patch: Record<string, unknown>): Record<string, unknown> {
+  const merged = deepMergeJson(readProjectConfig(cwd) ?? {}, patch);
+  writeProjectConfigFile(cwd, merged);
+  return merged;
+}
+
+/** Select the active preset for a project (`undefined` clears the selection). */
+export function setProjectPreset(cwd: string, name: string | undefined): void {
+  writeProjectConfig(cwd, { [PROJECT_PRESET_KEY]: name });
+}
+
+/** Remove a role's project override so the preset/default applies again. */
+export function clearProjectRole(cwd: string, role: RoleName): void {
+  const current = readProjectConfig(cwd) ?? {};
+  const roles = asRecord(current.roles);
+  if (roles) {
+    delete roles[role];
+    if (Object.keys(roles).length === 0) delete current.roles;
+  }
+  writeProjectConfigFile(cwd, current);
+}
+
+function deepMergeJson(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    const existing = asRecord(out[key]);
+    const incoming = asRecord(value);
+    if (existing && incoming) out[key] = deepMergeJson(existing, incoming);
+    else if (value === undefined) delete out[key];
+    else out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Deterministic config validation against the currently available model ids
+ * (`provider/model`). Returns human-readable issues; an empty array is valid.
+ * Used by the config UI and as a pre-launch warning — never as an LLM check.
+ */
+export function validateFactoryConfig(config: FactoryConfig, availableModels: readonly string[]): string[] {
+  const available = new Set(availableModels);
+  const issues: string[] = [];
+  for (const role of ROLE_NAMES) {
+    const targets = targetsForRole(config, role);
+    if (targets.length === 0) issues.push(`${role}: no model target configured`);
+    for (const target of targets) {
+      if (!available.has(target)) issues.push(`${role}: model "${target}" is not currently available`);
+    }
+  }
+  const limits: Array<[string, number]> = [
+    ["maxRepairRounds", config.maxRepairRounds],
+    ["maxArchitectRemediationRounds", config.maxArchitectRemediationRounds],
+    ["maxArchitectEscalations", config.maxArchitectEscalations],
+    ["maxLeadEscalations", config.maxLeadEscalations],
+  ];
+  for (const [name, value] of limits) {
+    if (!Number.isFinite(value) || value < 0) issues.push(`${name} must be >= 0`);
+  }
+  return issues;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
