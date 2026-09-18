@@ -17,7 +17,9 @@ USER TASK
   → bounded Engineer/Reviewer repair loop
   → Lead integration + system verification
   → mandatory FINAL_ARCHITECT acceptance gate
-  → (one bounded remediation cycle, one recheck) → DONE / STOPPED
+  → (one bounded remediation cycle, one recheck)
+  → mandatory FINAL_SYNTHESIS (final Lead report of the accepted state)
+  → DONE / STOPPED
 ```
 
 Two kinds of decisions:
@@ -88,14 +90,23 @@ REVIEW ──PASS──▶ INTEGRATION
 REVIEW ──NEEDS_FIX, rounds left──▶ EXECUTION            (bounded local loop)
 REVIEW / EXECUTION ──architectural──▶ ARCHITECT_ESCALATION ──Architect──▶ EXECUTION
 INTEGRATION ──Lead acceptance packet──▶ FINAL_ARCHITECT
-FINAL_ARCHITECT ──ACCEPT──▶ DONE
+FINAL_ARCHITECT ──ACCEPT──▶ FINAL_SYNTHESIS
 FINAL_ARCHITECT ──NEEDS_REMEDIATION, rounds left──▶ REMEDIATION
 REMEDIATION ──Engineer + Reviewer──▶ FINAL_ARCHITECT_RECHECK
-FINAL_ARCHITECT_RECHECK ──ACCEPT──▶ DONE
+FINAL_ARCHITECT_RECHECK ──ACCEPT──▶ FINAL_SYNTHESIS
 FINAL_ARCHITECT_RECHECK ──reject (budget spent)──▶ STOPPED
+FINAL_SYNTHESIS ──Lead report persisted──▶ DONE
 any active state ──all targets unavailable──▶ WAITING_CAPACITY ──capacity──▶ resume
 any active state ──unrecoverable──▶ FAILED / STOPPED
 ```
+
+`FINAL_SYNTHESIS` is the mandatory finalization gate: **every** accepted run,
+including one that went through remediation, must produce exactly one bounded
+final Lead synthesis before `DONE`. It is a synthesis of accepted evidence only
+— it cannot modify repository files, spawn agents, or reopen remediation. The
+accepted state it describes is the post-remediation state when one exists; the
+earlier rejected `results.integration` packet and both Architect gate packets
+remain preserved as audit history.
 
 Illegal transitions are rejected programmatically (`assertTransition`), so a
 run can never skip a mandatory checkpoint (e.g. Engineer before the initial
@@ -130,8 +141,10 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 
 | Command | What it does |
 |---|---|
-| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. |
-| `/factory-status` | Read-only status of the latest run for the project (state/phase, active role, repair/remediation counts, retries, fallbacks, capacity waits, per-role last target, last error/parked). Never resumes or spends a request. |
+| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. When the run reaches `DONE`, its persisted final report is rendered automatically in the invoking session. |
+| `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
+| `/factory-report [runId]` | Prints the human-readable final report for the latest completed run, or for an explicit run id. Reads persisted state only — no model call. Legacy runs without a final Lead synthesis fall back to the accepted Architect/integration packet, clearly labelled. |
+| `/factory-metrics [runId]` | Prints operational metrics for the latest run, or an explicit run id: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
 | `/factory-config` | Interactive menu: per-role primary/fallback models (chosen from Pi's available-model registry), transient retries/delay/max-turns, limits, and preset management. |
 
@@ -244,6 +257,18 @@ It holds packets and references only — never child transcripts. On restart:
   as a failed attempt and re-attempted deterministically;
 - a `WAITING_CAPACITY` run restores its `nextRetryAt` and wakes on the clock.
 
+`results.finalReport` is the final Lead synthesis for the actual accepted
+state; `results.integration`, `results.finalArchitect` and
+`results.finalRecheck` are never overwritten by it, so the full acceptance
+history survives. Older run files that predate these fields stay readable: the
+commands degrade gracefully (and `/factory-report` labels a legacy fallback).
+
+**`.pi/` ownership.** `<cwd>/.pi/factory.json` is project configuration — it is
+hand-edited (or written by `/factory-config`) and may be committed. Everything
+under `<cwd>/.pi/factory/` is a per-run runtime artifact: treat it as
+untracked output and add `.pi/factory/` to the project's `.gitignore`. Factory
+never commits run artifacts.
+
 ## Metrics
 
 Per role/agent: actual model (when exposed), input/output/cacheWrite tokens
@@ -252,6 +277,14 @@ billed cost, tool uses, duration, compaction count, attempts, retries,
 fallbacks. A metric a provider does not expose stays **unknown** — never a
 fabricated zero. `factory_status` returns a compact machine-readable run
 summary at completion.
+
+Every settled call is also appended to an append-only per-call record
+(`metrics.calls`), so `/factory-metrics` can report honest totals, request
+context sizes and the slowest call instead of only the last settle per role.
+TTFT and generation tokens/second are **not** captured by the transport and are
+shown as `n/a`; they are never inferred. A run persisted before per-call
+telemetry existed sets a legacy flag and reports the last reported call per
+role, clearly labelled.
 
 ## Running a minimal example
 
@@ -268,6 +301,8 @@ pi install /path/to/pi-subagents
 
 # 4. inspect / stop deterministically
 /factory-status
+/factory-report      # the final report, once the run is DONE
+/factory-metrics     # per-call tokens, cost, context and orchestration counts
 /factory-stop
 ```
 

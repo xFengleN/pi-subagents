@@ -40,3 +40,6 @@ test/perf/.results/
 # Pi internal files
 progress.md
 CLAUDE.md
+
+# AI Factory runtime artifacts — per-run state, not project config
+.pi/factory/
