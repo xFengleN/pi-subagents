@@ -371,6 +371,48 @@ describe("AI Factory controller — state machine", () => {
   });
 });
 
+describe("AI Factory controller — reviewer finding fidelity", () => {
+  async function runToIntegration(m: ReturnType<typeof make>, integrationPacket: unknown): Promise<void> {
+    await startRun(m);
+    complete(m, packets.proposal);
+    await flush();
+    complete(m, packets.approve);
+    await flush();
+    complete(m, packets.engineer);
+    await flush();
+    // PASS with a non-blocking advisory finding: no repair is required.
+    complete(m, packets.reviewerPassWithNote);
+    await flush();
+    complete(m, integrationPacket);
+    await flush();
+  }
+
+  it("7a. preserves a Reviewer non-blocking finding the Lead summarized away", async () => {
+    const m = makeWithCleanup();
+    // The Lead's packet insists there were no findings (the observed defect).
+    await runToIntegration(m, packets.integrationIgnoringNote);
+
+    const integration = m.controller.getState().results.integration!.packet;
+    expect(integration.reviewerFindingsAcceptedRisk.join(" ")).toContain("None");
+    // The deterministic guard preserved the finding with an explicit disposition.
+    expect(integration.reviewerFindingsUnresolved).toContain("rename the helper for clarity");
+
+    // ...and the Final Architect receives it, labelled by disposition.
+    const finalArchitect = m.transport.spawned.find((s) => s.phase === "final.architect");
+    expect(finalArchitect?.prompt).toContain("rename the helper for clarity");
+    expect(finalArchitect?.prompt).toContain("UNRESOLVED");
+  });
+
+  it("7b. does not duplicate a finding the Lead already dispositioned", async () => {
+    const m = makeWithCleanup();
+    await runToIntegration(m, packets.integrationWithDisposition);
+
+    const integration = m.controller.getState().results.integration!.packet;
+    expect(integration.reviewerFindingsAcceptedRisk).toContain("rename the helper for clarity");
+    expect(integration.reviewerFindingsUnresolved).toEqual([]);
+  });
+});
+
 describe("AI Factory controller — repair-loop escalation paths", () => {
   it("escalates to the Architect when the Reviewer flags an architectural issue after the budget", async () => {
     const m = makeWithCleanup({ config: { maxRepairRounds: 1 } });

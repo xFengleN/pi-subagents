@@ -167,12 +167,31 @@ Approved architecture: ${input.architecture}
 Completed work packages:
 ${input.engineers.map((e) => `- [${e.workPackageId}] ${e.summary}`).join("\n") || "(none)"}
 
-Reviewer findings:
-${input.reviewers.map((r) => `- verdict ${r.verdict}: blocking=${r.blockingFindings.join("; ") || "none"}`).join("\n") || "(none)"}
+Reviewer findings — EVERY finding listed below must appear in exactly one of
+reviewerFindingsResolved, reviewerFindingsAcceptedRisk or reviewerFindingsUnresolved.
+Do not write "None" while a finding is listed, and do not summarize a finding away:
+${reviewerFindingsBlock(input.reviewers)}
 
-Verify the integrated system (run the relevant tests/checks), then report the acceptance packet: goal, approved architecture, completed work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved), relevant selected files/diffs, and your factual assessment.
+Verify the integrated system (run the relevant tests/checks), then report the acceptance packet: goal, approved architecture, completed work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment.
 
 ${STRUCTURED}`;
+}
+
+/** Render every Reviewer finding, by category, so none is invisible to the Lead. */
+function reviewerFindingsBlock(reviewers: ReviewerPacket[]): string {
+  if (reviewers.length === 0) return "(none)";
+  return reviewers.map((r, i) => {
+    const lines: string[] = [`Reviewer ${i + 1} (verdict ${r.verdict}):`];
+    const section = (label: string, items: string[]): void => {
+      if (items.length > 0) lines.push(`  ${label}:`, ...items.map((t) => `    - ${t}`));
+    };
+    section("blocking", r.blockingFindings);
+    section("non-blocking", r.nonBlockingFindings);
+    section("required repairs", r.requiredRepairs);
+    section("test concerns", r.testConcerns);
+    if (lines.length === 1) lines.push("  (no findings)");
+    return lines.join("\n");
+  }).join("\n");
 }
 
 /** Final Architect acceptance checkpoint (FINAL_ARCHITECT / FINAL_ARCHITECT_RECHECK). */
@@ -199,7 +218,9 @@ ${list(input.remediation.engineer.testsRun)}
 - Test results: ${input.remediation.engineer.testResults || "(none reported)"}
 - Reviewer verdict on the remediation: ${input.remediation.reviewer.verdict}
 - Reviewer blocking findings on the remediation:
-${list(input.remediation.reviewer.blockingFindings)}`
+${list(input.remediation.reviewer.blockingFindings)}
+- Reviewer non-blocking findings on the remediation:
+${list(input.remediation.reviewer.nonBlockingFindings)}`
     : "";
   return `You are the Architect — a premium, temporary consultant. ${head} You are deciding whether this completed system is the RIGHT architectural/system solution and should be accepted.
 
@@ -214,11 +235,11 @@ ${list(input.integration.completedWorkPackages)}
 ${list(input.integration.importantDecisions)}
 - Deviations:
 ${list(input.integration.deviations)}
-- Reviewer findings resolved:
+- Reviewer findings — RESOLVED:
 ${list(input.integration.reviewerFindingsResolved)}
-- Reviewer findings accepted as risk:
+- Reviewer findings — ACCEPTED RISK:
 ${list(input.integration.reviewerFindingsAcceptedRisk)}
-- Reviewer findings unresolved:
+- Reviewer findings — UNRESOLVED:
 ${list(input.integration.reviewerFindingsUnresolved)}
 - Selected files:
 ${list(input.integration.selectedFiles)}

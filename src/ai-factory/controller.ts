@@ -34,6 +34,8 @@ import type {
   FactoryConfig,
   FactoryRunState,
   LeadEscalationPacket,
+  LeadIntegrationPacket,
+  ReviewerOutcome,
   ReviewerPacket,
   RoleName,
 } from "./types.js";
@@ -404,7 +406,12 @@ export class FactoryController {
         return {
           role: "architect",
           kind: "architect_final",
-          prompt: finalArchitectPrompt({ task: s.task, integration: s.results.integration!.packet }),
+          prompt: finalArchitectPrompt({
+            task: s.task,
+            // Sweep again at the checkpoint so the guarantee holds even for a
+            // legacy/restored integration packet. Idempotent.
+            integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
+          }),
         };
       case "final_recheck.architect": {
         const rem = s.results.remediation;
@@ -413,7 +420,7 @@ export class FactoryController {
           kind: "architect_final",
           prompt: finalArchitectPrompt({
             task: s.task,
-            integration: s.results.integration!.packet,
+            integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
             // Surface the actual remediation so the recheck assesses the fixed
             // system, not the pre-fix packet it already rejected.
             ...(rem?.engineer && rem.reviewer
@@ -698,9 +705,21 @@ export class FactoryController {
       case "review.reviewer":
         s.results.reviewers.push({ round: s.repairRound, outcome });
         break;
-      case "integration.lead":
-        s.results.integration = outcome;
+      case "integration.lead": {
+        // Deterministic fidelity guard: the Lead may summarize, but it may not
+        // erase. Every Reviewer finding that the acceptance packet does not
+        // explicitly disposition is preserved under `reviewerFindingsUnresolved`.
+        const integration = enforceReviewerFindingDispositions(
+          packet as LeadIntegrationPacket,
+          s.results.reviewers,
+        );
+        s.results.integration = {
+          packet: integration,
+          agentId: info.agentId,
+          ...(info.modelName !== undefined ? { target: info.modelName } : {}),
+        };
         break;
+      }
       case "final.architect":
         s.results.finalArchitect = outcome;
         break;
@@ -874,6 +893,50 @@ function lastExecutionEngineer(s: FactoryRunState) {
 function lastReviewer(s: FactoryRunState) {
   const reviewers = s.results.reviewers;
   return reviewers[reviewers.length - 1];
+}
+
+/** Every finding any Reviewer raised, across every round, in a stable order. */
+function reviewerFindings(reviewers: ReviewerOutcome[]): string[] {
+  const findings: string[] = [];
+  for (const reviewer of reviewers) {
+    const packet = reviewer.outcome.packet;
+    findings.push(
+      ...packet.blockingFindings,
+      ...packet.nonBlockingFindings,
+      ...packet.requiredRepairs,
+      ...packet.testConcerns,
+    );
+  }
+  return findings;
+}
+
+const normalizeFinding = (text: string): string => text.trim().toLowerCase().replace(/\s+/g, " ");
+
+/**
+ * Guarantee every Reviewer finding survives into the Lead's acceptance packet
+ * with an explicit disposition. The packet's three buckets ARE the dispositions
+ * (resolved / accepted risk / unresolved); a finding the Lead placed in none of
+ * them is preserved verbatim under `reviewerFindingsUnresolved`, so a
+ * non-blocking finding can never be summarized away before the Final Architect
+ * sees it.
+ */
+function enforceReviewerFindingDispositions(
+  packet: LeadIntegrationPacket,
+  reviewers: ReviewerOutcome[],
+): LeadIntegrationPacket {
+  const placed = [
+    ...packet.reviewerFindingsResolved,
+    ...packet.reviewerFindingsAcceptedRisk,
+    ...packet.reviewerFindingsUnresolved,
+  ].map(normalizeFinding).join("\n");
+
+  const missing: string[] = [];
+  for (const finding of reviewerFindings(reviewers)) {
+    const normalized = normalizeFinding(finding);
+    if (normalized !== "" && !placed.includes(normalized)) missing.push(finding);
+  }
+  if (missing.length === 0) return packet;
+  return { ...packet, reviewerFindingsUnresolved: [...packet.reviewerFindingsUnresolved, ...missing] };
 }
 
 /**
