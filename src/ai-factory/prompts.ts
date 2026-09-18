@@ -250,6 +250,87 @@ Respond with ACCEPT, or NEEDS_REMEDIATION (with blocking issues, required change
 ${STRUCTURED}`;
 }
 
+/**
+ * Final Lead synthesis (FINAL_SYNTHESIS).
+ *
+ * The run has already been accepted by the Architect. This is a bounded,
+ * human-facing synthesis of the accepted evidence ONLY: it must not modify the
+ * repository, must not spawn further agents, and must not reopen remediation.
+ * It may inspect the repository read-only to report git facts.
+ */
+export function finalReportPrompt(input: {
+  runId: string;
+  task: string;
+  architecture: string;
+  integration: LeadIntegrationPacket;
+  finalAcceptance: ArchitectFinalResult;
+  engineers: EngineerPacket[];
+  reviewers: ReviewerPacket[];
+  remediation?: { engineer: EngineerPacket; reviewer: ReviewerPacket };
+  runStartedAt: number;
+  runEndedAt?: number;
+  repairRounds: number;
+  remediationRounds: number;
+  roleTargets: string[];
+}): string {
+  const iso = (ms?: number): string => (ms === undefined ? "(unknown)" : new Date(ms).toISOString());
+  const remediationBlock = input.remediation
+    ? `
+Remediation cycle that produced the accepted state:
+- Engineer status: ${input.remediation.engineer.status}
+- Engineer summary: ${input.remediation.engineer.summary}
+- Changed files:
+${list(input.remediation.engineer.changedFiles)}
+- Tests run:
+${list(input.remediation.engineer.testsRun)}
+- Test results: ${input.remediation.engineer.testResults || "(none reported)"}
+- Reviewer verdict on the remediation: ${input.remediation.reviewer.verdict}
+- Reviewer blocking findings:
+${list(input.remediation.reviewer.blockingFindings)}`
+    : "";
+  const delivered = input.engineers.map((e) => `- [${e.workPackageId}] ${e.summary}`).join("\n") || "(none)";
+  return `You are the Technical Lead of an AI Factory run that has ALREADY FINISHED and been ACCEPTED by the Architect. Your only job now is the final human-facing completion report for the actual accepted state.
+
+This is a bounded synthesis of accepted evidence. You MUST NOT modify any repository file, create commits, run any command that writes, or spawn any further agents. You MAY inspect the repository read-only (for example \`git log\`, \`git status\`, \`git diff --stat\`) to report the ending HEAD, the commits created during the run, and the final git status. Do NOT resume implementation or reopen remediation, even if you notice something you would have done differently: report it under warnings instead.
+
+Do not invent metrics, commits, hashes, or test results. If a fact cannot be determined from the repository or the evidence below, say "unknown".
+
+Original goal: ${input.task}
+Run id: ${input.runId}
+Run window: ${iso(input.runStartedAt)} to ${iso(input.runEndedAt)}
+Role models used: ${input.roleTargets.join(", ")}
+
+Accepted architecture: ${input.architecture}
+
+Lead integration packet:
+- Completed work packages:
+${delivered}
+- System verification: ${input.integration.systemVerification}
+- Important decisions:
+${list(input.integration.importantDecisions)}
+- Deviations:
+${list(input.integration.deviations)}
+- Reviewer findings — RESOLVED:
+${list(input.integration.reviewerFindingsResolved)}
+- Reviewer findings — ACCEPTED RISK:
+${list(input.integration.reviewerFindingsAcceptedRisk)}
+- Reviewer findings — UNRESOLVED:
+${list(input.integration.reviewerFindingsUnresolved)}
+- Factual assessment: ${input.integration.factualAssessment}${remediationBlock}
+
+Final Architect acceptance verdict: ${input.finalAcceptance.verdict}
+Architect required changes (already accepted; for context):
+${list(input.finalAcceptance.requiredChanges)}
+Architect required evidence:
+${list(input.finalAcceptance.requiredEvidence)}
+
+Deterministic orchestration facts: repair rounds ${input.repairRounds}, remediation rounds ${input.remediationRounds}.
+
+Produce the final report packet. "summary" is a concise overall synthesis a human can read first. "delivered" lists the major implementation outcomes. "architecture" lists the accepted architecture decisions/invariants. "reviewerFindings" lists each Reviewer finding and how it was dispositioned in the accepted state. "validation" lists the tests/build/probe results that were actually observed. "commits" lists the commits created during the run (empty if none). "endingHead" is the repository HEAD at completion. "pushed" says whether anything was pushed (a local clone often cannot tell — report "unknown" then). "humanVerification" lists what a human must still verify. "warnings" lists any limitations or contradictory evidence. If the task supplied an explicit requested completion checklist, satisfy that checklist explicitly using only accepted evidence.
+
+${STRUCTURED}`;
+}
+
 /** Mid-run Architect escalation (ARCHITECT_ESCALATION). */
 export function architectEscalationPrompt(input: {
   task: string;

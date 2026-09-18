@@ -65,16 +65,19 @@ describe("AI Factory — section 29 demonstrations", () => {
     await flush();
     complete(m, packets.accept);
     await flush();
+    complete(m, packets.finalReport);
+    await flush();
 
     expect(m.store.transitions).toEqual([
-      "DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "INTEGRATION", "FINAL_ARCHITECT", "DONE",
+      "DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "INTEGRATION",
+      "FINAL_ARCHITECT", "FINAL_SYNTHESIS", "DONE",
     ]);
     expect(phases(m)).toEqual([
       "discovery.lead", "initial.architect", "execution.engineer",
-      "review.reviewer", "integration.lead", "final.architect",
+      "review.reviewer", "integration.lead", "final.architect", "final_synthesis.lead",
     ]);
     // model calls = role runs spawned (no "oracle"/relay calls)
-    expect(m.controller.getState().metrics.totalAttempts).toBe(6);
+    expect(m.controller.getState().metrics.totalAttempts).toBe(7);
     expect(m.controller.getState().state).toBe("DONE");
   });
 
@@ -132,6 +135,8 @@ describe("AI Factory — section 29 demonstrations", () => {
     complete(m, packets.integration);
     await flush();
     complete(m, packets.accept);
+    await flush();
+    complete(m, packets.finalReport);
     await flush();
     expect(m.controller.getState().state).toBe("DONE");
   });

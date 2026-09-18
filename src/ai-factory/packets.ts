@@ -17,6 +17,7 @@ import type {
   ArchitectFinalResult,
   ArchitectInitialResult,
   EngineerPacket,
+  FinalReportPacket,
   LeadEscalationPacket,
   LeadIntegrationPacket,
   LeadProposalPacket,
@@ -31,6 +32,7 @@ export type PacketKind =
   | "reviewer"
   | "integration"
   | "architect_final"
+  | "final_report"
   | "lead_escalation";
 
 const strArr = { type: "array", items: { type: "string" } } as const;
@@ -130,6 +132,24 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       requiredEvidence: strArr,
     },
   },
+  final_report: {
+    type: "object",
+    additionalProperties: false,
+    required: ["result", "summary"],
+    properties: {
+      result: { type: "string" },
+      summary: { type: "string" },
+      delivered: strArr,
+      architecture: strArr,
+      reviewerFindings: strArr,
+      validation: strArr,
+      commits: strArr,
+      endingHead: { type: "string" },
+      pushed: { type: "string" },
+      humanVerification: strArr,
+      warnings: strArr,
+    },
+  },
   lead_escalation: {
     type: "object",
     additionalProperties: false,
@@ -217,6 +237,22 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       const verdict = raw.verdict;
       if (verdict !== "ACCEPT" && verdict !== "NEEDS_REMEDIATION") return undefined;
       return { verdict, blockingIssues: strList(raw.blockingIssues), requiredChanges: strList(raw.requiredChanges), doNotChange: strList(raw.doNotChange), requiredEvidence: strList(raw.requiredEvidence) } satisfies ArchitectFinalResult;
+    }
+    case "final_report": {
+      if (typeof raw.result !== "string" || typeof raw.summary !== "string") return undefined;
+      return {
+        result: raw.result,
+        summary: raw.summary,
+        delivered: strList(raw.delivered),
+        architecture: strList(raw.architecture),
+        reviewerFindings: strList(raw.reviewerFindings),
+        validation: strList(raw.validation),
+        commits: strList(raw.commits),
+        endingHead: str(raw.endingHead, "unknown"),
+        pushed: str(raw.pushed, "unknown"),
+        humanVerification: strList(raw.humanVerification),
+        warnings: strList(raw.warnings),
+      } satisfies FinalReportPacket;
     }
     case "lead_escalation": {
       const verdict = raw.verdict;

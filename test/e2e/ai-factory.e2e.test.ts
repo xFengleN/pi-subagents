@@ -7,9 +7,9 @@
  * schema. No network and no keys: the faux backend answers every model call.
  *
  * This is the section-29 happy-path smoke: Lead → initial Architect → Engineer
- * → Reviewer → Lead integration → final Architect → DONE, with every link
- * (bus RPC spawn, fresh child contexts, structured packets, deterministic
- * transitions, consume-on-settle) exercised for real.
+ * → Reviewer → Lead integration → final Architect → final Lead synthesis →
+ * DONE, with every link (bus RPC spawn, fresh child contexts, structured
+ * packets, deterministic transitions, consume-on-settle) exercised for real.
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -66,6 +66,19 @@ const PACKETS = {
     factualAssessment: "complete",
   },
   accept: { verdict: "ACCEPT", blockingIssues: [], requiredChanges: [], doNotChange: [], requiredEvidence: [] },
+  finalReport: {
+    result: "ACCEPT",
+    summary: "Implemented and validated the widgets package.",
+    delivered: ["widgets package with tests"],
+    architecture: ["single module"],
+    reviewerFindings: [],
+    validation: ["npm test: pass"],
+    commits: [],
+    endingHead: "unknown",
+    pushed: "unknown",
+    humanVerification: ["run the widgets package by hand"],
+    warnings: [],
+  },
 } as const;
 
 /** A project directory with a Factory config pointing at the faux model. */
@@ -101,7 +114,7 @@ afterEach(async () => {
 
 describe("AI Factory end to end (faux model, no network)", () => {
   it(
-    "runs Lead → initial Architect → Engineer → Reviewer → integration → final Architect → DONE",
+    "runs Lead → initial Architect → Engineer → Reviewer → integration → final Architect → final synthesis → DONE",
     async () => {
       const cwd = factoryProject();
       dirs.push(cwd);
@@ -130,6 +143,7 @@ describe("AI Factory end to end (faux model, no network)", () => {
             if (text.includes("independent implementation-correctness role")) return fauxToolCall("StructuredOutput", PACKETS.pass, { id: "so-rev" });
             if (text.includes("The implementation work is complete")) return fauxToolCall("StructuredOutput", PACKETS.integration, { id: "so-int" });
             if (text.includes("final architecture/acceptance checkpoint")) return fauxToolCall("StructuredOutput", PACKETS.accept, { id: "so-final" });
+            if (text.includes("bounded synthesis of accepted evidence")) return fauxToolCall("StructuredOutput", PACKETS.finalReport, { id: "so-report" });
             return fauxText("unexpected child");
           }
 
@@ -156,20 +170,25 @@ describe("AI Factory end to end (faux model, no network)", () => {
       expect(statusText).toContain('"state": "DONE"');
       expect(statusText).toContain('"runId"');
 
-      // The run's persisted state reached DONE, with all six role runs recorded.
+      // The run's persisted state reached DONE, with all seven role runs
+      // recorded (six implementation roles + the final Lead synthesis).
       const runId = statusText.match(/"runId": "(\S+)"/)?.[1];
       expect(runId).toBeTruthy();
       const stateFile = join(cwd, FACTORY_DIR, `${runId}.json`);
       expect(existsSync(stateFile)).toBe(true);
       const persisted = JSON.parse(readFileSync(stateFile, "utf8")) as {
         state: string;
-        metrics: { roles: Record<string, { attempts?: number }>; totals?: unknown };
+        results: { finalReport?: { packet?: { result?: string } } };
+        metrics: { roles: Record<string, { attempts?: number }>; totals?: unknown; calls?: unknown[] };
       };
       expect(persisted.state).toBe("DONE");
-      expect(persisted.metrics.roles.lead.attempts).toBe(2); // proposal + integration
+      expect(persisted.results.finalReport?.packet?.result).toBe("ACCEPT");
+      expect(persisted.metrics.roles.lead.attempts).toBe(3); // proposal + integration + final synthesis
       expect(persisted.metrics.roles.architect.attempts).toBe(2); // initial + final
       expect(persisted.metrics.roles.engineer.attempts).toBe(1);
       expect(persisted.metrics.roles.reviewer.attempts).toBe(1);
+      // Per-call telemetry exists for the metrics command.
+      expect(persisted.metrics.calls).toHaveLength(7);
     },
     120_000,
   );

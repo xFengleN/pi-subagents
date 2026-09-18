@@ -186,6 +186,8 @@ describe("AI Factory — restart/recovery", () => {
     await flush();
     m.transport.completeLastPacket(packets.accept);
     await flush();
+    m.transport.completeLastPacket(packets.finalReport);
+    await flush();
     expect(controller.getState().state).toBe("DONE");
 
     const m2 = make();

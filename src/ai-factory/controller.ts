@@ -13,12 +13,13 @@
 
 import type { Clock } from "./clock.js";
 import { targetsForRole } from "./config.js";
-import { emptyFactoryMetrics, recordSettleMetrics } from "./metrics.js";
+import { appendCallMetric, emptyFactoryMetrics, recordSettleMetrics } from "./metrics.js";
 import { type PacketKind, packetSchema, parsePacketTyped } from "./packets.js";
 import {
   architectEscalationPrompt,
   engineerPrompt,
   finalArchitectPrompt,
+  finalReportPrompt,
   initialArchitectPrompt,
   leadEscalationPrompt,
   leadIntegrationPrompt,
@@ -29,15 +30,16 @@ import {
 import { assertTransition, isTerminal } from "./state.js";
 import type { FactoryStore } from "./store.js";
 import { type AgentSettleInfo, classifyError, type FactoryTransport, type SpawnRequest } from "./transport.js";
-import type {
-  ArchitectInitialResult,
-  FactoryConfig,
-  FactoryRunState,
-  LeadEscalationPacket,
-  LeadIntegrationPacket,
-  ReviewerOutcome,
-  ReviewerPacket,
-  RoleName,
+import {
+  type ArchitectInitialResult,
+  type FactoryConfig,
+  type FactoryRunState,
+  type LeadEscalationPacket,
+  type LeadIntegrationPacket,
+  type ReviewerOutcome,
+  type ReviewerPacket,
+  ROLE_NAMES,
+  type RoleName,
 } from "./types.js";
 
 export interface FactoryControllerDeps {
@@ -229,7 +231,7 @@ export class FactoryController {
 
   private onSettled(info: AgentSettleInfo, ok: boolean): void {
     if (!this.state.inFlight || this.state.inFlight.agentId !== info.agentId) return;
-    const { role, phase } = this.state.inFlight;
+    const { role, phase, target } = this.state.inFlight;
     this.state.inFlight = undefined;
 
     // Consume synchronously so pi-subagents does not deliver this completion as
@@ -248,6 +250,24 @@ export class FactoryController {
       modelId: info.modelId,
       compactionCount: info.compactionCount,
       error: info.error,
+      completedAt: info.completedAt,
+    });
+    // Append-only per-call telemetry, so /factory-metrics can total honestly
+    // instead of only seeing the last settle per role.
+    appendCallMetric(this.state.metrics, {
+      role,
+      phase,
+      agentId: info.agentId,
+      target,
+      ok,
+      status: info.status,
+      usage: info.usage,
+      tokens: info.tokens,
+      toolUses: info.toolUses,
+      durationMs: info.durationMs,
+      modelName: info.modelName,
+      modelId: info.modelId,
+      compactionCount: info.compactionCount,
       completedAt: info.completedAt,
     });
     this.commit();
@@ -312,7 +332,9 @@ export class FactoryController {
         return s.results.integration ? { kind: "transition", to: "FINAL_ARCHITECT" } : { kind: "spawn", phase: "integration.lead" };
       case "FINAL_ARCHITECT": {
         if (!s.results.finalArchitect) return { kind: "spawn", phase: "final.architect" };
-        if (s.results.finalArchitect.packet.verdict === "ACCEPT") return { kind: "transition", to: "DONE" };
+        // ACCEPT never goes straight to DONE: every accepted run must pass
+        // through exactly one bounded final Lead synthesis first.
+        if (s.results.finalArchitect.packet.verdict === "ACCEPT") return { kind: "transition", to: "FINAL_SYNTHESIS" };
         if (s.remediationRounds < this.config.maxArchitectRemediationRounds) {
           s.remediationRounds++;
           return { kind: "transition", to: "REMEDIATION" };
@@ -327,8 +349,13 @@ export class FactoryController {
       }
       case "FINAL_ARCHITECT_RECHECK": {
         if (!s.results.finalRecheck) return { kind: "spawn", phase: "final_recheck.architect" };
-        return { kind: "transition", to: s.results.finalRecheck.packet.verdict === "ACCEPT" ? "DONE" : "STOPPED" };
+        return { kind: "transition", to: s.results.finalRecheck.packet.verdict === "ACCEPT" ? "FINAL_SYNTHESIS" : "STOPPED" };
       }
+      case "FINAL_SYNTHESIS":
+        // The accepted state gets one bounded Lead synthesis, then DONE. The
+        // presence of the persisted packet is the deterministic completion
+        // signal; the synthesis can never send the run back into remediation.
+        return s.results.finalReport ? { kind: "transition", to: "DONE" } : { kind: "spawn", phase: "final_synthesis.lead" };
       case "WAITING_CAPACITY":
         return this.parkedAction();
       default:
@@ -432,6 +459,36 @@ export class FactoryController {
             ...(rem?.engineer && rem.reviewer
               ? { remediation: { engineer: rem.engineer.packet, reviewer: rem.reviewer.packet } }
               : {}),
+          }),
+        };
+      }
+      case "final_synthesis.lead": {
+        // The accepted packet is whichever Architect gate accepted the run. The
+        // synthesis is told the post-remediation state when one exists, so its
+        // report describes the ACTUAL accepted state, not the pre-fix packet.
+        const accepted = s.results.finalRecheck ?? s.results.finalArchitect;
+        const rem = s.results.remediation;
+        return {
+          role: "lead",
+          kind: "final_report",
+          prompt: finalReportPrompt({
+            runId: this.runId,
+            task: s.task,
+            architecture: s.effectiveArchitecture,
+            integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
+            finalAcceptance: accepted!.packet,
+            engineers: s.results.engineers.map((e) => e.outcome.packet),
+            reviewers: s.results.reviewers.map((r) => r.outcome.packet),
+            ...(rem?.engineer && rem.reviewer
+              ? { remediation: { engineer: rem.engineer.packet, reviewer: rem.reviewer.packet } }
+              : {}),
+            runStartedAt: s.createdAt,
+            // The run has not gone terminal yet (DONE follows this synthesis),
+            // so use the accepted-state clock time as the window end.
+            runEndedAt: s.metrics.runEndedAt ?? this.clock.now(),
+            repairRounds: s.repairRound,
+            remediationRounds: s.remediationRounds,
+            roleTargets: ROLE_NAMES.map((role) => `${role}: ${s.metrics.roles[role].targetUsed ?? this.config.roles[role]?.targets?.primary ?? "unknown"}`),
           }),
         };
       }
@@ -731,6 +788,12 @@ export class FactoryController {
         break;
       case "final_recheck.architect":
         s.results.finalRecheck = outcome;
+        break;
+      case "final_synthesis.lead":
+        // Preserved separately from integration/finalArchitect/finalRecheck so
+        // the rejected integration packet and both Architect gates remain as
+        // audit history for the run.
+        s.results.finalReport = outcome;
         break;
       case "remediation.engineer":
         s.results.remediation = { ...(s.results.remediation ?? {}), engineer: outcome };

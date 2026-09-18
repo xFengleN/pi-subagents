@@ -21,14 +21,19 @@ import { type FactoryState, TERMINAL_STATES } from "./types.js";
  *   REVIEW / EXECUTION   --(architectural)--> ARCHITECT_ESCALATION
  *   ARCHITECT_ESCALATION --(Architect corrected)--> EXECUTION
  *   INTEGRATION          --(Lead acceptance packet)--> FINAL_ARCHITECT
- *   FINAL_ARCHITECT      --(ACCEPT)--> DONE
+ *   FINAL_ARCHITECT      --(ACCEPT)--> FINAL_SYNTHESIS
  *   FINAL_ARCHITECT      --(NEEDS_REMEDIATION, rounds left)--> REMEDIATION
  *   REMEDIATION          --(Engineer+Reviewer done)--> FINAL_ARCHITECT_RECHECK
- *   FINAL_ARCHITECT_RECHECK --(ACCEPT)--> DONE
+ *   FINAL_ARCHITECT_RECHECK --(ACCEPT)--> FINAL_SYNTHESIS
  *   FINAL_ARCHITECT_RECHECK --(reject, budget exhausted)--> STOPPED
+ *   FINAL_SYNTHESIS      --(Lead report persisted)--> DONE
  *   any active state     --(all targets unavailable)--> WAITING_CAPACITY
  *   WAITING_CAPACITY     --(capacity available)--> resumeState
  *   any active state     --(unrecoverable)--> FAILED / STOPPED
+ *
+ * FINAL_SYNTHESIS is the mandatory finalization gate: EVERY accepted run,
+ * including one that went through remediation, must produce exactly one final
+ * Lead synthesis before DONE. It cannot go back to implementation.
  *
  * WAITING_CAPACITY may transition back to any resume state (it records the
  * state to resume into), so it is intentionally open.
@@ -40,16 +45,17 @@ const TRANSITIONS: Record<FactoryState, readonly FactoryState[]> = {
   REVIEW: ["INTEGRATION", "EXECUTION", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   ARCHITECT_ESCALATION: ["EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   INTEGRATION: ["FINAL_ARCHITECT", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  FINAL_ARCHITECT: ["DONE", "REMEDIATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  FINAL_ARCHITECT: ["FINAL_SYNTHESIS", "REMEDIATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   REMEDIATION: ["FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  FINAL_ARCHITECT_RECHECK: ["DONE", "STOPPED", "WAITING_CAPACITY", "FAILED"],
+  FINAL_ARCHITECT_RECHECK: ["FINAL_SYNTHESIS", "STOPPED", "WAITING_CAPACITY", "FAILED"],
+  FINAL_SYNTHESIS: ["DONE", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   WAITING_CAPACITY: [
     // Resume targets; the run records which one it came from and may return to
     // any active state. Terminal states are also reachable if a wake discovers
     // the situation has become unrecoverable.
     "DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "ARCHITECT_ESCALATION",
     "INTEGRATION", "FINAL_ARCHITECT", "REMEDIATION", "FINAL_ARCHITECT_RECHECK",
-    "FAILED", "STOPPED",
+    "FINAL_SYNTHESIS", "FAILED", "STOPPED",
   ],
   DONE: [],
   STOPPED: [],

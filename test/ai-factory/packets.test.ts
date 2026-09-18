@@ -7,7 +7,7 @@ import { packetSchema, parsePacket } from "../../src/ai-factory/packets.js";
 
 describe("AI Factory — packets", () => {
   it("packet schemas compile and reject garbage", () => {
-    for (const kind of ["proposal", "architect_initial", "engineer", "reviewer", "integration", "architect_final", "lead_escalation"] as const) {
+    for (const kind of ["proposal", "architect_initial", "engineer", "reviewer", "integration", "architect_final", "final_report", "lead_escalation"] as const) {
       const schema = packetSchema(kind);
       expect(schema.check({})).not.toBe(true); // required fields missing
     }

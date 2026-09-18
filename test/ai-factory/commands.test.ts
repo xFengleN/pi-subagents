@@ -14,10 +14,12 @@ import { formatRunStatus } from "../../src/ai-factory/commands.js";
 import { defaultFactoryConfig, factoryBaseState, loadPresetAsWorkingConfig, mergeFactoryConfig, resolvePresetConfig, writeProjectConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
 import factoryExtension from "../../src/ai-factory/index.js";
+import { emptyFactoryMetrics } from "../../src/ai-factory/metrics.js";
 import { savePreset } from "../../src/ai-factory/presets.js";
 import { FactoryStore } from "../../src/ai-factory/store.js";
+import type { FactoryRunState } from "../../src/ai-factory/types.js";
 import { ctx as baseCtx, hermeticDir, makePi } from "../helpers/boot-extension.js";
-import { FakeClock, FakeTransport, flush } from "./fakes.js";
+import { FakeClock, FakeTransport, flush, packets } from "./fakes.js";
 
 const hermetic: ReturnType<typeof hermeticDir>[] = [];
 afterEach(() => {
@@ -307,6 +309,165 @@ describe("AI Factory — slash commands", () => {
     expect(statusText).toContain("old/lead");
     expect(statusText).toContain("Run configuration snapshot");
     expect(statusText).not.toContain("new/lead");
+    expect(b.spawns).toHaveLength(0);
+  });
+});
+
+/** A completed (DONE) run state carrying a persisted final report. */
+function completedState(
+  cwd: string,
+  runId: string,
+  summary: string,
+  overrides: Partial<FactoryRunState> = {},
+): FactoryRunState {
+  return {
+    version: 1,
+    runId,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    task: "t",
+    cwd,
+    config: defaultFactoryConfig(),
+    state: "DONE",
+    repairRound: 0,
+    repairExhausted: false,
+    effectiveArchitecture: "arch",
+    remediationRounds: 0,
+    architectEscalations: 0,
+    leadEscalations: 0,
+    results: {
+      engineers: [],
+      reviewers: [],
+      finalReport: { packet: { ...packets.finalReport, summary }, agentId: "x" },
+    },
+    metrics: { ...emptyFactoryMetrics(1_000), runEndedAt: 2_000, runDurationMs: 1_000 },
+    errors: [],
+    parked: false,
+    ...overrides,
+  };
+}
+
+describe("AI Factory — /factory-report", () => {
+  it("E. prints the latest completed run's persisted final report", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_old_report", "Old report summary.", { updatedAt: 1_000 }));
+    store.save(completedState(cwd, "factory_new_report", "New report summary.", { updatedAt: 3_000 }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-report").handler("", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("factory_new_report");
+    expect(text).toContain("New report summary.");
+    expect(text).not.toContain("Old report summary.");
+    expect(text).toContain("Full report persisted: .pi/factory/factory_new_report.json");
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("F. /factory-report <runId> prints that run's persisted report", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_old_report", "Old report summary.", { updatedAt: 1_000 }));
+    store.save(completedState(cwd, "factory_new_report", "New report summary.", { updatedAt: 3_000 }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-report").handler("factory_old_report", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("factory_old_report");
+    expect(text).toContain("Old report summary.");
+    expect(text).not.toContain("New report summary.");
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("G. legacy run without finalReport falls back to the finalRecheck packet", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_legacy", "", {
+      results: {
+        engineers: [],
+        reviewers: [],
+        integration: { packet: packets.integration, agentId: "i" },
+        finalRecheck: { packet: packets.accept, agentId: "r" },
+      },
+    }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-report").handler("", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("LEGACY FALLBACK");
+    expect(text).toContain("Final Architect verdict (recheck): ACCEPT");
+    expect(text).toContain("npm test green"); // the preserved integration packet
+    expect(b.spawns).toHaveLength(0);
+  });
+});
+
+describe("AI Factory — /factory-status compactness", () => {
+  it("H. a live run shows the compact live fields", () => {
+    const state = completedState("/tmp/x", "factory_live", "unused");
+    state.state = "EXECUTION";
+    state.results = { engineers: [], reviewers: [] };
+    state.inFlight = { role: "engineer", phase: "execution.engineer", agentId: "a", target: "p/eng", spawnedAt: 1_000 };
+    state.metrics.roles.engineer.targetUsed = "p/eng";
+
+    const text = formatRunStatus(state);
+    expect(text).toContain("Current run: factory_live");
+    expect(text).toContain("state: EXECUTION");
+    expect(text).toContain("phase: execution.engineer   active role: engineer");
+    expect(text).toContain("active model: p/eng");
+    expect(text).toContain("elapsed:");
+    expect(text).toContain("retries:");
+  });
+
+  it("I. a completed run shows a compact summary, not the full report", () => {
+    const state = completedState("/tmp/x", "factory_done2", "UNIQUE SUMMARY SENTINEL");
+    state.metrics.roles.lead.targetUsed = "old/lead";
+
+    const text = formatRunStatus(state);
+    expect(text).toContain("Latest completed run: factory_done2");
+    expect(text).toContain("result: ACCEPT");
+    expect(text).toContain("final HEAD: abc1234");
+    expect(text).toContain("commits: 1");
+    expect(text).toContain("validation: npm test: pass");
+    expect(text).toContain("human verification: PENDING (1)");
+    expect(text).not.toContain("UNIQUE SUMMARY SENTINEL");
+  });
+
+  it("M. the Factory commands register distinctly without aliases", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    for (const name of ["factory-status", "factory-report", "factory-metrics"]) {
+      expect(b.commands.has(name), `missing command ${name}`).toBe(true);
+    }
+    expect(b.commands.has("factory-stats")).toBe(false);
+    expect(b.commands.has("factory-summary")).toBe(false);
+  });
+
+  it("N. /factory-metrics reads persisted metrics without a model call", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const state = completedState(cwd, "factory_metrics", "s");
+    state.metrics.roles.lead.attempts = 2;
+    state.metrics.roles.lead.targetUsed = "p/lead";
+    state.metrics.calls = [
+      { role: "lead", phase: "discovery.lead", agentId: "a", ok: true, input: 100, output: 50, cacheRead: 1000, cacheWrite: 10, logicalTokens: 160, cost: 0.01, durationMs: 10 },
+    ];
+    store.save(state);
+
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-metrics").handler("", ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory metrics"))?.message ?? "";
+    expect(text).toContain("Run: factory_metrics");
+    expect(text).toMatch(/Total\s+2/);
+    expect(text).toMatch(/Input\s+100/);
     expect(b.spawns).toHaveLength(0);
   });
 });

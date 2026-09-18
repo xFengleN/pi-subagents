@@ -24,18 +24,24 @@ describe("AI Factory — state machine legality", () => {
     expect(isLegalTransition("REVIEW", "EXECUTION")).toBe(true); // repair loop
     expect(isLegalTransition("REVIEW", "ARCHITECT_ESCALATION")).toBe(true);
     expect(isLegalTransition("INTEGRATION", "FINAL_ARCHITECT")).toBe(true);
-    expect(isLegalTransition("FINAL_ARCHITECT", "DONE")).toBe(true);
+    // ACCEPT must pass through the final Lead synthesis, never straight to DONE.
+    expect(isLegalTransition("FINAL_ARCHITECT", "FINAL_SYNTHESIS")).toBe(true);
+    expect(isLegalTransition("FINAL_ARCHITECT", "DONE")).toBe(false);
     expect(isLegalTransition("FINAL_ARCHITECT", "REMEDIATION")).toBe(true);
     expect(isLegalTransition("REMEDIATION", "FINAL_ARCHITECT_RECHECK")).toBe(true);
-    expect(isLegalTransition("FINAL_ARCHITECT_RECHECK", "DONE")).toBe(true);
+    expect(isLegalTransition("FINAL_ARCHITECT_RECHECK", "FINAL_SYNTHESIS")).toBe(true);
     expect(isLegalTransition("FINAL_ARCHITECT_RECHECK", "STOPPED")).toBe(true);
+    expect(isLegalTransition("FINAL_SYNTHESIS", "DONE")).toBe(true);
+    // A final synthesis can never re-enter implementation.
+    expect(isLegalTransition("FINAL_SYNTHESIS", "REMEDIATION")).toBe(false);
+    expect(isLegalTransition("FINAL_SYNTHESIS", "EXECUTION")).toBe(false);
   });
 
   it("treats every state as capacity-parkable and resumable", () => {
-    for (const state of ["DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "ARCHITECT_ESCALATION", "INTEGRATION", "FINAL_ARCHITECT", "REMEDIATION", "FINAL_ARCHITECT_RECHECK"] as const) {
+    for (const state of ["DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "ARCHITECT_ESCALATION", "INTEGRATION", "FINAL_ARCHITECT", "REMEDIATION", "FINAL_ARCHITECT_RECHECK", "FINAL_SYNTHESIS"] as const) {
       expect(isLegalTransition(state, "WAITING_CAPACITY"), `${state} -> WAITING_CAPACITY`).toBe(true);
     }
-    for (const state of ["DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "INTEGRATION", "FINAL_ARCHITECT"] as const) {
+    for (const state of ["DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "INTEGRATION", "FINAL_ARCHITECT", "FINAL_SYNTHESIS"] as const) {
       expect(isLegalTransition("WAITING_CAPACITY", state), `WAITING_CAPACITY -> ${state}`).toBe(true);
     }
   });

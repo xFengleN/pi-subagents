@@ -19,7 +19,9 @@ import { Container, getKeybindings, Input, SelectList, type SettingItem, Setting
 import { loadFactoryConfig, validateFactoryConfig } from "./config.js";
 import { type ConfigUI, filterModels, type MenuRow, type ModelOption, showFactoryConfigUI } from "./config-ui.js";
 import type { FactoryController } from "./controller.js";
+import { formatDuration, formatRunMetrics } from "./metrics.js";
 import { isTerminal } from "./state.js";
+import { FACTORY_DIR } from "./store.js";
 import { type FactoryRunState, ROLE_NAMES, type RoleName } from "./types.js";
 
 export interface FactoryRunListItem {
@@ -62,25 +64,140 @@ function availableModels(ctx: ExtensionContext): string[] {
  *
  * This is HISTORICAL / current-run state — the models a run actually used — not
  * the configuration the next run will use. The labels make that explicit.
+ *
+ * It stays compact by design: it summarises a completed run but never prints the
+ * final report itself. Use `/factory-report` for that.
  */
 export function formatRunStatus(state: FactoryRunState): string {
   const m = state.metrics;
   const terminal = isTerminal(state.state);
-  const lines = [
-    terminal ? `Latest completed run: ${state.runId}` : `Current run: ${state.runId}`,
-    `state: ${state.state}${state.parked ? " (parked)" : ""}`,
-    `phase: ${state.inFlight?.phase ?? "-"}   active role: ${state.inFlight?.role ?? "-"}`,
-    `repairRound: ${state.repairRound}   remediationRounds: ${state.remediationRounds}`,
-    `retries: ${m.totalRetries}   fallbacks: ${m.totalFallbacks}   capacityWaits: ${m.capacityWaits}`,
-    "Run configuration snapshot (models THIS run used — not the next run's config):",
-    ...ROLE_NAMES.map((role) => `  ${role}: ${m.roles[role].targetUsed ?? "-"}`),
-    `updated: ${new Date(state.updatedAt).toISOString()}`,
-  ];
+  const finalReport = state.results.finalReport?.packet;
+  const lines: string[] = [];
+  if (terminal) {
+    const verdict = finalReport?.result
+      ?? state.results.finalRecheck?.packet.verdict
+      ?? state.results.finalArchitect?.packet.verdict
+      ?? state.stoppedReason
+      ?? "-";
+    lines.push(`Latest completed run: ${state.runId}`);
+    lines.push(`state: ${state.state}`);
+    lines.push(`result: ${verdict}`);
+    if (m.runDurationMs !== undefined) lines.push(`duration: ${formatDuration(m.runDurationMs)}`);
+  } else {
+    lines.push(`Current run: ${state.runId}`);
+    lines.push(`state: ${state.state}${state.parked ? " (parked)" : ""}`);
+    lines.push(`phase: ${state.inFlight?.phase ?? "-"}   active role: ${state.inFlight?.role ?? "-"}`);
+    lines.push(`active model: ${state.inFlight?.target ?? "-"}`);
+    if (m.runStartedAt > 0) lines.push(`elapsed: ${formatDuration(Math.max(0, Date.now() - m.runStartedAt))}`);
+  }
+  lines.push(`repairRound: ${state.repairRound}   remediationRounds: ${state.remediationRounds}`);
+  lines.push(`retries: ${m.totalRetries}   fallbacks: ${m.totalFallbacks}   capacityWaits: ${m.capacityWaits}`);
+  if (terminal) {
+    const head = finalReport?.endingHead ?? "-";
+    const commits = finalReport ? finalReport.commits.length : "-";
+    const validation = finalReport?.validation[0] ?? state.results.integration?.packet.systemVerification ?? "-";
+    const pending = finalReport?.humanVerification.length ?? 0;
+    lines.push(`final HEAD: ${head}   commits: ${commits}`);
+    lines.push(`validation: ${validation}`);
+    lines.push(`human verification: ${pending > 0 ? `PENDING (${pending})` : "none recorded"}`);
+  }
+  lines.push("Run configuration snapshot (models THIS run used — not the next run's config):");
+  lines.push(...ROLE_NAMES.map((role) => `  ${role}: ${m.roles[role].targetUsed ?? "-"}`));
+  lines.push(`updated: ${new Date(state.updatedAt).toISOString()}`);
   const lastError = state.errors[state.errors.length - 1];
   if (lastError) lines.push(`last error: ${lastError.message}`);
   if (state.stoppedReason) lines.push(`stopped: ${state.stoppedReason}`);
   lines.push("Use /factory-config to view the configuration for the next run.");
   return lines.join("\n");
+}
+
+function section(lines: string[], title: string, items: string[]): void {
+  if (items.length === 0) return;
+  lines.push("");
+  lines.push(title);
+  for (const item of items) lines.push(`- ${item}`);
+}
+
+/** Body used when a run predates the final Lead synthesis. */
+function legacyReportBody(state: FactoryRunState): string {
+  const accepted = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+  const integration = state.results.integration?.packet;
+  const lines: string[] = [];
+  if (integration) {
+    lines.push("Accepted integration (preserved):");
+    lines.push(`- System verification: ${integration.systemVerification}`);
+    lines.push(`- Factual assessment: ${integration.factualAssessment}`);
+    for (const finding of integration.reviewerFindingsUnresolved) lines.push(`- Unresolved reviewer finding: ${finding}`);
+  }
+  if (accepted) {
+    if (lines.length > 0) lines.push("");
+    const gate = state.results.finalRecheck ? "recheck" : "final gate";
+    lines.push(`Final Architect verdict (${gate}): ${accepted.verdict}`);
+    for (const change of accepted.requiredChanges) lines.push(`- Required change: ${change}`);
+  }
+  if (lines.length === 0) lines.push("No accepted artifact is available for this run.");
+  return lines.join("\n");
+}
+
+/**
+ * The single human-facing final report. `/factory-report` and the automatic
+ * post-run rendering both print this, so there is no second, divergent summary.
+ *
+ * Uses the persisted `results.finalReport` when present; for a run that predates
+ * it, falls back (clearly labelled) to the accepted Architect/integration
+ * artifacts.
+ */
+export function formatFactoryReport(state: FactoryRunState): string {
+  const finalReport = state.results.finalReport?.packet;
+  const lines: string[] = ["Factory final report", `Run: ${state.runId}`];
+  if (finalReport) {
+    lines.push(`Result: ${finalReport.result}`);
+  } else {
+    lines.push("Result: (LEGACY FALLBACK — this run has no final Lead synthesis recorded)");
+  }
+  if (state.metrics.runDurationMs !== undefined) lines.push(`Duration: ${formatDuration(state.metrics.runDurationMs)}`);
+  lines.push(`Remediation rounds: ${state.remediationRounds}`);
+  if (finalReport) {
+    if (finalReport.summary.trim() !== "") {
+      lines.push("");
+      lines.push(finalReport.summary.trim());
+    }
+    section(lines, "Delivered", finalReport.delivered);
+    section(lines, "Architecture / decisions", finalReport.architecture);
+    section(lines, "Reviewer findings", finalReport.reviewerFindings);
+    section(lines, "Validation", finalReport.validation);
+    section(lines, "Commits", finalReport.commits);
+    if (finalReport.endingHead) lines.push(`Ending HEAD: ${finalReport.endingHead}`);
+    if (finalReport.pushed) lines.push(`Pushed: ${finalReport.pushed}`);
+    section(lines, "Human verification (pending)", finalReport.humanVerification);
+    section(lines, "Warnings / limitations", finalReport.warnings);
+  } else {
+    lines.push("");
+    lines.push(legacyReportBody(state));
+  }
+  lines.push("");
+  lines.push(`Full report persisted: ${FACTORY_DIR}/${state.runId}.json`);
+  return lines.join("\n");
+}
+
+/** Automatic post-run rendering: the persisted final report, or a short notice. */
+export function formatFactoryCompletion(state: FactoryRunState): string {
+  if (state.state === "DONE") return formatFactoryReport(state);
+  return `Factory run ${state.runId} ended ${state.state}. Use /factory-status for details.`;
+}
+
+/** State for a run or undefined, reading persisted state only (no model calls). */
+function reportStateFor(runId: string | undefined, cwd: string, runtime: FactoryCommandRuntime): FactoryRunState | undefined {
+  if (runId !== undefined && runId !== "") return runtime.peekState(runId, cwd);
+  const runs = runtime.listRuns(cwd); // newest first
+  const newestFirst = runs.map((run) => runtime.peekState(run.runId, cwd)).filter((s): s is FactoryRunState => s !== undefined);
+  return newestFirst.find((s) => s.results.finalReport !== undefined)
+    ?? newestFirst.find((s) => s.state === "DONE");
+}
+
+function latestStateFor(cwd: string, runtime: FactoryCommandRuntime): FactoryRunState | undefined {
+  const runs = runtime.listRuns(cwd);
+  return runs.length > 0 ? runtime.peekState(runs[0].runId, cwd) : undefined;
 }
 
 export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryCommandRuntime): void {
@@ -109,6 +226,15 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
       }
       const { id, controller } = runtime.launch(ctx.cwd, task);
       ctx.ui.notify(`Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}`, "info");
+      // Auto-render the final report when the run finishes, so the invoking
+      // session shows the result without the user remembering another command.
+      // Uses the persisted finalReport via the same formatter /factory-report
+      // uses — never a second, divergent summary.
+      if (ctx.hasUI) {
+        void controller.waitForTerminal().then((final) => {
+          ctx.ui.notify(formatFactoryCompletion(final), final.state === "DONE" ? "info" : "warning");
+        });
+      }
     },
   });
 
@@ -127,6 +253,40 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
         return;
       }
       ctx.ui.notify(formatRunStatus(state), "info");
+    },
+  });
+
+  pi.registerCommand("factory-report", {
+    description: "Print the final human-readable report for the latest completed AI Factory run (read-only; no model call). Optionally pass a run id.",
+    handler: async (args, ctx) => {
+      const runId = args.trim();
+      const state = reportStateFor(runId === "" ? undefined : runId, ctx.cwd, runtime);
+      if (!state) {
+        ctx.ui.notify(
+          runId !== "" ? `Factory run not found: ${runId}` : "No completed Factory run found for this project.",
+          "info",
+        );
+        return;
+      }
+      ctx.ui.notify(formatFactoryReport(state), "info");
+    },
+  });
+
+  pi.registerCommand("factory-metrics", {
+    description: "Show operational metrics for the latest AI Factory run (read-only; no model call). Optionally pass a run id.",
+    handler: async (args, ctx) => {
+      const runId = args.trim();
+      const state = runId !== ""
+        ? runtime.peekState(runId, ctx.cwd)
+        : latestStateFor(ctx.cwd, runtime);
+      if (!state) {
+        ctx.ui.notify(
+          runId !== "" ? `Factory run not found: ${runId}` : "No Factory run found for this project.",
+          "info",
+        );
+        return;
+      }
+      ctx.ui.notify(formatRunMetrics(state), "info");
     },
   });
 

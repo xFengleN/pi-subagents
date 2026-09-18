@@ -242,7 +242,7 @@ describe("AI Factory controller — state machine", () => {
     expect(m.transport.spawned.at(-1)?.phase).toBe("final.architect");
   });
 
-  it("11. Final Architect ACCEPT completes the run as DONE", async () => {
+  it("11. Final Architect ACCEPT finalizes through the Lead synthesis, then DONE", async () => {
     const m = makeWithCleanup();
     await startRun(m);
     complete(m, packets.proposal);
@@ -258,7 +258,15 @@ describe("AI Factory controller — state machine", () => {
     complete(m, packets.accept);
     await flush();
 
+    // ACCEPT never goes straight to DONE: one bounded final Lead synthesis runs.
+    expect(m.controller.getState().state).toBe("FINAL_SYNTHESIS");
+    expect(m.transport.spawned.at(-1)?.phase).toBe("final_synthesis.lead");
+
+    complete(m, packets.finalReport);
+    await flush();
+
     expect(m.controller.getState().state).toBe("DONE");
+    expect(m.controller.getState().results.finalReport?.packet.result).toBe("ACCEPT");
     expect(m.controller.getState().metrics.runEndedAt).toBeTypeOf("number");
   });
 
@@ -308,8 +316,14 @@ describe("AI Factory controller — state machine", () => {
 
     complete(m, packets.accept);
     await flush();
+    expect(m.controller.getState().state).toBe("FINAL_SYNTHESIS");
+    // Exactly one final synthesis on the remediated path too.
+    expect(m.transport.spawned.filter((s) => s.phase === "final_synthesis.lead")).toHaveLength(1);
+    complete(m, packets.finalReportRemediated);
+    await flush();
     expect(m.controller.getState().state).toBe("DONE");
     expect(m.controller.getState().remediationRounds).toBe(1);
+    expect(m.controller.getState().results.finalReport?.packet.result).toBe("ACCEPT (after remediation)");
   });
 
   it("14. A second failure after budget exhaustion ends STOPPED, not a loop", async () => {
@@ -354,19 +368,22 @@ describe("AI Factory controller — state machine", () => {
     await flush();
     complete(m, packets.accept);
     await flush();
+    complete(m, packets.finalReport);
+    await flush();
 
     // Every spawned phase is a real role run. There is no "oracle" or
     // "decide-next-step" phase anywhere — the state machine never spends a
     // model turn merely to authorize a transition.
     const allowedPhases = new Set([
       "discovery.lead", "initial.architect", "execution.engineer", "review.reviewer",
-      "integration.lead", "final.architect",
+      "integration.lead", "final.architect", "final_synthesis.lead",
     ]);
     for (const phase of phases(m)) expect(allowedPhases.has(phase), `unexpected phase ${phase}`).toBe(true);
-    // The canonical happy path invokes exactly six role runs.
+    // The canonical happy path invokes exactly seven role runs: the six
+    // implementation roles plus the one final Lead synthesis.
     expect(phases(m)).toEqual([
       "discovery.lead", "initial.architect", "execution.engineer", "review.reviewer",
-      "integration.lead", "final.architect",
+      "integration.lead", "final.architect", "final_synthesis.lead",
     ]);
   });
 });

@@ -35,6 +35,7 @@ export const FACTORY_STATES = [
   "FINAL_ARCHITECT",      // mandatory final architecture/acceptance checkpoint
   "REMEDIATION",          // Engineer/Reviewer fix what the final Architect rejected
   "FINAL_ARCHITECT_RECHECK", // bounded Architect recheck after remediation
+  "FINAL_SYNTHESIS",      // bounded Lead synthesis of the accepted evidence (no code changes)
   "WAITING_CAPACITY",     // all targets for a required role are unavailable
   "DONE",                 // accepted
   "STOPPED",              // rejected past a budget, or stopped by the user
@@ -123,6 +124,39 @@ export interface ArchitectFinalResult {
   requiredEvidence: string[];
 }
 
+/**
+ * Final Lead synthesis packet (FINAL_SYNTHESIS).
+ *
+ * This is NOT an implementation packet: the run has already been accepted by
+ * the Architect. It is the bounded, human-facing report for the actual accepted
+ * state, assembled from persisted evidence only. It never reopens remediation
+ * and never triggers repo changes or further agents.
+ */
+export interface FinalReportPacket {
+  /** Final result/verdict, e.g. "ACCEPT". */
+  result: string;
+  /** Concise overall synthesis paragraph. */
+  summary: string;
+  /** Major implementation outcomes delivered by the run. */
+  delivered: string[];
+  /** Architecture decisions / invariants that hold in the accepted state. */
+  architecture: string[];
+  /** Reviewer findings and how each was resolved/accepted. */
+  reviewerFindings: string[];
+  /** Tests/build/probe results observed. */
+  validation: string[];
+  /** Commits created by the run (read-only git evidence). */
+  commits: string[];
+  /** Ending HEAD, or "unknown" when it could not be determined. */
+  endingHead: string;
+  /** Whether anything was pushed ("no", a description, or "unknown"). */
+  pushed: string;
+  /** Human verification still pending. */
+  humanVerification: string[];
+  /** Warnings, limitations, or contradictory evidence. */
+  warnings: string[];
+}
+
 /** Lead disposition after a bounded repair loop is exhausted. */
 export interface LeadEscalationPacket {
   verdict: "continue" | "stop";
@@ -137,6 +171,7 @@ export type Packet =
   | ReviewerPacket
   | LeadIntegrationPacket
   | ArchitectFinalResult
+  | FinalReportPacket
   | LeadEscalationPacket;
 
 /* -------------------------------------------------------------------------- */
@@ -221,6 +256,13 @@ export interface PhaseResults {
   integration?: RoleOutcome<LeadIntegrationPacket>;
   finalArchitect?: RoleOutcome<ArchitectFinalResult>;
   finalRecheck?: RoleOutcome<ArchitectFinalResult>;
+  /**
+   * Final human-facing Lead synthesis for the ACTUAL accepted state. Produced
+   * once the final Architect/ recheck accepted, for both the normal and the
+   * remediated path. `integration`/`finalArchitect`/`finalRecheck` remain as
+   * preserved audit history and are never overwritten by it.
+   */
+  finalReport?: RoleOutcome<FinalReportPacket>;
   escalationArchitect?: RoleOutcome<ArchitectInitialResult>;
   leadEscalation?: RoleOutcome<LeadEscalationPacket>;
   /** One remediation cycle: the Engineer fix + Reviewer recheck. */
@@ -348,8 +390,44 @@ export interface RoleMetrics {
   error?: string;
 }
 
+/**
+ * One settled role-agent call. Append-only per-call telemetry, so totals and
+ * context/performance aggregates are derived honestly instead of only seeing
+ * the last settle per role. Optional on the run state: runs persisted before it
+ * existed simply have no per-call records, and readers degrade gracefully.
+ */
+export interface CallMetric {
+  role: RoleName;
+  /** Stable sub-phase label the call ran for, e.g. "execution.engineer". */
+  phase: string;
+  agentId: string;
+  /** Configured target attempted, when known. */
+  target?: string;
+  /** Actual resolved model name/id from the settle record, when exposed. */
+  modelName?: string;
+  modelId?: string;
+  ok: boolean;
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  /** Logical (billed-by-work) tokens: input + output + cacheWrite. */
+  logicalTokens?: number;
+  cost?: number;
+  toolUses?: number;
+  compactionCount?: number;
+}
+
 export interface FactoryMetrics {
   roles: Record<RoleName, RoleMetrics>;
+  /**
+   * Append-only settled-call records. Absent on runs persisted before this
+   * field existed; readers must treat `undefined` as "unknown", never as zero.
+   */
+  calls?: CallMetric[];
   /** Total spawn attempts across all roles. */
   totalAttempts: number;
   /** Total transient retries across all roles. */
