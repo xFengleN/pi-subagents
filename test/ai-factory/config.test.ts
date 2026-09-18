@@ -14,6 +14,7 @@ import {
   factoryBaseState,
   factoryConfigPath,
   loadFactoryConfig,
+  loadPresetAsWorkingConfig,
   mergeFactoryConfig,
   projectPresetName,
   readProjectConfig,
@@ -145,7 +146,7 @@ describe("AI Factory — config resolution and validation", () => {
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Save current configuration as new preset…" : "Back";
+          return presetCalls === 1 ? "Save as new preset…" : "Back";
         }
         return undefined;
       },
@@ -244,7 +245,7 @@ describe("AI Factory — config resolution and validation", () => {
       },
     });
     expect(seen[0]).toContain("Pi chat model: omlx/qwen  (separate from Factory)");
-    expect(seen[0].some((o) => o.startsWith("Base preset:"))).toBe(true);
+    expect(seen[0].some((o) => o.startsWith("Configuration:"))).toBe(true);
     expect(uiA.notifications.some((n) => n.message.includes("Pi's ordinary chat model are separate"))).toBe(true);
     expect(leftUnchanged).toEqual([]);
 
@@ -334,42 +335,86 @@ function saveLeadPreset(name: string, model: string): void {
 }
 
 describe("AI Factory — preset base vs effective working copy", () => {
-  it("A. an exact preset match shows the base with no * marker", async () => {
+  it("A. an exact preset match shows the configuration with no * marker", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    setProjectPreset(cwd, "go-balanced");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
 
     const state = factoryBaseState(cwd);
     expect(state.preset).toBe("go-balanced");
     expect(state.dirty).toBe(false);
 
     const options = await mainMenuOptions(cwd, ["m/base"]);
-    expect(options).toContain("Base preset: go-balanced");
-    expect(options).not.toContain("Base preset: go-balanced *");
-    expect(options).not.toContain("* modified by project overrides");
+    expect(options).toContain("Configuration: go-balanced");
+    expect(options).not.toContain("Configuration: Modified");
+    expect(options.some((o) => o.startsWith("* differs from"))).toBe(false);
     expect(options.some((o) => o.startsWith("Lead ") && o.includes("m/base"))).toBe(true);
   });
 
-  it("B. editing after loading shows * and the project-overrides note", async () => {
+  it("A2. loading a preset replaces the working config and clears prior overrides", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    setProjectPreset(cwd, "go-balanced");
+    // A previous working config with several overrides and a different Lead.
+    writeProjectConfig(cwd, {
+      roles: { lead: { targets: { primary: "m/prev" } }, engineer: { targets: { primary: "m/eng" } } },
+      maxRepairRounds: 7,
+    });
+    expect(factoryBaseState(cwd).dirty).toBe(true);
+
+    let main = 0;
+    let presetCalls = 0;
+    const ui = scriptedUI({
+      select: (title, options) => {
+        if (title.startsWith("Factory configuration")) {
+          main++;
+          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+        }
+        if (title.startsWith("Factory presets")) {
+          presetCalls++;
+          return presetCalls === 1 ? "Load another preset…" : "Back";
+        }
+        if (title === "Load preset") return "go-balanced";
+        return undefined;
+      },
+      confirm: (title) => title === "Load preset",
+    });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/eng"] });
+
+    const state = factoryBaseState(cwd);
+    expect(state.preset).toBe("go-balanced");
+    expect(state.dirty).toBe(false);
+    expect(state.effective).toEqual(resolvePresetConfig("go-balanced"));
+    expect(state.effective.roles.lead.targets.primary).toBe("m/base");
+    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model"); // old override gone
+    expect(state.effective.maxRepairRounds).toBe(defaultFactoryConfig().maxRepairRounds); // old limit gone
+    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" }); // only the selection remains
+  });
+
+  it("B. editing after loading changes the working config and marks it modified", async () => {
+    const cwd = workdir();
+    saveLeadPreset("go-balanced", "m/base");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
+    expect(factoryBaseState(cwd).dirty).toBe(false);
+
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } } });
 
     const state = factoryBaseState(cwd);
     expect(state.dirty).toBe(true);
     expect(state.effective.roles.lead.targets.primary).toBe("m/next");
+    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/base"); // preset unchanged
 
     const options = await mainMenuOptions(cwd, ["m/next"]);
-    expect(options).toContain("Base preset: go-balanced *");
-    expect(options).toContain("* modified by project overrides");
-    expect(options.some((o) => o.startsWith("Lead ") && o.includes("m/next"))).toBe(true);
+    expect(options).toContain("Configuration: Modified");
+    expect(options).toContain("Based on: go-balanced");
+    expect(options).toContain("* differs from go-balanced");
+    expect(options.some((o) => o.startsWith("Lead ") && o.includes("m/next") && o.endsWith("*"))).toBe(true);
+    expect(options.some((o) => o.startsWith("Architect ") && o.endsWith("*"))).toBe(false);
   });
 
-  it("C. revert clears project overrides and the dirty marker", () => {
+  it("C. revert makes the effective config exactly the selected preset", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    setProjectPreset(cwd, "go-balanced");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } }, maxRepairRounds: 9 });
     expect(factoryBaseState(cwd).dirty).toBe(true);
 
@@ -378,14 +423,67 @@ describe("AI Factory — preset base vs effective working copy", () => {
     const state = factoryBaseState(cwd);
     expect(state.dirty).toBe(false);
     expect(state.preset).toBe("go-balanced");
+    expect(state.effective).toEqual(resolvePresetConfig("go-balanced"));
     expect(state.effective.roles.lead.targets.primary).toBe("m/base");
     expect(state.effective.maxRepairRounds).toBe(defaultFactoryConfig().maxRepairRounds);
+    const options = await mainMenuOptions(cwd, ["m/base"]);
+    expect(options).toContain("Configuration: go-balanced");
+  });
+
+  it("C2. loading another preset does not leak the previous overrides", async () => {
+    const cwd = workdir();
+    saveLeadPreset("go-balanced", "m/base");
+    saveLeadPreset("other", "m/other");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
+    writeProjectConfig(cwd, { roles: { engineer: { targets: { primary: "m/leak" } } } }); // modify
+    expect(factoryBaseState(cwd).dirty).toBe(true);
+
+    let main = 0;
+    let presetCalls = 0;
+    const ui = scriptedUI({
+      select: (title, options) => {
+        if (title.startsWith("Factory configuration")) {
+          main++;
+          return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+        }
+        if (title.startsWith("Factory presets")) {
+          presetCalls++;
+          return presetCalls === 1 ? "Load another preset…" : "Back";
+        }
+        if (title === "Load preset") return "other";
+        return undefined;
+      },
+      confirm: (title) => title === "Load preset",
+    });
+    await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/other", "m/leak"] });
+
+    const state = factoryBaseState(cwd);
+    expect(state.preset).toBe("other");
+    expect(state.dirty).toBe(false);
+    expect(state.effective).toEqual(resolvePresetConfig("other"));
+    expect(state.effective.roles.engineer.targets.primary).toBe("provider/engineer-model"); // leak gone
+  });
+
+  it("G. individual rows mark only the changed roles/limits", async () => {
+    const cwd = workdir();
+    saveLeadPreset("go-balanced", "m/base");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } } });
+
+    let options = await mainMenuOptions(cwd, ["m/next"]);
+    expect(options.some((o) => o.startsWith("Lead ") && o.endsWith("*"))).toBe(true);
+    expect(options.some((o) => o.startsWith("Engineer ") && o.endsWith("*"))).toBe(false);
+    expect(options.some((o) => o.startsWith("Limits") && o.endsWith("*"))).toBe(false);
+
+    writeProjectConfig(cwd, { maxRepairRounds: 5 });
+    options = await mainMenuOptions(cwd, ["m/next"]);
+    expect(options.some((o) => o.startsWith("Limits") && o.endsWith("*"))).toBe(true);
   });
 
   it("D. saving the working config as a new preset leaves the old preset unchanged", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    setProjectPreset(cwd, "go-balanced");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } } });
 
     let main = 0;
@@ -398,7 +496,7 @@ describe("AI Factory — preset base vs effective working copy", () => {
         }
         if (title.startsWith("Factory presets")) {
           presetCalls++;
-          return presetCalls === 1 ? "Save current configuration as new preset…" : "Back";
+          return presetCalls === 1 ? "Save as new preset…" : "Back";
         }
         return undefined;
       },
@@ -413,14 +511,15 @@ describe("AI Factory — preset base vs effective working copy", () => {
     expect(factoryBaseState(cwd).dirty).toBe(false);
   });
 
-  it("E. explicit update overwrites the base preset and clears the marker", async () => {
+  it("E. explicit update overwrites the base preset, requires confirmation, and is clean afterward", async () => {
     const cwd = workdir();
     saveLeadPreset("go-balanced", "m/base");
-    setProjectPreset(cwd, "go-balanced");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "m/next" } } } });
 
     let main = 0;
     let presetCalls = 0;
+    let confirmed = false;
     const ui = scriptedUI({
       select: (title, options) => {
         if (title.startsWith("Factory configuration")) {
@@ -433,12 +532,20 @@ describe("AI Factory — preset base vs effective working copy", () => {
         }
         return undefined;
       },
-      confirm: (title) => title === "Update preset",
+      confirm: (title) => {
+        if (title === "Update preset") {
+          confirmed = true;
+          return true;
+        }
+        return false;
+      },
     });
 
     await showFactoryConfigUI(ui, { cwd, models: ["m/base", "m/next"] });
 
+    expect(confirmed).toBe(true);
     expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("m/next");
     expect(factoryBaseState(cwd).dirty).toBe(false);
+    expect(readProjectConfig(cwd)).toEqual({ preset: "go-balanced" }); // redundant overrides dropped
   });
 });

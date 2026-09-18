@@ -12,10 +12,13 @@
  */
 
 import {
+  changedRoles,
   clearProjectRole,
   defaultFactoryConfig,
   factoryBaseState,
+  limitsDiffer,
   loadFactoryConfig,
+  loadPresetAsWorkingConfig,
   mergeFactoryConfig,
   projectPresetName,
   revertProjectOverrides,
@@ -84,20 +87,23 @@ export async function showFactoryConfigUI(ui: ConfigUI, deps: FactoryConfigUIDep
     }
     if (state.missingPreset) {
       ui.notify(
-        `Base preset "${state.missingPreset}" is selected but has no saved snapshot; built-in defaults apply.`,
+        `Preset "${state.missingPreset}" is selected but has no saved snapshot; built-in defaults apply.`,
         "warning",
       );
     }
-    const baseLabel = state.preset
-      ? `Base preset: ${state.preset}${state.dirty ? " *" : ""}`
-      : state.missingPreset
-        ? `Base preset: ${state.missingPreset} (missing)${state.dirty ? " *" : ""}`
-        : `Base preset: (built-in defaults)${state.dirty ? " *" : ""}`;
+    const baseName = state.preset ?? state.missingPreset ?? "built-in defaults";
+    const changed = new Set(changedRoles(state.base, state.effective));
+    const limitsChanged = limitsDiffer(state.base, state.effective);
     const options = [
-      ...ROLE_NAMES.map((role) => `${cap(role).padEnd(9)} ${state.effective.roles[role].targets.primary}`),
-      baseLabel,
-      ...(state.dirty ? ["* modified by project overrides"] : []),
-      `Limits — repair ${state.effective.maxRepairRounds}, remediation ${state.effective.maxArchitectRemediationRounds}`,
+      ...ROLE_NAMES.map((role) => {
+        const primary = state.effective.roles[role].targets.primary;
+        return `${cap(role).padEnd(9)} ${primary}${changed.has(role) ? "  *" : ""}`;
+      }),
+      ...(state.dirty
+        ? ["Configuration: Modified", `Based on: ${baseName}`]
+        : [`Configuration: ${baseName}`]),
+      ...(state.dirty ? [`* differs from ${baseName}`] : []),
+      `Limits — repair ${state.effective.maxRepairRounds}, remediation ${state.effective.maxArchitectRemediationRounds}${limitsChanged ? "  *" : ""}`,
       `Presets… (${listPresetNames().length})`,
       `Pi chat model: ${deps.chatModel ?? "(unknown)"}  (separate from Factory)`,
       `Model scopes — Factory roles vs Pi chat`,
@@ -107,10 +113,10 @@ export async function showFactoryConfigUI(ui: ConfigUI, deps: FactoryConfigUIDep
     const choice = await ui.select("Factory configuration — effective for next run", options);
     if (!choice || choice === "Done") return;
 
-    if (choice.startsWith("Presets…") || choice.startsWith("Base preset:")) {
+    if (choice.startsWith("Presets…") || choice.startsWith("Configuration:") || choice.startsWith("Based on:")) {
       await presetsMenu(ui, deps);
-    } else if (choice.startsWith("* modified by project overrides")) {
-      // Informational row — the marker is explained by its own text.
+    } else if (choice.startsWith("* differs from")) {
+      // Informational row — its text is the explanation.
     } else if (choice.startsWith("Pi chat model:")) {
       await chatModelMenu(ui, deps);
     } else if (choice.startsWith("Model scopes")) {
@@ -251,41 +257,45 @@ async function presetsMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<voi
     const names = listPresetNames();
     const options: string[] = [];
     if (state.preset && state.dirty) options.push(`Revert to ${state.preset}`);
-    options.push("Save current configuration as new preset…");
-    if (state.preset && state.dirty) options.push(`Update ${state.preset} with current configuration…`);
+    options.push("Save as new preset…");
+    if (state.preset && state.dirty) options.push(`Update ${state.preset}…`);
     options.push("Load another preset…");
     options.push("Delete preset…");
     options.push("View presets");
     options.push("Back");
 
-    const title = state.preset
-      ? `Factory presets — base: ${state.preset}${state.dirty ? " *" : ""}`
-      : "Factory presets";
+    const title = state.dirty
+      ? "Factory presets — modified"
+      : state.preset
+        ? `Factory presets — ${state.preset}`
+        : "Factory presets";
     const choice = await ui.select(title, options);
     if (!choice || choice === "Back") return;
 
     if (choice.startsWith("Revert to ")) {
       const name = choice.slice("Revert to ".length);
       revertProjectOverrides(deps.cwd);
-      ui.notify(`Reverted to preset "${name}"; project overrides cleared.`, "info");
-    } else if (choice === "Save current configuration as new preset…") {
+      ui.notify(`Reverted to preset "${name}".`, "info");
+    } else if (choice === "Save as new preset…") {
       const name = (await ui.input("New preset name", "e.g. fast-local"))?.trim();
       if (!name) continue;
       if (hasPreset(name) && !(await ui.confirm("Overwrite preset", `A preset named "${name}" already exists. Overwrite it?`))) {
         continue;
       }
       // Snapshot the CURRENT EFFECTIVE config; the previously selected preset is
-      // untouched. The new snapshot becomes the project's base.
+      // untouched. The snapshot becomes the working configuration, cleanly.
       savePreset(name, state.effective);
-      setProjectPreset(deps.cwd, name);
-      ui.notify(`Saved preset "${name}" and set it as the base.`, "info");
+      loadPresetAsWorkingConfig(deps.cwd, name);
+      ui.notify(`Saved and loaded preset "${name}".`, "info");
     } else if (choice.startsWith("Update ")) {
-      const name = choice.slice("Update ".length, choice.indexOf(" with current configuration…"));
-      if (!(await ui.confirm("Update preset", `Overwrite preset "${name}" with the current effective configuration?`))) {
+      const name = choice.replace(/^Update /, "").replace(/…$/, "");
+      if (!(await ui.confirm("Update preset", `Overwrite preset "${name}" with the current configuration?`))) {
         continue;
       }
+      // Persist the snapshot, then drop the now-redundant project overrides.
       savePreset(name, state.effective);
-      ui.notify(`Updated preset "${name}" from the current configuration.`, "info");
+      revertProjectOverrides(deps.cwd);
+      ui.notify(`Updated preset "${name}".`, "info");
     } else if (choice === "Load another preset…") {
       await chooseActivePreset(ui, deps);
     } else if (choice === "Delete preset…") {
@@ -306,14 +316,28 @@ async function presetsMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<voi
   }
 }
 
-/** Load a saved preset as the project's BASE configuration. */
+/**
+ * Load a saved preset as the working configuration. This REPLACES the current
+ * working config: all project overrides are cleared, so the effective config
+ * equals the preset immediately. When the working config is modified, confirm
+ * first because the unsaved changes will be discarded.
+ */
 async function chooseActivePreset(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<void> {
   const names = listPresetNames();
   const defaults = "(built-in defaults)";
-  const choice = await ui.select("Load preset as base", [defaults, ...names]);
+  const choice = await ui.select("Load preset", [defaults, ...names]);
   if (choice === undefined) return;
-  setProjectPreset(deps.cwd, choice === defaults ? undefined : choice);
-  ui.notify(choice === defaults ? "Base preset cleared (built-in defaults)." : `Base preset set to "${choice}".`, "info");
+  const state = factoryBaseState(deps.cwd);
+  if (state.dirty) {
+    const ok = await ui.confirm(
+      "Load preset",
+      `Loading "${choice}" discards your unsaved working changes. Continue?`,
+    );
+    if (!ok) return;
+  }
+  const name = choice === defaults ? undefined : choice;
+  loadPresetAsWorkingConfig(deps.cwd, name);
+  ui.notify(name ? `Loaded preset "${name}".` : "Working configuration reset to built-in defaults.", "info");
 }
 
 async function pickPreset(ui: ConfigUI, names: string[], title: string): Promise<string | undefined> {

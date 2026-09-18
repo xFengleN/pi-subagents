@@ -240,15 +240,45 @@ export function factoryConfigEquals(a: FactoryConfig, b: FactoryConfig): boolean
   return stableStringify(a) === stableStringify(b);
 }
 
+/** Structural equality of two role configs. */
+export function roleConfigEquals(a: RoleConfig, b: RoleConfig): boolean {
+  return stableStringify(a) === stableStringify(b);
+}
+
+/** Roles whose effective config differs from the base preset. */
+export function changedRoles(base: FactoryConfig, effective: FactoryConfig): RoleName[] {
+  return ROLE_NAMES.filter((role) => !roleConfigEquals(base.roles[role], effective.roles[role]));
+}
+
+/** Whether any execution limit differs between the base preset and the effective config. */
+export function limitsDiffer(a: FactoryConfig, b: FactoryConfig): boolean {
+  return a.maxRepairRounds !== b.maxRepairRounds
+    || a.maxArchitectRemediationRounds !== b.maxArchitectRemediationRounds
+    || a.maxArchitectEscalations !== b.maxArchitectEscalations
+    || a.maxLeadEscalations !== b.maxLeadEscalations
+    || a.defaultRetryAfterMs !== b.defaultRetryAfterMs;
+}
+
+/**
+ * Replace the project's working configuration with a saved preset (or the
+ * built-in defaults when `name` is undefined). Every project override is
+ * dropped, so the effective config equals the resolved preset immediately.
+ *
+ * Loading a preset is a REPLACE, not a layer: stale role/limit overrides from
+ * the previous working configuration must not survive.
+ */
+export function loadPresetAsWorkingConfig(cwd: string, name: string | undefined): void {
+  const next: Record<string, unknown> = {};
+  if (name !== undefined && name !== "") next[PROJECT_PRESET_KEY] = name;
+  writeProjectConfigFile(cwd, next);
+}
+
 /**
  * Drop all project overrides, keeping the base preset selection. After this the
  * effective config equals the saved base preset again.
  */
 export function revertProjectOverrides(cwd: string): void {
-  const preset = readProjectConfig(cwd)?.[PROJECT_PRESET_KEY];
-  const next: Record<string, unknown> = {};
-  if (typeof preset === "string" && preset !== "") next[PROJECT_PRESET_KEY] = preset;
-  writeProjectConfigFile(cwd, next);
+  loadPresetAsWorkingConfig(cwd, projectPresetName(cwd));
 }
 
 /** Deterministic serialization with keys sorted, so equality is order-independent. */

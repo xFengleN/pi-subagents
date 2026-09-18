@@ -157,30 +157,38 @@ configs are unaffected.
 two concepts explicit:
 
 - the **base preset** is an immutable saved snapshot the project selected; and
-- the **effective configuration** is what the next `/factory` run will actually
+- the **working configuration** is what the next `/factory` run will actually
   use (`defaults <- base preset <- project overrides`).
 
 Editing any role/limit writes a project override and takes effect immediately —
-no preset save is required, and no saved preset is mutated. The UI header shows
-the effective config for the next run:
+no preset save is required, and no saved preset is mutated. The top level shows
+the working configuration for the next run, marking only the rows that differ:
 
 ```
 Factory configuration — effective for next run
-Lead       openai-codex/gpt-5.3-codex-spark
+Lead       openai-codex/gpt-5.3-codex-spark  *
 Architect  opencode-go/glm-5.3
 Engineer   opencode-go/deepseek-v4.1-flash
 Reviewer   opencode-go/glm-5.3-flash
-Base preset: Go Balanced *
-* modified by project overrides
+Configuration: Modified
+Based on: go-balanced
+* differs from go-balanced
 ```
 
-The `*` and note appear only when a deterministic deep comparison finds the
-effective config differs from the resolved base. When dirty, `Presets…` offers
-`Revert to <base>` (drops project overrides), `Save current configuration as new
-preset…` (snapshot of the effective config; old preset untouched; the new one
-becomes the base), `Update <base> with current configuration…` (confirmed
-overwrite), `Load another preset…`, and `Delete preset…`. There is no fragile
-dirty flag — the comparison is recomputed from resolved configs.
+When unmodified it reads simply `Configuration: go-balanced`. `dirty` is a
+deterministic deep comparison of the resolved preset against the effective
+config — no mutable flag.
+
+**Loading a preset is a REPLACE.** `Load preset` (and `Load another preset…`)
+clears every project override and installs the chosen preset, so the effective
+config equals that preset immediately; it never layers old overrides on top. If
+the working config is modified, the UI confirms that unsaved changes will be
+discarded first. `Revert to <base>` does the same for the currently selected
+preset.
+
+When modified, `Presets…` offers `Revert to <base>`, `Save as new preset…`
+(snapshot of the working config; the old preset is untouched), `Update <base>…`
+(confirmed overwrite), `Load another preset…`, and `Delete preset…`.
 
 `/factory-status` is **historical/current-run state**, labelled `Run
 configuration snapshot`, and never mixed with next-run configuration.

@@ -11,7 +11,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { formatRunStatus } from "../../src/ai-factory/commands.js";
-import { defaultFactoryConfig, mergeFactoryConfig, projectPresetName, resolvePresetConfig, setProjectPreset, writeProjectConfig } from "../../src/ai-factory/config.js";
+import { defaultFactoryConfig, factoryBaseState, loadPresetAsWorkingConfig, mergeFactoryConfig, projectPresetName, resolvePresetConfig, writeProjectConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
 import factoryExtension from "../../src/ai-factory/index.js";
 import { savePreset } from "../../src/ai-factory/presets.js";
@@ -256,7 +256,7 @@ describe("AI Factory — slash commands", () => {
         presetCalls++;
         return presetCalls === 1 ? "Load another preset…" : "Back";
       }
-      if (title === "Load preset as base") return "go-balanced";
+      if (title === "Load preset") return "go-balanced";
       return undefined;
     });
 
@@ -301,7 +301,9 @@ describe("AI Factory — slash commands", () => {
         roles: { lead: { targets: { primary: "opencode-go/deepseek-v4.1-flash" } } },
       }),
     );
-    setProjectPreset(cwd, "go-balanced");
+    loadPresetAsWorkingConfig(cwd, "go-balanced");
+    // Loading replaces the working config: the preset's Lead is effective now.
+    expect(factoryBaseState(cwd).effective.roles.lead.targets.primary).toBe("opencode-go/deepseek-v4.1-flash");
     // Edit the working copy — explicitly WITHOUT saving/updating any preset.
     writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "openai-codex/gpt-5.3-codex-spark" } } } });
 
