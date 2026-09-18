@@ -1,0 +1,54 @@
+{
+  "roles": {
+    "lead": {
+      "targets": {
+        "primary": "openai-codex/gpt-5.5",
+        "fallbacks": ["openai-codex/gpt-5.4"]
+      },
+      "maxTransientRetries": 2,
+      "retryDelayMs": 1000,
+      "maxTurns": 80,
+      "policy": "equivalent"
+    },
+    "architect": {
+      "targets": {
+        "primary": "openai-codex/gpt-5.5"
+      },
+      "maxTransientRetries": 2,
+      "retryDelayMs": 1000,
+      "maxTurns": 60,
+      "policy": "conservative"
+    },
+    "engineer": {
+      "targets": {
+        "primary": "openai-codex/gpt-5.4",
+        "fallbacks": ["openai-codex/gpt-5.3-codex-spark"]
+      },
+      "maxTransientRetries": 2,
+      "retryDelayMs": 1000,
+      "maxTurns": 150,
+      "policy": "permissive"
+    },
+    "reviewer": {
+      "targets": {
+        "primary": "openai-codex/gpt-5.4",
+        "fallbacks": ["openai-codex/gpt-5.5"]
+      },
+      "maxTransientRetries": 2,
+      "retryDelayMs": 1000,
+      "maxTurns": 60,
+      "policy": "quality_floor"
+    }
+  },
+  "agentTypes": {
+    "lead": "factory-lead",
+    "architect": "factory-architect",
+    "engineer": "factory-engineer",
+    "reviewer": "factory-reviewer"
+  },
+  "maxRepairRounds": 1,
+  "maxArchitectRemediationRounds": 1,
+  "maxArchitectEscalations": 1,
+  "maxLeadEscalations": 1,
+  "defaultRetryAfterMs": 1800000
+}

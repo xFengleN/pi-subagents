@@ -1,0 +1,384 @@
+/**
+ * ai-factory/types.ts — Shared types for the AI Factory orchestration layer.
+ *
+ * The Factory is a thin, deterministic orchestration layer that runs on top of
+ * pi-subagents' cross-extension surface. It owns NO model calls: every semantic
+ * decision is made by one of the four role agents (Lead, Architect, Engineer,
+ * Reviewer) which are spawned as ordinary pi-subagents; every deterministic
+ * decision (what phase comes next, whether a transition is legal, whether a
+ * limit was reached, whether capacity is available) is made here in code.
+ *
+ * The persisted run state is intentionally small and versioned — packets and
+ * references, never child transcripts.
+ */
+
+/** The four Factory roles. `RoleName` is the identity; a role's backend model
+ * is configuration, never part of the role definition. */
+export type RoleName = "lead" | "architect" | "engineer" | "reviewer";
+
+export const ROLE_NAMES: readonly RoleName[] = ["lead", "architect", "engineer", "reviewer"];
+
+/**
+ * The deterministic Factory state machine.
+ *
+ * `ARCHITECT_ESCALATION` is a mid-run escalation to the Architect (structural
+ * problems discovered during execution), which the spec requires in addition to
+ * the mandatory initial and final checkpoints.
+ */
+export const FACTORY_STATES = [
+  "DISCOVERY",            // Lead reconnaissance + architecture proposal
+  "INITIAL_ARCHITECT",    // mandatory initial architecture checkpoint
+  "EXECUTION",            // Engineer works a work package
+  "REVIEW",               // Reviewer assesses implementation correctness
+  "ARCHITECT_ESCALATION", // exceptional structural escalation mid-run
+  "INTEGRATION",          // Lead integrates + verifies the whole system
+  "FINAL_ARCHITECT",      // mandatory final architecture/acceptance checkpoint
+  "REMEDIATION",          // Engineer/Reviewer fix what the final Architect rejected
+  "FINAL_ARCHITECT_RECHECK", // bounded Architect recheck after remediation
+  "WAITING_CAPACITY",     // all targets for a required role are unavailable
+  "DONE",                 // accepted
+  "STOPPED",              // rejected past a budget, or stopped by the user
+  "FAILED",               // unrecoverable error
+] as const;
+
+export type FactoryState = (typeof FACTORY_STATES)[number];
+
+export const TERMINAL_STATES: readonly FactoryState[] = ["DONE", "STOPPED", "FAILED"];
+
+/* -------------------------------------------------------------------------- */
+/* Structured handoff packets. These are the ONLY information that moves      */
+/* upward between roles — never transcripts.                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Lead architecture-proposal packet (DISCOVERY). */
+export interface LeadProposalPacket {
+  goal: string;
+  repositoryFindings: string;
+  currentArchitecture: string;
+  assumptions: string[];
+  proposedSolution: string;
+  constraints: string[];
+  workPackages: string[];
+  dependencies: string;
+  risks: string[];
+  acceptanceCriteria: string[];
+  architecturalQuestions: string[];
+}
+
+/** Initial Architect checkpoint result. */
+export interface ArchitectInitialResult {
+  verdict: "APPROVE" | "CORRECT";
+  approvedArchitecture: string;
+  constraints: string[];
+  correctedWorkPackages: string[];
+  importantRisks: string[];
+}
+
+/** Engineer completion packet. */
+export interface EngineerPacket {
+  status: "completed" | "partially_completed" | "failed";
+  workPackageId: string;
+  summary: string;
+  changedFiles: string[];
+  importantDecisions: string[];
+  testsRun: string[];
+  testResults: string;
+  deviations: string[];
+  knownLimitations: string[];
+  unresolvedQuestions: string[];
+  architecturalEscalationRequired: boolean;
+}
+
+/** Reviewer implementation-correctness verdict. */
+export interface ReviewerPacket {
+  verdict: "PASS" | "NEEDS_FIX" | "ARCHITECTURAL_ESCALATION";
+  blockingFindings: string[];
+  nonBlockingFindings: string[];
+  requiredRepairs: string[];
+  testConcerns: string[];
+  architecturalIssue: boolean;
+}
+
+/** Lead integration/acceptance packet (INTEGRATION). */
+export interface LeadIntegrationPacket {
+  goal: string;
+  approvedArchitecture: string;
+  completedWorkPackages: string[];
+  importantDecisions: string[];
+  deviations: string[];
+  systemVerification: string;
+  reviewerFindingsResolved: string[];
+  reviewerFindingsAcceptedRisk: string[];
+  reviewerFindingsUnresolved: string[];
+  selectedFiles: string[];
+  factualAssessment: string;
+}
+
+/** Final Architect acceptance-checkpoint result. */
+export interface ArchitectFinalResult {
+  verdict: "ACCEPT" | "NEEDS_REMEDIATION";
+  blockingIssues: string[];
+  requiredChanges: string[];
+  doNotChange: string[];
+  requiredEvidence: string[];
+}
+
+/** Lead disposition after a bounded repair loop is exhausted. */
+export interface LeadEscalationPacket {
+  verdict: "continue" | "stop";
+  guidance: string;
+}
+
+/** Every packet a role may produce, keyed by role, for the packet parsers. */
+export type Packet =
+  | LeadProposalPacket
+  | ArchitectInitialResult
+  | EngineerPacket
+  | ReviewerPacket
+  | LeadIntegrationPacket
+  | ArchitectFinalResult
+  | LeadEscalationPacket;
+
+/* -------------------------------------------------------------------------- */
+/* Configuration                                                              */
+/* -------------------------------------------------------------------------- */
+
+/** Ordered model targets for one role. Fallback order matters; role semantics
+ * never change during fallback. */
+export interface RoleModelTargets {
+  /** Primary target, "provider/model". */
+  primary: string;
+  /** Ordered fallback targets, tried when the primary is unavailable. */
+  fallbacks?: string[];
+}
+
+export interface RoleConfig {
+  targets: RoleModelTargets;
+  /** Bounded transient retries on the same target before moving to a fallback. */
+  maxTransientRetries: number;
+  /** Bounded backoff between transient retries, in ms. */
+  retryDelayMs: number;
+  /** Turn ceiling for this role's agents. 0 = inherit/undefined. */
+  maxTurns?: number;
+  /**
+   * Fallback policy. `architect` is conservative (wait rather than degrade),
+   * `reviewer` requires a configured quality floor, `engineer` is permissive,
+   * `lead` allows only equivalent-capability targets. For MVP the policy is
+   * carried as configuration only — the chain itself is the mechanism.
+   */
+  policy: "conservative" | "permissive" | "quality_floor" | "equivalent";
+}
+
+export interface FactoryConfig {
+  /** Which pi-subagents agent type each role spawns as. Falls back to
+   * `general-purpose` when the configured type is unavailable. */
+  agentTypes: Record<RoleName, string>;
+  /** Whether role children are spawned isolated (no extensions/skills/nested
+   * tools) — the Factory-mode default. */
+  isolated: boolean;
+  roles: Record<RoleName, RoleConfig>;
+  /** Maximum Engineer/Reviewer repair rounds (default 1 for MVP). */
+  maxRepairRounds: number;
+  /** Maximum final-Architect remediation cycles (default 1). */
+  maxArchitectRemediationRounds: number;
+  /** Maximum mid-run Architect escalations per run. */
+  maxArchitectEscalations: number;
+  /** Maximum Lead escalations from an exhausted repair loop. */
+  maxLeadEscalations: number;
+  /** Conservative wait before re-attempting when no retry-after is known. */
+  defaultRetryAfterMs: number;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Persisted run state                                                        */
+/* -------------------------------------------------------------------------- */
+
+/** A role outcome: the compact packet plus the operational reference. */
+export interface RoleOutcome<T> {
+  packet: T;
+  agentId: string;
+  /** The model target ("provider/model") that actually ran, when known. */
+  target?: string;
+}
+
+export interface EngineerOutcome {
+  round: number;
+  outcome: RoleOutcome<EngineerPacket>;
+}
+
+export interface ReviewerOutcome {
+  round: number;
+  outcome: RoleOutcome<ReviewerPacket>;
+}
+
+/** Completed phase packets. IDs/references and compact packets only — no
+ * transcripts, no full child conversations. */
+export interface PhaseResults {
+  proposal?: RoleOutcome<LeadProposalPacket>;
+  initialArchitect?: RoleOutcome<ArchitectInitialResult>;
+  engineers: EngineerOutcome[];
+  reviewers: ReviewerOutcome[];
+  integration?: RoleOutcome<LeadIntegrationPacket>;
+  finalArchitect?: RoleOutcome<ArchitectFinalResult>;
+  finalRecheck?: RoleOutcome<ArchitectFinalResult>;
+  escalationArchitect?: RoleOutcome<ArchitectInitialResult>;
+  leadEscalation?: RoleOutcome<LeadEscalationPacket>;
+  /** One remediation cycle: the Engineer fix + Reviewer recheck. */
+  remediation?: {
+    engineer?: RoleOutcome<EngineerPacket>;
+    reviewer?: RoleOutcome<ReviewerPacket>;
+  };
+}
+
+/** The agent currently awaited by the run. */
+export interface InFlightAgent {
+  role: RoleName;
+  /** Stable sub-phase label, e.g. "execution.engineer". */
+  phase: string;
+  agentId: string;
+  target: string;
+  spawnedAt: number;
+}
+
+/** Persisted information for a WAITING_CAPACITY park. */
+export interface WaitingState {
+  phase: string;
+  role: RoleName;
+  /** The state to return to once capacity is available. */
+  resumeState: FactoryState;
+  attemptedTargets: string[];
+  reasons: string[];
+  /** Provider-provided retry-after in ms, when known. */
+  retryAfterMs?: number;
+  /** Clock time at which the next attempt is allowed. */
+  nextRetryAt: number;
+}
+
+export interface FactoryError {
+  phase: string;
+  role?: RoleName;
+  message: string;
+  at: number;
+}
+
+export const FACTORY_STATE_VERSION = 1 as const;
+
+export interface FactoryRunState {
+  version: typeof FACTORY_STATE_VERSION;
+  runId: string;
+  createdAt: number;
+  updatedAt: number;
+  task: string;
+  cwd: string;
+  /** The resolved configuration the run started with, so a restart resumes
+   * with identical role/model targets even if the project file or an inline
+   * override has since changed. */
+  config: FactoryConfig;
+  state: FactoryState;
+  /** Engineer/Reviewer repair loop counter (EXECUTION/REVIEW alternation). */
+  repairRound: number;
+  /** True once the repair loop budget is exhausted without a fix; the next
+   * action is a Lead escalation (non-architectural) or Architect escalation
+   * (architectural). Persisted so a restart resumes the right escalation. */
+  repairExhausted: boolean;
+  /** The working architecture text, updated by the initial Architect and by
+   * mid-run Architect corrections. Feeds every downstream prompt. */
+  effectiveArchitecture: string;
+  /** Final-Architect remediation cycles used. */
+  remediationRounds: number;
+  /** Mid-run Architect escalations used. */
+  architectEscalations: number;
+  /** Lead escalations from an exhausted repair loop. */
+  leadEscalations: number;
+  results: PhaseResults;
+  inFlight?: InFlightAgent;
+  waiting?: WaitingState;
+  metrics: FactoryMetrics;
+  errors: FactoryError[];
+  stoppedReason?: string;
+  /** True when the run is parked waiting for capacity or a backoff retry. */
+  parked: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Metrics                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Per-role operational metrics. Fields a provider/runner does not expose stay
+ * `undefined` ("unknown") — never coerced to 0.
+ */
+export interface RoleMetrics {
+  role: RoleName;
+  agentId?: string;
+  /** Total spawn attempts for this role across the run. */
+  attempts: number;
+  /** Transient retries on the same target. */
+  retries: number;
+  /** Times the run advanced to a fallback target. */
+  fallbacks: number;
+  /** Model targets attempted, most recent last. */
+  targetsAttempted: string[];
+  /** The target that ran (or was attempted last). */
+  targetUsed?: string;
+  status?: "running" | "completed" | "failed" | "stopped" | "skipped";
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  /** Actual resolved model name/id from the record's invocation, if exposed. */
+  modelName?: string;
+  modelId?: string;
+  /**
+   * Logical (billed-by-work) tokens: input + output + cacheWrite.
+   * Deliberately separate from cacheRead — never conflated with it.
+   */
+  logicalTokens?: number;
+  /** Cache-read tokens, reported separately (they are re-billed per call). */
+  cacheRead?: number;
+  /** Input tokens. */
+  input?: number;
+  /** Output tokens. */
+  output?: number;
+  /** Billed cost in USD, when the provider prices it. */
+  cost?: number;
+  /** Tool uses (a proxy for work performed; not a model-request count). */
+  toolUses?: number;
+  /** Compaction count (context boundedness signal). */
+  compactionCount?: number;
+  error?: string;
+}
+
+export interface FactoryMetrics {
+  roles: Record<RoleName, RoleMetrics>;
+  /** Total spawn attempts across all roles. */
+  totalAttempts: number;
+  /** Total transient retries across all roles. */
+  totalRetries: number;
+  /** Total fallback transitions across all roles. */
+  totalFallbacks: number;
+  /** Number of times the run entered WAITING_CAPACITY. */
+  capacityWaits: number;
+  runStartedAt: number;
+  runEndedAt?: number;
+  runDurationMs?: number;
+}
+
+/**
+ * Compact, machine-readable run summary produced at completion. Every metric
+ * is either present or omitted ("unknown") — never a fabricated zero.
+ */
+export interface FactoryRunSummary {
+  runId: string;
+  state: FactoryState;
+  task: string;
+  stoppedReason?: string;
+  roles: Record<RoleName, Omit<RoleMetrics, "role"> | undefined>;
+  totals: {
+    modelRequests: number;
+    retries: number;
+    fallbacks: number;
+    capacityWaits: number;
+    durationMs?: number;
+  };
+  notes: string[];
+}

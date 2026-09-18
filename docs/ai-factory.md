@@ -1,0 +1,198 @@
+# AI Factory
+
+A lean, deterministic orchestration layer on top of pi-subagents. It runs one
+"factory" — a Lead, an Architect, an Engineer and a Reviewer — through a
+persisted state machine, with fresh bounded contexts and no hidden model calls.
+
+## Purpose
+
+The Factory automates a full coding task as a fixed pipeline:
+
+```
+USER TASK
+  → Lead reconnaissance + architecture proposal
+  → mandatory INITIAL_ARCHITECT gate
+  → Engineer implements
+  → Reviewer assesses correctness
+  → bounded Engineer/Reviewer repair loop
+  → Lead integration + system verification
+  → mandatory FINAL_ARCHITECT acceptance gate
+  → (one bounded remediation cycle, one recheck) → DONE / STOPPED
+```
+
+Two kinds of decisions:
+
+- **Deterministic decisions — code owns them.** What phase comes next, whether
+  a checkpoint ran, repair/remediation counters, retry/fallback selection,
+  capacity waiting, persistence/recovery, legality of a transition. None of
+  these ever costs a model turn.
+- **Semantic decisions — models own them.** Reconnaissance, architecture,
+  implementation, correctness assessment, integration, final acceptance. These
+  happen *inside* role agents, never in the controller.
+
+## Architecture
+
+```
+src/ai-factory/
+  index.ts        pi extension entry: Factory + factory_status tools, discovery
+  transport.ts    seam to pi-subagents (cross-extension RPC + manager registry)
+  controller.ts   the deterministic state machine (pi-free, fully tested)
+  state.ts        legal transition table (illegal transitions throw)
+  packets.ts      structured handoff packets (schemas + parsing)
+  prompts.ts      deterministic role prompts (packets in, no parent context)
+  config.ts       role → model targets, agent types, limits; .pi/factory.json
+  metrics.ts      per-role token/cost accounting + run summary
+  store.ts        small atomic JSON persistence (.pi/factory/<runId>.json)
+  clock.ts        injectable clock (fake clock drives multi-hour waits in tests)
+```
+
+The Factory is a **second pi extension** in this package
+(`package.json` → `pi.extensions`). It talks to pi-subagents only through the
+documented cross-extension surface: `subagents:rpc:spawn` / `subagents:rpc:consume`,
+the `subagents:started/completed/failed` events, and the
+`Symbol.for("pi-subagents:manager")` registry for post-settle details. It never
+reaches into pi-subagents internals and never spawns through the model-mediated
+`Agent` tool.
+
+## Roles
+
+| Role | What it does | Fresh context | Backend |
+|---|---|---|---|
+| Lead | recon, architecture proposal, integration/verification, escalation disposition | yes, per phase | configured primary + equivalent fallbacks |
+| Architect | initial gate, mid-run escalation, final acceptance | yes, per checkpoint | configured primary; conservative fallback (wait, never silently degrade) |
+| Engineer | implements one work package, runs fundamental tests, returns a completion packet | yes, per run/repair | configured primary + permissive fallback chain |
+| Reviewer | independent implementation-correctness verdict (never architecture) | yes, per review | configured primary; quality-floor targets |
+
+Child agents are spawned **isolated** (no parent extensions/skills/nested
+tools) with **fresh contexts** (`inheritContext` is never set). Each child must
+report through a `StructuredOutput` tool whose schema is the packet type it is
+expected to produce; the controller has a lenient prose fallback.
+
+## Deterministic vs semantic boundary
+
+- The controller has **no model client**. It only calls `transport.spawn`,
+  `transport.consume`, `transport.stop`, and reacts to lifecycle events.
+- A deterministic transition (Reviewer PASS → INTEGRATION, counter checks,
+  entering/leaving WAITING_CAPACITY, consuming a child result) causes **zero
+  model requests**.
+- The only model-mediated dispatches are the role runs themselves; there is no
+  "ask the Lead what to do next" consult, no message relay between Engineer and
+  Reviewer (the controller mediates with only the concrete findings).
+
+## State diagram
+
+```
+START → DISCOVERY ──Lead proposal──▶ INITIAL_ARCHITECT ──APPROVE/CORRECT──▶ EXECUTION
+EXECUTION ──Engineer packet──▶ REVIEW
+REVIEW ──PASS──▶ INTEGRATION
+REVIEW ──NEEDS_FIX, rounds left──▶ EXECUTION            (bounded local loop)
+REVIEW / EXECUTION ──architectural──▶ ARCHITECT_ESCALATION ──Architect──▶ EXECUTION
+INTEGRATION ──Lead acceptance packet──▶ FINAL_ARCHITECT
+FINAL_ARCHITECT ──ACCEPT──▶ DONE
+FINAL_ARCHITECT ──NEEDS_REMEDIATION, rounds left──▶ REMEDIATION
+REMEDIATION ──Engineer + Reviewer──▶ FINAL_ARCHITECT_RECHECK
+FINAL_ARCHITECT_RECHECK ──ACCEPT──▶ DONE
+FINAL_ARCHITECT_RECHECK ──reject (budget spent)──▶ STOPPED
+any active state ──all targets unavailable──▶ WAITING_CAPACITY ──capacity──▶ resume
+any active state ──unrecoverable──▶ FAILED / STOPPED
+```
+
+Illegal transitions are rejected programmatically (`assertTransition`), so a
+run can never skip a mandatory checkpoint (e.g. Engineer before the initial
+Architect).
+
+## Configuration
+
+`<cwd>/.pi/factory.json` — plain JSON, no model involved. Defaults live in
+`src/ai-factory/config.ts`. Per-call overrides can be passed to the `Factory`
+tool.
+
+```json
+{
+  "roles": {
+    "lead":     { "targets": { "primary": "openai-codex/gpt-5.5", "fallbacks": ["openai-codex/gpt-5.4"] } },
+    "architect":{ "targets": { "primary": "openai-codex/gpt-5.5" } },
+    "engineer": { "targets": { "primary": "openai-codex/gpt-5.4", "fallbacks": ["openai-codex/gpt-5.3-codex-spark"] } },
+    "reviewer": { "targets": { "primary": "openai-codex/gpt-5.4", "fallbacks": ["openai-codex/gpt-5.5"] } }
+  },
+  "maxRepairRounds": 1,
+  "maxArchitectRemediationRounds": 1,
+  "defaultRetryAfterMs": 1800000
+}
+```
+
+See `examples/ai-factory/` for a full example (including role agent files).
+
+### Fallback semantics
+
+Per-role ordered targets (`primary` then `fallbacks`). Role identity never
+changes during fallback — fallback is about **availability**, never task
+difficulty.
+
+- `transient` (timeout, 5xx, connection reset): bounded same-target backoff
+  retries, then the next fallback.
+- `quota` / capacity exhaustion: advance to the next fallback immediately.
+- `hard` (model not found, auth, unknown agent type): do not hop — surface
+  through `FAILED` with a structured error.
+- all targets exhausted: **WAITING_CAPACITY** — park, persist `nextRetryAt`
+  (provider retry-after when parseable, else `defaultRetryAfterMs`), resume
+  with no LLM call. `WAITING_CAPACITY` is purely timer/clock driven.
+
+## Persistence
+
+Run state lives at `<cwd>/.pi/factory/<runId>.json` (atomic write, versioned).
+It holds packets and references only — never child transcripts. On restart:
+
+- completed phases are never re-run (their packets are in the store);
+- an in-flight phase (whose in-process agent died with the process) is treated
+  as a failed attempt and re-attempted deterministically;
+- a `WAITING_CAPACITY` run restores its `nextRetryAt` and wakes on the clock.
+
+## Metrics
+
+Per role/agent: actual model (when exposed), input/output/cacheWrite tokens
+(logical work), cache-read tokens (reported separately, never conflated),
+billed cost, tool uses, duration, compaction count, attempts, retries,
+fallbacks. A metric a provider does not expose stays **unknown** — never a
+fabricated zero. `factory_status` returns a compact machine-readable run
+summary at completion.
+
+## Running a minimal example
+
+```bash
+# 1. install this extension into pi
+pi install /path/to/pi-subagents
+
+# 2. configure role targets (project-scoped)
+#    <cwd>/.pi/factory.json — see examples/ai-factory/factory.config.json
+
+# 3. in a pi session, ask the agent to run a task through the Factory:
+#    "Use Factory to: <task>"
+#    The model calls Factory({task}), gets a runId, then factory_status({run_id, wait: true}).
+```
+
+Optionally install the role agent files from `examples/ai-factory/agents/` into
+`.pi/agents/` for role-appropriate tool sets (e.g. read-only Reviewer). Without
+them the roles fall back to `general-purpose` (still isolated).
+
+## Known limitations
+
+- MVP runs **one Engineer** implementing the scope as one coherent work
+  package; multiple work packages run sequentially, not in parallel.
+- A repair "round" spawns a fresh Engineer with the concrete findings; true
+  in-session resume/steer of the same child is not exposed over the RPC bus and
+  is deferred.
+- `modelRequests` in the summary counts role-agent runs spawned, not
+  per-turn provider requests (pi does not expose per-agent turn counts).
+- Fallback is configuration, not inference: no difficulty classification, no
+  autonomous benchmarking, no quota forecasting.
+
+## Intentionally deferred
+
+- easy/medium/hard Engineer routing; autonomous model benchmarking; quota
+  forecasting dashboards; provider usage scraping; bounty hunting;
+  PO/stakeholder/UI roles; nested agent hierarchies; councils/swarms/voting;
+  missions; autonomous schedules; persistent agent memory; a generic workflow
+  product; web/mobile clients; automatic merge-conflict resolution.
+- Parallel dependency-aware work packages + worktree isolation (Phase 3) —
+  design only.

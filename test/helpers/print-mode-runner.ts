@@ -70,7 +70,6 @@ import { getModel, registerFauxProvider } from "./pi-ai.js";
 
 /** Path to the pi-subagents extension entrypoint (repo `src/index.ts`). */
 const EXTENSION_PATH = fileURLToPath(new URL("../../src/index.ts", import.meta.url));
-
 /** The cross-package handle the extension publishes on a global Symbol. */
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
 
@@ -132,6 +131,12 @@ export interface RunPrintModeOptions {
   timeoutMs?: number;
   /** Abort the parent (and forwarded children) externally. */
   signal?: AbortSignal;
+  /**
+   * Additional extension entry paths to load alongside pi-subagents. Used by
+   * e2e suites that need another extension of this package in the same session
+   * (e.g. the AI Factory orchestrator). Defaults to pi-subagents only.
+   */
+  extensionPaths?: string[];
   /**
    * Force live mode against a specific provider/model (overrides PI_E2E_LIVE).
    * When omitted, live mode is on iff `PI_E2E_LIVE` is truthy. In live mode, if
@@ -340,7 +345,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
-    additionalExtensionPaths: [EXTENSION_PATH],
+    additionalExtensionPaths: options.extensionPaths ?? [EXTENSION_PATH],
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
     noPromptTemplates: true,
