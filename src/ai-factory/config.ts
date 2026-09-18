@@ -190,6 +190,83 @@ export function validateFactoryConfig(config: FactoryConfig, availableModels: re
   return issues;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Base preset vs effective working configuration, and dirty detection        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Two distinct concepts, kept explicit:
+ *   - the BASE preset is the saved snapshot the project selected; and
+ *   - the EFFECTIVE config is what the next `/factory` run will actually use
+ *     (base <- project overrides).
+ * A project is "dirty" when the two differ, computed by deep comparison — never
+ * a mutable boolean.
+ */
+export interface FactoryBaseState {
+  /** The selected base preset, when its saved snapshot exists. */
+  preset?: string;
+  /** A selected preset name with no saved snapshot (stale project config). */
+  missingPreset?: string;
+  /** Resolved base configuration (`defaults <- preset`). */
+  base: FactoryConfig;
+  /** Effective configuration the next run uses (`base <- project overrides`). */
+  effective: FactoryConfig;
+  /** True when project overrides make the effective config differ from the base. */
+  dirty: boolean;
+}
+
+/** Resolve a saved preset over the built-in defaults (no project overrides). */
+export function resolvePresetConfig(name: string): FactoryConfig {
+  return mergeFactoryConfig(defaultFactoryConfig(), getRawPreset(name));
+}
+
+/** The base/effective/dirty state for a project. */
+export function factoryBaseState(cwd: string): FactoryBaseState {
+  const selected = projectPresetName(cwd);
+  const raw = selected !== undefined ? getRawPreset(selected) : undefined;
+  const base = mergeFactoryConfig(defaultFactoryConfig(), raw);
+  const effective = loadFactoryConfig(cwd);
+  return {
+    ...(selected !== undefined && raw !== undefined ? { preset: selected } : {}),
+    ...(selected !== undefined && raw === undefined ? { missingPreset: selected } : {}),
+    base,
+    effective,
+    dirty: !factoryConfigEquals(base, effective),
+  };
+}
+
+/** Deep structural equality of two resolved Factory configs. */
+export function factoryConfigEquals(a: FactoryConfig, b: FactoryConfig): boolean {
+  return stableStringify(a) === stableStringify(b);
+}
+
+/**
+ * Drop all project overrides, keeping the base preset selection. After this the
+ * effective config equals the saved base preset again.
+ */
+export function revertProjectOverrides(cwd: string): void {
+  const preset = readProjectConfig(cwd)?.[PROJECT_PRESET_KEY];
+  const next: Record<string, unknown> = {};
+  if (typeof preset === "string" && preset !== "") next[PROJECT_PRESET_KEY] = preset;
+  writeProjectConfigFile(cwd, next);
+}
+
+/** Deterministic serialization with keys sorted, so equality is order-independent. */
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === "object") {
+    const src = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(src).sort()) out[key] = sortKeysDeep(src[key]);
+    return out;
+  }
+  return value;
+}
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
 }

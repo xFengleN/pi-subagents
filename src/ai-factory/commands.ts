@@ -50,22 +50,29 @@ function availableModels(ctx: ExtensionContext): string[] {
   }
 }
 
-/** Compact, deterministic status block for `/factory-status`. */
+/**
+ * Compact, deterministic status block for `/factory-status`.
+ *
+ * This is HISTORICAL / current-run state — the models a run actually used — not
+ * the configuration the next run will use. The labels make that explicit.
+ */
 export function formatRunStatus(state: FactoryRunState): string {
   const m = state.metrics;
+  const terminal = isTerminal(state.state);
   const lines = [
-    `Factory run ${state.runId}`,
+    terminal ? `Latest completed run: ${state.runId}` : `Current run: ${state.runId}`,
     `state: ${state.state}${state.parked ? " (parked)" : ""}`,
     `phase: ${state.inFlight?.phase ?? "-"}   active role: ${state.inFlight?.role ?? "-"}`,
     `repairRound: ${state.repairRound}   remediationRounds: ${state.remediationRounds}`,
     `retries: ${m.totalRetries}   fallbacks: ${m.totalFallbacks}   capacityWaits: ${m.capacityWaits}`,
-    "targets:",
+    "Run configuration snapshot (models THIS run used — not the next run's config):",
     ...ROLE_NAMES.map((role) => `  ${role}: ${m.roles[role].targetUsed ?? "-"}`),
     `updated: ${new Date(state.updatedAt).toISOString()}`,
   ];
   const lastError = state.errors[state.errors.length - 1];
   if (lastError) lines.push(`last error: ${lastError.message}`);
   if (state.stoppedReason) lines.push(`stopped: ${state.stoppedReason}`);
+  lines.push("Use /factory-config to view the configuration for the next run.");
   return lines.join("\n");
 }
 

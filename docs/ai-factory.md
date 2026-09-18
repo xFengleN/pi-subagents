@@ -151,8 +151,39 @@ built-in defaults
 ```
 
 A project file with no `preset` key resolves exactly as before, so existing
-configs are unaffected. Preset selection and project overrides are independent:
-clearing the active preset leaves project overrides in place.
+configs are unaffected.
+
+**Base preset vs effective configuration (working copy).** The config UI keeps
+two concepts explicit:
+
+- the **base preset** is an immutable saved snapshot the project selected; and
+- the **effective configuration** is what the next `/factory` run will actually
+  use (`defaults <- base preset <- project overrides`).
+
+Editing any role/limit writes a project override and takes effect immediately —
+no preset save is required, and no saved preset is mutated. The UI header shows
+the effective config for the next run:
+
+```
+Factory configuration — effective for next run
+Lead       openai-codex/gpt-5.3-codex-spark
+Architect  opencode-go/glm-5.3
+Engineer   opencode-go/deepseek-v4.1-flash
+Reviewer   opencode-go/glm-5.3-flash
+Base preset: Go Balanced *
+* modified by project overrides
+```
+
+The `*` and note appear only when a deterministic deep comparison finds the
+effective config differs from the resolved base. When dirty, `Presets…` offers
+`Revert to <base>` (drops project overrides), `Save current configuration as new
+preset…` (snapshot of the effective config; old preset untouched; the new one
+becomes the base), `Update <base> with current configuration…` (confirmed
+overwrite), `Load another preset…`, and `Delete preset…`. There is no fragile
+dirty flag — the comparison is recomputed from resolved configs.
+
+`/factory-status` is **historical/current-run state**, labelled `Run
+configuration snapshot`, and never mixed with next-run configuration.
 
 **Model scopes (Factory roles vs Pi chat).** The active preset / project config
 controls **only** the models the Factory role agents run on. Pi's ordinary chat

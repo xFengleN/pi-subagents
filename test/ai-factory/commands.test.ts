@@ -10,7 +10,8 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { defaultFactoryConfig, projectPresetName, writeProjectConfig } from "../../src/ai-factory/config.js";
+import { formatRunStatus } from "../../src/ai-factory/commands.js";
+import { defaultFactoryConfig, mergeFactoryConfig, projectPresetName, resolvePresetConfig, setProjectPreset, writeProjectConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
 import factoryExtension from "../../src/ai-factory/index.js";
 import { savePreset } from "../../src/ai-factory/presets.js";
@@ -166,12 +167,12 @@ describe("AI Factory — slash commands", () => {
 
     await b.commands.get("factory-status").handler("", ctx);
 
-    const text = notifications.find((n) => n.message.includes("Factory run"))?.message ?? "";
+    const text = notifications.find((n) => n.message.includes("Current run:"))?.message ?? "";
     expect(text).toContain("factory_new"); // newest wins
     expect(text).toContain("state: DISCOVERY");
     expect(text).toContain("repairRound:");
     expect(text).toContain("retries:");
-    expect(text).toContain("targets:");
+    expect(text).toContain("Run configuration snapshot");
     expect(b.spawns).toHaveLength(0); // read-only
   });
 
@@ -251,11 +252,11 @@ describe("AI Factory — slash commands", () => {
         main++;
         return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
       }
-      if (title === "Factory presets") {
+      if (title.startsWith("Factory presets")) {
         presetCalls++;
-        return presetCalls === 1 ? "Set active preset" : "Back";
+        return presetCalls === 1 ? "Load another preset…" : "Back";
       }
-      if (title === "Active Factory preset") return "go-balanced";
+      if (title === "Load preset as base") return "go-balanced";
       return undefined;
     });
 
@@ -289,6 +290,90 @@ describe("AI Factory — slash commands", () => {
     await flush();
 
     expect(b.pi.setModel).toHaveBeenCalledTimes(1);
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("14. project edits after loading a preset are live for the next /factory run", async () => {
+    const cwd = workdir();
+    savePreset(
+      "go-balanced",
+      mergeFactoryConfig(defaultFactoryConfig(), {
+        roles: { lead: { targets: { primary: "opencode-go/deepseek-v4.1-flash" } } },
+      }),
+    );
+    setProjectPreset(cwd, "go-balanced");
+    // Edit the working copy — explicitly WITHOUT saving/updating any preset.
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "openai-codex/gpt-5.3-codex-spark" } } } });
+
+    const b = await boot(cwd);
+    const { ctx } = commandCtx(cwd, ["openai-codex/gpt-5.3-codex-spark", "opencode-go/deepseek-v4.1-flash"]);
+    await b.commands.get("factory").handler("do it", ctx);
+    await flush();
+
+    // The run's Lead uses the edited project override...
+    expect(b.spawns).toHaveLength(1);
+    expect(b.spawns[0].options.model).toBe("openai-codex/gpt-5.3-codex-spark");
+    // ...while the saved preset snapshot is untouched.
+    expect(resolvePresetConfig("go-balanced").roles.lead.targets.primary).toBe("opencode-go/deepseek-v4.1-flash");
+  });
+
+  it("F. /factory-status labels run models as a historical snapshot", () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const controller = FactoryController.create(
+      { transport: new FakeTransport(), clock: new FakeClock(), store, config: defaultFactoryConfig() },
+      "factory_done",
+      "t",
+      cwd,
+    );
+    const snap = controller.getSnapshot();
+    snap.state = "DONE";
+    snap.metrics.roles.lead.targetUsed = "old/lead";
+    controller.dispose();
+
+    const text = formatRunStatus(snap);
+    expect(text).toContain("Latest completed run: factory_done");
+    expect(text).toContain("Run configuration snapshot");
+    expect(text).toContain("lead: old/lead");
+    expect(text).toContain("Use /factory-config to view the configuration for the next run.");
+  });
+
+  it("G. a completed run's snapshot and the next-run config are shown without ambiguity", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const controller = FactoryController.create(
+      { transport: new FakeTransport(), clock: new FakeClock(), store, config: defaultFactoryConfig() },
+      "factory_prev",
+      "t",
+      cwd,
+    );
+    const done = controller.getSnapshot();
+    done.state = "DONE";
+    done.metrics.roles.lead.targetUsed = "old/lead";
+    store.save(done);
+    controller.dispose();
+    // The configuration for the NEXT run differs from the completed run's snapshot.
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "new/lead" } } } });
+
+    const b = await boot(cwd);
+    const { ctx, notifications, ui } = commandCtx(cwd, ["old/lead", "new/lead"]);
+
+    await b.commands.get("factory-status").handler("", ctx);
+    const statusText = notifications.find((n) => n.message.includes("Latest completed run"))?.message ?? "";
+    expect(statusText).toContain("old/lead");
+    expect(statusText).toContain("Run configuration snapshot");
+
+    let configOptions: string[] | undefined;
+    ui.select.mockImplementation(async (title: string, options: string[]) => {
+      if (title.startsWith("Factory configuration")) {
+        configOptions = options;
+        return "Done";
+      }
+      return undefined;
+    });
+    await b.commands.get("factory-config").handler("", ctx);
+
+    expect(configOptions?.some((o) => o.startsWith("Lead ") && o.includes("new/lead"))).toBe(true);
     expect(b.spawns).toHaveLength(0);
   });
 });
