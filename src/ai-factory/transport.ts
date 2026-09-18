@@ -57,8 +57,13 @@ export type FailureClass = "transient" | "quota" | "hard";
 export function classifyError(message: string): FailureClass {
   const e = message.toLowerCase();
   if (/quota|capacity|exhausted|subscription|insufficient.*credit|billing/i.test(e)) return "quota";
+  // Transient availability failures: the target is otherwise valid but the
+  // provider/transport is unreachable right now (connectivity, overload,
+  // rate-limit). Bounded same-target retry, then fallback. Deliberately does
+  // NOT match configuration/auth failures (model-not-found, invalid provider,
+  // 401/403) — those stay `hard` and are surfaced without model-hopping.
   if (
-    /timeout|timed ?out|econnreset|connection reset|socket hang up|overloaded|502|503|504|bad gateway|service unavailable|429|too many requests|rate ?limit/i.test(e)
+    /timeout|timed ?out|econnreset|econnrefused|econnaborted|econnclose|enetunreach|ehostunreach|network (error|unreachable|is unreachable)|connect(ion)? (error|refused|reset|closed|dropped|timed ?out)|reset by peer|socket hang ?up|premature close|other side closed|fetch failed|transport (error|failure|closed)|provider transport|overloaded|502|503|504|bad gateway|service unavailable|429|too many requests|rate ?limit/i.test(e)
   ) return "transient";
   return "hard";
 }

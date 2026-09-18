@@ -166,3 +166,91 @@ describe("AI Factory — availability fallback", () => {
     expect(s.waiting!.nextRetryAt - before).toBe(5_000);
   });
 });
+
+describe("AI Factory — connectivity failure classification", () => {
+  it("A. 'Connection error.' on the primary Engineer retries then falls back and continues", async () => {
+    const m = make({
+      roles: { engineer: { targets: { primary: "omlx/qwen", fallbacks: ["opencode-go/deepseek"] }, maxTransientRetries: 2, retryDelayMs: 1_000 } },
+    });
+    await reachEngineerSpawn(m);
+
+    // The oMLX server is stopped: every attempt on the primary fails with a
+    // bare connectivity error. The fallback target is healthy.
+    m.transport.fireFailed({ agentId: m.transport.lastAgentId!, ok: false, status: "error", error: "Connection error." });
+    await flush();
+    expect(m.controller.getState().metrics.roles.engineer.retries).toBe(1);
+    expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(1);
+
+    // Backoff fires → same-target retry #2.
+    m.clock.advance(1_001);
+    await flush();
+    expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(2);
+    m.transport.fireFailed({ agentId: m.transport.lastAgentId!, ok: false, status: "error", error: "Connection error." });
+    await flush();
+    expect(m.controller.getState().metrics.roles.engineer.retries).toBe(2);
+
+    // Backoff fires → retry #3, which also fails; the budget is then exhausted
+    // and the configured fallback is attempted immediately.
+    m.clock.advance(2_001);
+    await flush();
+    expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(3);
+    m.transport.fireFailed({ agentId: m.transport.lastAgentId!, ok: false, status: "error", error: "Connection error." });
+    await flush();
+
+    const models = m.transport.spawned.filter((s) => s.role === "engineer").map((s) => s.model);
+    expect(models).toEqual(["omlx/qwen", "omlx/qwen", "omlx/qwen", "opencode-go/deepseek"]);
+    expect(m.controller.getState().metrics.roles.engineer.retries).toBe(2);
+    expect(m.controller.getState().metrics.roles.engineer.fallbacks).toBe(1);
+    // The run is still alive and continuing on the fallback.
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    expect(m.controller.getState().inFlight?.target).toBe("opencode-go/deepseek");
+  });
+
+  it("B. ECONNREFUSED follows the same transient path", async () => {
+    const m = make({ roles: { engineer: { targets: { primary: "p/a", fallbacks: ["p/b"] }, maxTransientRetries: 1, retryDelayMs: 1_000 } } });
+    m.transport.spawnHandler = (req) =>
+      req.role === "engineer" && req.model === "p/a"
+        ? ({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:8080" } as const)
+        : ({ ok: true, agentId: `agent-${Math.random()}` } as const);
+    await reachEngineerSpawn(m);
+
+    // Attempt 1 fails transiently at spawn time → one bounded retry.
+    expect(m.controller.getState().metrics.roles.engineer.retries).toBe(1);
+    m.clock.advance(1_001);
+    await flush();
+    // Attempt 2 exhausts the retry budget → fallback attempted.
+    const models = m.transport.spawned.filter((s) => s.role === "engineer").map((s) => s.model);
+    expect(models).toEqual(["p/a", "p/a", "p/b"]);
+    expect(m.controller.getState().metrics.roles.engineer.fallbacks).toBe(1);
+    expect(m.controller.getState().state).toBe("EXECUTION");
+  });
+
+  it("C. 'Model not found' stays HARD and does NOT fall back", async () => {
+    const m = make({ roles: { engineer: { targets: { primary: "p/a", fallbacks: ["p/b"] } } } });
+    m.transport.spawnHandler = (req) =>
+      req.role === "engineer" ? ({ ok: false, error: "Model not found: p/a" } as const) : ({ ok: true, agentId: `agent-${Math.random()}` } as const);
+    await reachEngineerSpawn(m);
+    await flush();
+
+    expect(m.controller.getState().state).toBe("FAILED");
+    const models = m.transport.spawned.filter((s) => s.role === "engineer").map((s) => s.model);
+    expect(models).toEqual(["p/a"]); // no retry, no fallback
+    expect(m.controller.getState().metrics.roles.engineer.retries).toBe(0);
+    expect(m.controller.getState().metrics.roles.engineer.fallbacks).toBe(0);
+    expect(m.controller.getState().errors[0].message).toContain("Model not found");
+  });
+
+  it("D. an auth/config error stays HARD and does NOT fall back", async () => {
+    const m = make({ roles: { engineer: { targets: { primary: "p/a", fallbacks: ["p/b"] } } } });
+    m.transport.spawnHandler = (req) =>
+      req.role === "engineer"
+        ? ({ ok: false, error: "401 Unauthorized: invalid API key" } as const)
+        : ({ ok: true, agentId: `agent-${Math.random()}` } as const);
+    await reachEngineerSpawn(m);
+    await flush();
+
+    expect(m.controller.getState().state).toBe("FAILED");
+    expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(1);
+    expect(m.controller.getState().metrics.roles.engineer.fallbacks).toBe(0);
+  });
+});

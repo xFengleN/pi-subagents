@@ -130,5 +130,15 @@ describe("AI Factory transport — direct RPC spawning", () => {
     expect(classifyError("quota exhausted")).toBe("quota");
     expect(classifyError("capacity blocked")).toBe("quota");
     expect(classifyError("Model not found: nope")).toBe("hard");
+    // Connectivity/transport failures are transient availability problems.
+    expect(classifyError("Connection error.")).toBe("transient");
+    expect(classifyError("ECONNREFUSED")).toBe("transient");
+    expect(classifyError("connect ECONNREFUSED 127.0.0.1:8080")).toBe("transient");
+    expect(classifyError("network unreachable")).toBe("transient");
+    expect(classifyError("connection refused")).toBe("transient");
+    expect(classifyError("temporary provider transport failure")).toBe("transient");
+    // Configuration/auth failures stay hard — hopping models cannot fix them.
+    expect(classifyError("401 Unauthorized: invalid API key")).toBe("hard");
+    expect(classifyError("invalid provider configuration")).toBe("hard");
   });
 });
