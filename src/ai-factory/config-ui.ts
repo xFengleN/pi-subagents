@@ -36,6 +36,14 @@ export interface FactoryConfigUIDeps {
   cwd: string;
   /** Available model ids as `provider/model`, from Pi's model registry. */
   models: string[];
+  /** Pi's current interactive chat model as `provider/model`, when known. */
+  chatModel?: string;
+  /**
+   * Change Pi's interactive chat model. Optional so the UI degrades to a
+   * display-only explanation when the host does not expose it. Only ever
+   * called from an explicit user selection — never on preset activation.
+   */
+  setChatModel?: (label: string) => Promise<boolean>;
 }
 
 const cap = (role: RoleName): string => role.charAt(0).toUpperCase() + role.slice(1);
@@ -46,6 +54,16 @@ function roleSummary(config: FactoryConfig, role: RoleName): string {
   const [primary, ...fallbacks] = targets;
   return fallbacks.length > 0 ? `${primary}  ←  ${fallbacks.join(", ")}` : primary;
 }
+
+/** The scope-separation explanation shown from the config menu. */
+const SCOPE_EXPLANATION =
+  "Factory role agents and Pi's ordinary chat model are separate.\n\n"
+  + "- The active Factory preset / project config controls ONLY the models Factory's "
+  + "Lead, Architect, Engineer and Reviewer roles run on.\n"
+  + "- Pi's main chat model is what your normal conversation uses. Activating or "
+  + "saving a Factory preset never changes it.\n"
+  + "- Normal messages stay normal Pi messages; Factory runs only when you invoke "
+  + "/factory or the Factory tool.";
 
 /**
  * Run the config menu until the user exits. Returns when the menu is dismissed.
@@ -63,7 +81,9 @@ export async function showFactoryConfigUI(ui: ConfigUI, deps: FactoryConfigUIDep
       ...ROLE_NAMES.map((role) => `${cap(role)} — ${roleSummary(config, role)}`),
       `Limits — repair ${config.maxRepairRounds}, remediation ${config.maxArchitectRemediationRounds}`,
       `Presets… (${listPresetNames().length})`,
-      `Active preset: ${activePreset ?? "(none)"}`,
+      `Active Factory preset: ${activePreset ?? "(none)"}  (Factory roles only)`,
+      `Pi chat model: ${deps.chatModel ?? "(unknown)"}  (separate from Factory)`,
+      `Model scopes — Factory roles vs Pi chat`,
       `View built-in defaults`,
       `Done`,
     ];
@@ -72,8 +92,12 @@ export async function showFactoryConfigUI(ui: ConfigUI, deps: FactoryConfigUIDep
 
     if (choice.startsWith("Presets…")) {
       await presetsMenu(ui, deps);
-    } else if (choice.startsWith("Active preset:")) {
+    } else if (choice.startsWith("Active Factory preset:")) {
       await chooseActivePreset(ui, deps);
+    } else if (choice.startsWith("Pi chat model:")) {
+      await chatModelMenu(ui, deps);
+    } else if (choice.startsWith("Model scopes")) {
+      ui.notify(SCOPE_EXPLANATION, "info");
     } else if (choice.startsWith("View built-in defaults")) {
       ui.notify(describeConfig(defaultFactoryConfig(), "Built-in Factory defaults"), "info");
     } else if (choice.startsWith("Limits")) {
@@ -82,6 +106,48 @@ export async function showFactoryConfigUI(ui: ConfigUI, deps: FactoryConfigUIDep
       const role = ROLE_NAMES.find((r) => choice.startsWith(`${cap(r)} `));
       if (role) await roleMenu(ui, deps, role);
     }
+  }
+}
+
+/**
+ * Explicit, opt-in control of Pi's chat model. Nothing here runs on preset
+ * activation; the user must open this menu and choose. Default is "Leave
+ * unchanged" (the menu is a no-op until an action is selected).
+ */
+async function chatModelMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<void> {
+  for (;;) {
+    const options = [
+      `Current Pi chat model: ${deps.chatModel ?? "(unknown)"}`,
+      "Leave unchanged",
+      "Same as Factory Lead",
+      "Choose model…",
+      "Back",
+    ];
+    const choice = await ui.select("Pi chat model (separate from Factory roles)", options);
+    if (!choice || choice === "Back" || choice.startsWith("Current Pi chat model:")) return;
+
+    if (choice === "Leave unchanged") {
+      ui.notify("Pi chat model left unchanged.", "info");
+      return;
+    }
+    let label: string | undefined;
+    if (choice === "Same as Factory Lead") {
+      label = loadFactoryConfig(deps.cwd).roles.lead.targets.primary;
+      if (!deps.models.includes(label)) {
+        ui.notify(`Factory Lead model "${label}" is not currently available; Pi chat model left unchanged.`, "warning");
+        return;
+      }
+    } else {
+      label = await ui.select("Choose Pi chat model", deps.models);
+    }
+    if (!label) return;
+    if (!deps.setChatModel) {
+      ui.notify("Pi's extension API does not expose changing the chat model here; left unchanged.", "warning");
+      return;
+    }
+    const ok = await deps.setChatModel(label);
+    ui.notify(ok ? `Pi chat model set to "${label}".` : `Could not set Pi chat model to "${label}" (no credentials?).`, ok ? "info" : "warning");
+    return;
   }
 }
 
@@ -166,7 +232,7 @@ async function presetsMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<voi
   for (;;) {
     const names = listPresetNames();
     const options = [
-      `Active preset: ${projectPresetName(deps.cwd) ?? "(none)"}`,
+      `Active Factory preset: ${projectPresetName(deps.cwd) ?? "(none)"}`,
       "Set active preset",
       "Save current config as new preset",
       "Overwrite existing preset",
@@ -177,7 +243,7 @@ async function presetsMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<voi
     const choice = await ui.select("Factory presets", options);
     if (!choice || choice === "Back") return;
 
-    if (choice.startsWith("Active preset:")) {
+    if (choice.startsWith("Active Factory preset:")) {
       await chooseActivePreset(ui, deps);
     } else if (choice === "Set active preset") {
       await chooseActivePreset(ui, deps);
@@ -216,10 +282,10 @@ async function presetsMenu(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<voi
 async function chooseActivePreset(ui: ConfigUI, deps: FactoryConfigUIDeps): Promise<void> {
   const names = listPresetNames();
   const none = "(none)";
-  const choice = await ui.select("Active preset", [none, ...names]);
+  const choice = await ui.select("Active Factory preset", [none, ...names]);
   if (choice === undefined) return;
   setProjectPreset(deps.cwd, choice === none ? undefined : choice);
-  ui.notify(choice === none ? "Project preset cleared." : `Active preset set to "${choice}".`, "info");
+  ui.notify(choice === none ? "Project Factory preset cleared." : `Active Factory preset set to "${choice}".`, "info");
 }
 
 async function pickPreset(ui: ConfigUI, names: string[], title: string): Promise<string | undefined> {

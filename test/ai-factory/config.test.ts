@@ -146,7 +146,7 @@ describe("AI Factory — config resolution and validation", () => {
           if (presetCalls === 2) return "Set active preset";
           return "Back";
         }
-        if (title === "Active preset") return "snap";
+        if (title === "Active Factory preset") return "snap";
         return undefined;
       },
       input: (title) => (title === "New preset name" ? "snap" : undefined),
@@ -209,6 +209,93 @@ describe("AI Factory — config resolution and validation", () => {
     expect(cfg.roles.lead.targets.primary).toBe("p/lead");
     expect(cfg.maxRepairRounds).toBe(2);
     expect(projectPresetName(cwd)).toBeUndefined();
+  });
+
+  it("G. Pi chat model is displayed/explained and changed only on explicit selection", async () => {
+    const cwd = workdir();
+    const models = ["p/lead", "p/eng"];
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "p/lead" } } } });
+
+    // (a) The main menu shows the current chat model and the scope explanation;
+    //     "Leave unchanged" calls nothing.
+    const seen: string[][] = [];
+    const leftUnchanged: string[] = [];
+    let mainA = 0;
+    const uiA = scriptedUI({
+      select: (title, options) => {
+        if (title.startsWith("Factory configuration")) {
+          seen.push(options);
+          mainA++;
+          if (mainA === 1) return "Model scopes — Factory roles vs Pi chat";
+          if (mainA === 2) return options.find((o) => o.startsWith("Pi chat model:"));
+          return "Done";
+        }
+        if (title === "Pi chat model (separate from Factory roles)") return "Leave unchanged";
+        return undefined;
+      },
+    });
+    await showFactoryConfigUI(uiA, {
+      cwd,
+      models,
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        leftUnchanged.push(label);
+        return true;
+      },
+    });
+    expect(seen[0]).toContain("Pi chat model: omlx/qwen  (separate from Factory)");
+    expect(seen[0].some((o) => o.startsWith("Active Factory preset:") && o.includes("Factory roles only"))).toBe(true);
+    expect(uiA.notifications.some((n) => n.message.includes("Pi's ordinary chat model are separate"))).toBe(true);
+    expect(leftUnchanged).toEqual([]);
+
+    // (b) "Same as Factory Lead" explicitly sets the chat model to the Lead primary.
+    const applied: string[] = [];
+    let mainB = 0;
+    const uiB = scriptedUI({
+      select: (title, options) => {
+        if (title.startsWith("Factory configuration")) {
+          mainB++;
+          return mainB === 1 ? options.find((o) => o.startsWith("Pi chat model:")) : "Done";
+        }
+        if (title === "Pi chat model (separate from Factory roles)") return "Same as Factory Lead";
+        return undefined;
+      },
+    });
+    await showFactoryConfigUI(uiB, {
+      cwd,
+      models,
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        applied.push(label);
+        return true;
+      },
+    });
+    expect(applied).toEqual(["p/lead"]);
+
+    // (c) An unavailable Lead model is surfaced, not applied.
+    const appliedC: string[] = [];
+    let mainC = 0;
+    const uiC = scriptedUI({
+      select: (title, options) => {
+        if (title.startsWith("Factory configuration")) {
+          mainC++;
+          return mainC === 1 ? options.find((o) => o.startsWith("Pi chat model:")) : "Done";
+        }
+        if (title === "Pi chat model (separate from Factory roles)") return "Same as Factory Lead";
+        return undefined;
+      },
+    });
+    await showFactoryConfigUI(uiC, {
+      cwd,
+      models: ["p/eng"],
+      chatModel: "omlx/qwen",
+      setChatModel: async (label) => {
+        appliedC.push(label);
+        return true;
+      },
+    });
+    expect(appliedC).toEqual([]);
+    expect(uiC.notifications.some((n) => n.type === "warning" && n.message.includes("not currently available"))).toBe(true);
   });
 
   it("preset store round-trips, reports names and deletes", () => {

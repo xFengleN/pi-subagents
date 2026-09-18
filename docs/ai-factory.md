@@ -154,6 +154,15 @@ A project file with no `preset` key resolves exactly as before, so existing
 configs are unaffected. Preset selection and project overrides are independent:
 clearing the active preset leaves project overrides in place.
 
+**Model scopes (Factory roles vs Pi chat).** The active preset / project config
+controls **only** the models the Factory role agents run on. Pi's ordinary chat
+model is separate and is shown in `/factory-config` (`Pi chat model: …`). Saving,
+activating or deleting a preset never changes Pi's chat model. The UI offers an
+explicit, opt-in `Pi chat model` item (Leave unchanged / Same as Factory Lead /
+Choose model…) via `pi.setModel`; the default is Leave unchanged, and it only
+acts when the user selects it. Normal messages stay normal Pi messages — Factory
+runs only when invoked via `/factory` or the `Factory` tool.
+
 ### Fallback semantics
 
 Per-role ordered targets (`primary` then `fallbacks`). Role identity never

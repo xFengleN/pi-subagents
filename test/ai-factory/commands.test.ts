@@ -7,12 +7,13 @@
  * no model anywhere: "zero model requests" means zero `subagents:rpc:spawn`.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { defaultFactoryConfig } from "../../src/ai-factory/config.js";
+import { defaultFactoryConfig, projectPresetName, writeProjectConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
 import factoryExtension from "../../src/ai-factory/index.js";
+import { savePreset } from "../../src/ai-factory/presets.js";
 import { FactoryStore } from "../../src/ai-factory/store.js";
 import { ctx as baseCtx, hermeticDir, makePi } from "../helpers/boot-extension.js";
 import { FakeClock, FakeTransport, flush } from "./fakes.js";
@@ -58,6 +59,7 @@ function makeDispatchingBus() {
 /** Boot the real Factory extension against a dispatching bus. */
 async function boot(cwd: string) {
   const { pi, tools, commands, lifecycle } = makePi();
+  pi.setModel = vi.fn(async () => true);
   const b = makeDispatchingBus();
   pi.events = b.bus;
   factoryExtension(pi);
@@ -235,5 +237,58 @@ describe("AI Factory — slash commands", () => {
 
     expect(b.spawns).toHaveLength(0);
     expect(readFileSync(join(cwd, ".pi", "factory.json"), "utf8")).toContain("p/eng");
+  });
+
+  it("H2. activating a Factory preset starts no run and leaves Pi's chat model unchanged", async () => {
+    const cwd = workdir();
+    savePreset("go-balanced", defaultFactoryConfig());
+    const b = await boot(cwd);
+    const { ctx, ui } = commandCtx(cwd, ["p/eng"]);
+    let main = 0;
+    let presetCalls = 0;
+    ui.select.mockImplementation(async (title: string, options: string[]) => {
+      if (title.startsWith("Factory configuration")) {
+        main++;
+        return main === 1 ? options.find((o) => o.startsWith("Presets")) : "Done";
+      }
+      if (title === "Factory presets") {
+        presetCalls++;
+        return presetCalls === 1 ? "Set active preset" : "Back";
+      }
+      if (title === "Active Factory preset") return "go-balanced";
+      return undefined;
+    });
+
+    await b.commands.get("factory-config").handler("", ctx);
+    await flush();
+
+    expect(projectPresetName(cwd)).toBe("go-balanced"); // selection was written
+    expect(b.spawns).toHaveLength(0); // no Factory run / zero model requests
+    const runsDir = join(cwd, ".pi", "factory");
+    expect(existsSync(runsDir) ? readdirSync(runsDir).length : 0).toBe(0);
+    expect(b.pi.setModel).not.toHaveBeenCalled(); // chat model untouched by preset activation
+  });
+
+  it("H3. explicitly choosing a Pi chat model calls pi.setModel (and starts no run)", async () => {
+    const cwd = workdir();
+    writeProjectConfig(cwd, { roles: { lead: { targets: { primary: "p/lead" } } } });
+    const b = await boot(cwd);
+    const { ctx, ui } = commandCtx(cwd, ["p/lead", "p/eng"]);
+    let main = 0;
+    ui.select.mockImplementation(async (title: string, options: string[]) => {
+      if (title.startsWith("Factory configuration")) {
+        main++;
+        return main === 1 ? options.find((o) => o.startsWith("Pi chat model:")) : "Done";
+      }
+      if (title === "Pi chat model (separate from Factory roles)") return "Choose model…";
+      if (title === "Choose Pi chat model") return "p/eng";
+      return undefined;
+    });
+
+    await b.commands.get("factory-config").handler("", ctx);
+    await flush();
+
+    expect(b.pi.setModel).toHaveBeenCalledTimes(1);
+    expect(b.spawns).toHaveLength(0);
   });
 });

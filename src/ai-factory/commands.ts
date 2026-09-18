@@ -140,7 +140,17 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
         ctx.ui.notify("/factory-config needs the interactive UI.", "error");
         return;
       }
-      await showFactoryConfigUI(commandUIContext(ctx), { cwd: ctx.cwd, models: availableModels(ctx) });
+      await showFactoryConfigUI(commandUIContext(ctx), {
+        cwd: ctx.cwd,
+        models: availableModels(ctx),
+        ...(ctx.model ? { chatModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
+        // Explicit-only: called solely from the "Pi chat model" submenu. Never on
+        // preset activation, so Factory presets cannot silently change the chat model.
+        setChatModel: async (label) => {
+          const model = ctx.modelRegistry.getAvailable().find((m) => `${m.provider}/${m.id}` === label);
+          return model ? pi.setModel(model) : false;
+        },
+      });
     },
   });
 }
