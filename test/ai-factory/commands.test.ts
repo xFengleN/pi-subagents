@@ -536,15 +536,19 @@ describe("AI Factory — /factory-status compactness", () => {
     store.save(state);
 
     const b = await boot(cwd);
-    const { ctx, notifications } = commandCtx(cwd);
+    const { ctx } = commandCtx(cwd);
 
     await b.commands.get("factory-metrics").handler("", ctx);
 
-    const text = notifications.find((n) => n.message.includes("Factory metrics"))?.message ?? "";
-    expect(text).toContain("Run: factory_metrics");
-    expect(text).toMatch(/Total\s+2/);
-    expect(text).toMatch(/Input\s+100/);
-    expect(text).toContain("p/lead"); // canonical identity, from the role aggregate
+    // Rendered at the bottom as a normal command-result message, not a toast.
+    expect(b.pi.sendMessage).toHaveBeenCalledTimes(1);
+    const msg = b.pi.sendMessage.mock.calls[0][0];
+    expect(msg.customType).toBe("factory-metrics");
+    expect(msg.display).toBe(true);
+    expect(msg.content).toContain("Run: factory_metrics");
+    expect(msg.content).toMatch(/Total\s+2/);
+    expect(msg.content).toMatch(/Input\s+100/);
+    expect(msg.content).toContain("p/lead"); // canonical identity, from the role aggregate
     expect(b.spawns).toHaveLength(0);
   });
 
@@ -557,13 +561,52 @@ describe("AI Factory — /factory-status compactness", () => {
     store.save(state);
 
     const b = await boot(cwd);
-    const { ctx, notifications } = commandCtx(cwd);
+    const { ctx } = commandCtx(cwd);
 
     await b.commands.get("factory-metrics").handler("factory_metrics_ro", ctx);
 
-    const text = notifications.find((n) => n.message.includes("Factory metrics"))?.message ?? "";
-    expect(text).toContain("opencode-go/deepseek-v4.1-flash");
+    expect(b.pi.sendMessage).toHaveBeenCalledTimes(1);
+    const msg = b.pi.sendMessage.mock.calls[0][0];
+    expect(msg.customType).toBe("factory-metrics");
+    expect(msg.content).toContain("opencode-go/deepseek-v4.1-flash");
     expect(b.spawns).toHaveLength(0);
     expect(b.emitted).not.toContain("subagents:rpc:spawn");
+  });
+});
+
+describe("AI Factory — run panel expansion", () => {
+  it("P. /factory registers the run panel widget above the editor", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, ui } = commandCtx(cwd);
+
+    await b.commands.get("factory").handler("do it", ctx);
+    await flush();
+
+    expect(ui.setWidget).toHaveBeenCalledWith("factory", expect.any(Function), { placement: "aboveEditor" });
+  });
+
+  it("O. /factory-agent toggles an agent's expansion, with no model call", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    store.save(completedState(cwd, "factory_toggle", "s", {
+      results: {
+        engineers: [{ round: 0, outcome: { packet: packets.engineer, agentId: "agent-eng" } }],
+        reviewers: [],
+      },
+    }));
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-agent").handler("engineer", ctx);
+    expect(notifications.some((n) => n.message.includes("Factory agent expanded"))).toBe(true);
+
+    await b.commands.get("factory-agent").handler("engineer", ctx);
+    expect(notifications.some((n) => n.message.includes("Factory agent collapsed"))).toBe(true);
+
+    await b.commands.get("factory-agent").handler("bogus", ctx);
+    expect(notifications.some((n) => n.message.includes("No Factory agent matches"))).toBe(true);
+
+    expect(b.spawns).toHaveLength(0);
   });
 });

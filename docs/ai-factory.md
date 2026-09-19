@@ -141,10 +141,11 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 
 | Command | What it does |
 |---|---|
-| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. When the run reaches `DONE`, its persisted final report is rendered automatically in the invoking session. |
+| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A run panel appears above the editor showing state and agents (collapsed). When the run reaches `DONE`, the accepted final report is appended automatically as a normal rendered (Markdown) message at the bottom of the conversation — exactly once per run. |
+| `/factory-agent <role|phase|active>` | Expands/collapses one agent in the run panel (e.g. `lead`, `execution.engineer`, `active` for the running agent). Collapsed by default; expanded rows stream the agent's visible operational transcript (prose, tool calls, tool/command results) live. No model call. |
 | `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
 | `/factory-report [runId]` | Prints the human-readable final report for the latest completed run, or for an explicit run id. Reads persisted state only — no model call. Legacy runs without a final Lead synthesis fall back to the accepted Architect/integration packet, clearly labelled. |
-| `/factory-metrics [runId]` | Prints operational metrics for the latest run, or an explicit run id: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
+| `/factory-metrics [runId]` | Appends operational metrics for the latest run, or an explicit run id, as a normal message at the current bottom of the conversation: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
 | `/factory-config` | Interactive menu: per-role primary/fallback models (chosen from Pi's available-model registry), transient retries/delay/max-turns, limits, and preset management. |
 
@@ -268,6 +269,26 @@ hand-edited (or written by `/factory-config`) and may be committed. Everything
 under `<cwd>/.pi/factory/` is a per-run runtime artifact: treat it as
 untracked output and add `.pi/factory/` to the project's `.gitignore`. Factory
 never commits run artifacts.
+
+## Run panel and final-output rendering
+
+While a `/factory` run is active, the Factory shows an above-editor panel with
+the run id, state and its role agents, one row each, collapsed by default. An
+agent row is expanded with `/factory-agent <role|phase|active>`; expanded rows
+stream the agent's **visible** operational transcript live — assistant prose,
+tool calls and tool/command results — from the agent's retained session,
+mirroring the normal Pi transcript (never chain-of-thought). The same
+conversation-viewer inspection remains available through `/agents → Enter`.
+
+At completion the accepted final report is appended to the conversation as a
+normal rendered message at the bottom: the same single-source formatter
+`/factory-report` uses, with section titles promoted to Markdown headings, sent
+through pi's custom-message renderer (the same mechanism pi-subagents uses for
+its completion notifications). It is appended exactly once per run; replayed
+completion events are ignored. `/factory-metrics` likewise appends its output as
+a normal message at the invocation point rather than updating a top status
+region. `/factory-status` and `/factory-report` remain compact `notify` recall
+commands.
 
 ## Metrics
 

@@ -54,6 +54,12 @@ export interface FactoryCommandRuntime {
   listRuns(cwd: string): FactoryRunListItem[];
   /** Stop a run; restores without resuming when it is not in-process. */
   stop(runId: string, cwd: string): boolean;
+  /** Register/refresh the Factory run panel widget for this session. */
+  showRunPanel(ctx: ExtensionCommandContext, runId: string): void;
+  /** Toggle an agent's expansion by role/phase/active; returns a status message. */
+  toggleAgent(ref: string, cwd: string): string | undefined;
+  /** Append the accepted final report to the conversation (deduplicated). */
+  reportCompletion(state: FactoryRunState): void;
 }
 
 /** Available model ids as `provider/model`, from Pi's registry. */
@@ -296,6 +302,59 @@ export function formatFactoryCompletion(state: FactoryRunState): string {
   return `Factory run ${state.runId} ended ${state.state}. Use /factory-status for details.`;
 }
 
+/** Section titles promoted to `##` headings in the Markdown report message. */
+const REPORT_HEADINGS = new Set([
+  "Factory final report",
+  "Delivered",
+  "Architecture / decisions",
+  "Reviewer findings",
+  "Validation",
+  "Commits",
+  "Human verification (pending)",
+  "Warnings / limitations",
+  "Remediation history",
+  "Final accepted evidence",
+  "Latest integration (NOT accepted)",
+]);
+
+/**
+ * The final report as a rich message: same single-source formatter as
+ * `/factory-report`, with the plain section titles promoted to Markdown
+ * headings so the normal assistant-message renderer displays them as headings.
+ */
+export function formatFactoryReportMarkdown(state: FactoryRunState): string {
+  return formatFactoryReport(state)
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (trimmed === "Factory final report") return "# Factory final report";
+      if (REPORT_HEADINGS.has(trimmed)) return `## ${trimmed}`;
+      return line;
+    })
+    .join("\n");
+}
+
+/** The minimal message sink the completion reporter needs (pi.sendMessage). */
+export interface CompletionSink {
+  sendMessage(message: { customType: string; content: string; display: boolean }): void;
+}
+
+/**
+ * Append the accepted final report to the conversation exactly once per run,
+ * as a normal rendered message. Replayed/duplicate DONE events are ignored via
+ * the caller-supplied `reported` set.
+ */
+export function reportFactoryCompletion(sink: CompletionSink, state: FactoryRunState, reported: Set<string>): void {
+  if (reported.has(state.runId)) return;
+  reported.add(state.runId);
+  if (state.state !== "DONE") return;
+  sink.sendMessage({
+    customType: "factory-final-report",
+    content: formatFactoryReportMarkdown(state),
+    display: true,
+  });
+}
+
 /** State for a run or undefined, reading persisted state only (no model calls). */
 function reportStateFor(runId: string | undefined, cwd: string, runtime: FactoryCommandRuntime): FactoryRunState | undefined {
   if (runId !== undefined && runId !== "") return runtime.peekState(runId, cwd);
@@ -336,13 +395,15 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
       }
       const { id, controller } = runtime.launch(ctx.cwd, task);
       ctx.ui.notify(`Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}`, "info");
-      // Auto-render the final report when the run finishes, so the invoking
-      // session shows the result without the user remembering another command.
-      // Uses the persisted finalReport via the same formatter /factory-report
-      // uses — never a second, divergent summary.
+      runtime.showRunPanel(ctx, id);
+      // Auto-append the accepted final report when the run finishes, as a
+      // normal rendered message at the bottom of the conversation (deduplicated
+      // by run id). Non-DONE terminal states stay a short notification.
       if (ctx.hasUI) {
         void controller.waitForTerminal().then((final) => {
-          ctx.ui.notify(formatFactoryCompletion(final), final.state === "DONE" ? "info" : "warning");
+          // Stops the live panel and appends the rich report on DONE.
+          runtime.reportCompletion(final);
+          if (final.state !== "DONE") ctx.ui.notify(formatFactoryCompletion(final), "warning");
         });
       }
     },
@@ -363,6 +424,21 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
         return;
       }
       ctx.ui.notify(formatRunStatus(state), "info");
+    },
+  });
+
+  pi.registerCommand("factory-agent", {
+    description:
+      "Expand/collapse a Factory run agent by role, phase or 'active' (read-only; no model call). " +
+      "e.g. /factory-agent lead, /factory-agent execution.engineer, /factory-agent active.",
+    handler: async (args, ctx) => {
+      const ref = args.trim();
+      if (ref === "") {
+        ctx.ui.notify("Usage: /factory-agent <role|phase|active>", "info");
+        return;
+      }
+      const message = runtime.toggleAgent(ref, ctx.cwd);
+      ctx.ui.notify(message ?? "No Factory run with a matching agent found for this project.", "info");
     },
   });
 
@@ -396,7 +472,13 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
         );
         return;
       }
-      ctx.ui.notify(formatRunMetrics(state), "info");
+      // Render at the current invocation point (bottom of the conversation) as a
+      // normal command-result message — never a top/toast status region.
+      if (ctx.hasUI) {
+        pi.sendMessage({ customType: "factory-metrics", content: formatRunMetrics(state), display: true });
+      } else {
+        ctx.ui.notify(formatRunMetrics(state), "info");
+      }
     },
   });
 

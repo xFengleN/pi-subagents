@@ -17,10 +17,13 @@ import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-
 import { Type } from "@sinclair/typebox";
 import { nanoid } from "nanoid";
 import { systemClock } from "./clock.js";
-import { type FactoryCommandRuntime, type FactoryRunListItem, registerFactoryCommands } from "./commands.js";
+import { type FactoryCommandRuntime, type FactoryRunListItem, registerFactoryCommands, reportFactoryCompletion } from "./commands.js";
 import { loadFactoryConfig } from "./config.js";
 import { FactoryController, type FactoryControllerDeps } from "./controller.js";
 import { buildRunSummary } from "./metrics.js";
+import { FactoryPanelState, resolveAgentId } from "./panel.js";
+import { FactoryRunPanel } from "./panel-widget.js";
+import { markdownMessage, textMessage, type WidgetTheme } from "./render.js";
 import { isTerminal } from "./state.js";
 import { FactoryStore } from "./store.js";
 import { BusFactoryTransport, globalManagerRegistry } from "./transport.js";
@@ -38,11 +41,29 @@ export default function (pi: ExtensionAPI): void {
   let store: FactoryStore | undefined;
   let sessionBound = false;
 
+  // Session-scoped Factory run panel state (the above-editor widget + expansion).
+  let panel: FactoryPanelState | undefined;
+  let runPanel: FactoryRunPanel | undefined;
+  let activeRunId: string | undefined;
+  let reportedRuns = new Set<string>();
+
   const depsFor = (cwd: string): FactoryControllerDeps => ({
     transport,
     clock: systemClock,
     store: new FactoryStore(cwd),
     config: loadFactoryConfig(cwd),
+  });
+
+  // Register message renderers at activation (like pi-subagents registers its
+  // notification renderer) so the Factory's transcript entries render through
+  // the normal message path: the final report as Markdown, metrics as text.
+  pi.registerMessageRenderer("factory-final-report", (message, _options, theme) => {
+    const content = typeof message.content === "string" ? message.content : "";
+    return content ? markdownMessage(content, theme as WidgetTheme) : undefined;
+  });
+  pi.registerMessageRenderer("factory-metrics", (message, _options) => {
+    const content = typeof message.content === "string" ? message.content : "";
+    return content ? textMessage(content) : undefined;
   });
 
   // Discovery: pi-subagents advertises `subagents:ready` on its first bound
@@ -53,8 +74,23 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     store = new FactoryStore(ctx.cwd);
     sessionBound = true;
+    panel = new FactoryPanelState();
+    runPanel = new FactoryRunPanel({
+      panel,
+      getRunState: () => (activeRunId !== undefined ? controllers.get(activeRunId)?.getState() : undefined),
+    });
+    reportedRuns = new Set();
+    activeRunId = undefined;
     void transport.ping(750).then((ok) => { if (ok) transport.markReady(); });
   });
+
+  const resetSessionUI = (): void => {
+    runPanel?.dispose();
+    runPanel = undefined;
+    panel = undefined;
+    activeRunId = undefined;
+    reportedRuns = new Set();
+  };
 
   pi.on("session_before_switch", () => {
     // Runs persist to disk on every transition; detach in-process controllers
@@ -62,6 +98,7 @@ export default function (pi: ExtensionAPI): void {
     // resumed on demand via factory_status.
     for (const controller of controllers.values()) controller.dispose();
     controllers.clear();
+    resetSessionUI();
   });
 
   pi.on("session_shutdown", async () => {
@@ -69,6 +106,7 @@ export default function (pi: ExtensionAPI): void {
     controllers.clear();
     sessionBound = false;
     store = undefined;
+    resetSessionUI();
   });
 
   pi.registerTool(defineTool({
@@ -169,6 +207,30 @@ export default function (pi: ExtensionAPI): void {
       }
       controller.stop("Stopped via /factory-stop");
       return true;
+    },
+    showRunPanel: (ctx, runId) => {
+      activeRunId = runId;
+      if (!ctx.hasUI || !runPanel) return;
+      ctx.ui.setWidget("factory", runPanel.content, { placement: "aboveEditor" });
+    },
+    toggleAgent: (ref, cwd) => {
+      if (!panel) return undefined;
+      if (activeRunId === undefined) {
+        const runs = listRuns(cwd);
+        if (runs.length === 0) return undefined;
+        activeRunId = runs[0].runId;
+      }
+      const state = controllers.get(activeRunId)?.getState() ?? activeStore(cwd).load(activeRunId);
+      if (!state) return undefined;
+      const id = resolveAgentId(state, ref);
+      if (!id) return `No Factory agent matches "${ref}".`;
+      panel.toggle(id);
+      runPanel?.refresh();
+      return `Factory agent ${panel.isExpanded(id) ? "expanded" : "collapsed"}.`;
+    },
+    reportCompletion: (state) => {
+      runPanel?.stop();
+      reportFactoryCompletion(pi, state, reportedRuns);
     },
   };
   registerFactoryCommands(pi, runtime);
