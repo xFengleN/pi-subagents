@@ -46,6 +46,9 @@ src/ai-factory/
   metrics.ts      per-role token/cost accounting + run summary
   store.ts        small atomic JSON persistence (.pi/factory/<runId>.json)
   clock.ts        injectable clock (fake clock drives multi-hour waits in tests)
+  panel.ts        visibility-mode vocabulary, target resolution, compact summary
+  panel-widget.ts the compact orchestration widget (above the editor)
+  live-view.ts    focused live transcript overlay (reuses pi-subagents' viewer)
 ```
 
 The Factory is a **second pi extension** in this package
@@ -141,8 +144,8 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 
 | Command | What it does |
 |---|---|
-| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A run panel appears above the editor showing state and agents (collapsed). When the run reaches `DONE`, the accepted final report is appended automatically as a normal rendered (Markdown) message at the bottom of the conversation — exactly once per run. |
-| `/factory-agent <role|phase|active>` | Expands/collapses one agent in the run panel (e.g. `lead`, `execution.engineer`, `active` for the running agent). Collapsed by default; expanded rows stream the agent's visible operational transcript (prose, tool calls, tool/command results) live. No model call. |
+| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A compact run panel appears above the editor showing orchestration state (run id, state, active role/phase/model, counters) — it deliberately does not duplicate the pi-subagents agent tree. When the run reaches `DONE`, the accepted final report is appended automatically as a normal rendered (Markdown) message at the bottom of the conversation — exactly once per run. |
+| `/factory-verbose [mode]` | Selects what the Factory's focused live view shows (read-only; no model call). With no argument it reports the current mode and usage. Modes: `on` (follow the active agent, then the last finished one — the default), `off` (compact progress only, no live view), `active` (only the running agent, following phase changes), a role (`lead`/`architect`/`engineer`/`reviewer`, the latest agent of that role), or an exact phase (e.g. `execution.engineer`, that phase's agent). For every mode except `off` the command opens a scrollable, live-updating transcript overlay (Esc closes it) that reuses pi-subagents' own conversation viewer; `/agents` remains the full history. The mode is a session-scoped UI preference, independent of Factory configuration and persisted run data, and never affects execution. Invalid arguments show usage and never invoke a model. |
 | `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
 | `/factory-report [runId]` | Prints the human-readable final report for the latest completed run, or for an explicit run id. Reads persisted state only — no model call. Legacy runs without a final Lead synthesis fall back to the accepted Architect/integration packet, clearly labelled. |
 | `/factory-metrics [runId]` | Appends operational metrics for the latest run, or an explicit run id, as a normal message at the current bottom of the conversation: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
@@ -272,13 +275,33 @@ never commits run artifacts.
 
 ## Run panel and final-output rendering
 
-While a `/factory` run is active, the Factory shows an above-editor panel with
-the run id, state and its role agents, one row each, collapsed by default. An
-agent row is expanded with `/factory-agent <role|phase|active>`; expanded rows
-stream the agent's **visible** operational transcript live — assistant prose,
-tool calls and tool/command results — from the agent's retained session,
-mirroring the normal Pi transcript (never chain-of-thought). The same
-conversation-viewer inspection remains available through `/agents → Enter`.
+While a `/factory` run is active, the Factory shows a compact above-editor panel
+with the run id, state, the active role/phase/model and the orchestration
+counters (repair/remediation rounds, retries, fallbacks, capacity waits). It
+deliberately does **not** list agents or render transcripts: pi-subagents' own
+agent tree is the single agent list, and a full transcript cannot live safely in
+the tiny non-scrollable widget (custom session entries are append-only and not
+re-rendered live; custom *messages* would pollute the parent model's context).
+
+Live detail therefore lives in a **focused, scrollable overlay** opened by
+`/factory-verbose`. The overlay reuses pi-subagents' own `ConversationViewer` —
+the same live, scrollable surface `/agents → Enter` opens — and subscribes to the
+retained agent session, so assistant prose, tool calls, tool results and shell
+commands/output stream in real time (never chain-of-thought). The Factory wrapper
+re-resolves the target on a timer, so `on`/`active` follow the running agent as
+phases change and a not-yet-spawned role/phase target appears when it starts. It
+is read-only: the Factory controller owns stop and steering. Esc closes the
+overlay; arrows / PgUp / PgDn scroll.
+
+The mode is UI state, deliberately separate from Factory execution configuration
+and persisted run data, and it is preserved across runs in the same pi session
+(a session switch disposes the panel but does not reset the preference).
+`/factory-agent` remains registered as a deprecated alias over the same state —
+it is not a second visibility system, and it is no longer advertised.
+
+Because the panel is a fixed few lines and the transcript lives in the overlay,
+there is no widget truncation: the underlying transcript is never deleted or
+mutated, and the full inspection remains available through `/agents → Enter`.
 
 At completion the accepted final report is appended to the conversation as a
 normal rendered message at the bottom: the same single-source formatter
@@ -320,7 +343,8 @@ pi install /path/to/pi-subagents
 # 3. start a run directly — no model has to decide to call Factory
 /factory add a widgets package with tests
 
-# 4. inspect / stop deterministically
+# 4. choose what the live view shows (default: on), then inspect / stop
+/factory-verbose active   # opens a live transcript overlay following the run; off/<role>/<exact-phase> also work
 /factory-status
 /factory-report      # the final report, once the run is DONE
 /factory-metrics     # per-call tokens, cost, context and orchestration counts

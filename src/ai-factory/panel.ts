@@ -1,18 +1,18 @@
 /**
- * ai-factory/panel.ts — Deterministic UI state and content builders for the
- * Factory run panel (the above-editor widget).
+ * ai-factory/panel.ts — Deterministic helpers for the Factory run panel.
  *
- * This module is pure and pi-free so tests can drive it directly: per-agent
- * expand/collapse state, the extraction of an agent's *visible* operational
- * stream from its session, and the plain-text lines the widget renders. The TUI
- * wiring in index.ts / panel-widget.ts composes these into a widget.
+ * Pure and pi-free. It owns the visibility-mode vocabulary, the target
+ * resolution used by the focused live view, agent listing, and the compact
+ * orchestration summary the above-editor widget renders.
  *
- * The stream deliberately mirrors what a normal Pi transcript shows (assistant
- * prose, tool calls, tool/command results) and never surfaces hidden
- * chain-of-thought/private reasoning.
+ * The live agent transcript is deliberately NOT built here: the widget is a
+ * tiny, non-scrollable, non-interactive surface, so detail lives in the focused
+ * viewer in `live-view.ts`, which reuses pi-subagents' own ConversationViewer.
+ * That is why there is no transcript extraction or line-bounding in this module
+ * any more — the summary is a fixed few lines.
  */
 
-import type { FactoryRunState, RoleName } from "./types.js";
+import { type FactoryRunState, ROLE_NAMES, type RoleName } from "./types.js";
 
 /** One role agent listed in the run panel. */
 export interface PanelAgentView {
@@ -22,155 +22,83 @@ export interface PanelAgentView {
 }
 
 /**
- * Per-agent expand/collapse state, keyed by the pi-subagents agent id so two
- * agents (or two runs) never share a flag. Collapsed by default.
+ * The run panel's visibility mode — the single state system that decides which
+ * agent's activity the focused live view shows. Deliberately separate from
+ * Factory configuration and from persisted run data: it is UI-only and
+ * session-scoped, and it never affects execution.
+ *
+ *   all      — `/factory-verbose on` — follow the active agent; when idle, the
+ *              most recent accepted/finished agent.
+ *   none     — `/factory-verbose off` — compact progress only; no live view.
+ *   active   — `/factory-verbose active` — only the currently running agent.
+ *   role     — `/factory-verbose lead|architect|engineer|reviewer` — the latest
+ *              agent of that role.
+ *   phase    — `/factory-verbose <exact-phase>` — that phase's agent.
  */
-export class FactoryPanelState {
-  private readonly expanded = new Set<string>();
+export type VisibilityMode =
+  | { kind: "all" }
+  | { kind: "none" }
+  | { kind: "active" }
+  | { kind: "role"; role: RoleName }
+  | { kind: "phase"; phase: string };
 
-  isExpanded(agentId: string): boolean {
-    return this.expanded.has(agentId);
-  }
-
-  toggle(agentId: string): void {
-    if (this.expanded.has(agentId)) this.expanded.delete(agentId);
-    else this.expanded.add(agentId);
-  }
-
-  clear(): void {
-    this.expanded.clear();
-  }
-}
-
-/* -------------------------------------------------------------------------- */
-/* Visible operational stream                                                 */
-/* -------------------------------------------------------------------------- */
-
-/** A user-visible event from an agent's session. */
-export type StreamEvent =
-  | { kind: "text"; text: string }
-  | { kind: "user"; text: string }
-  | { kind: "toolCall"; name: string }
-  | { kind: "toolResult"; text: string; elided?: number }
-  | { kind: "bash"; command: string; output?: string; elided?: number };
-
-/** The subset of an `AgentSession` message the panel reads. */
-export interface StreamMessageLike {
-  role: string;
-  content?: unknown;
-  command?: string;
-  output?: unknown;
-}
-
-/** Widget cap on a single result/output block. */
-const STREAM_RESULT_MAX_CHARS = 1_600;
-/** Widget cap on how many expanded lines one agent may occupy. */
-export const EXPANDED_MAX_LINES = 12;
-
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const part of content) {
-    if (part == null) continue;
-    if (typeof part === "string") {
-      parts.push(part);
-      continue;
-    }
-    const text = (part as { text?: unknown }).text;
-    if (typeof text === "string") parts.push(text);
-  }
-  return parts.join("\n");
-}
-
-function cap(text: string): { text: string; elided: number } {
-  if (text.length <= STREAM_RESULT_MAX_CHARS) return { text, elided: 0 };
-  return { text: text.slice(0, STREAM_RESULT_MAX_CHARS), elided: text.length - STREAM_RESULT_MAX_CHARS };
-}
+/** The development/validation default: follow the active agent. */
+export const DEFAULT_VISIBILITY_MODE: VisibilityMode = { kind: "all" };
 
 /**
- * Normalize an agent session's messages into the user-visible stream: assistant
- * prose, tool calls, tool/command results. Same content the conversation viewer
- * shows, nothing else.
+ * Every exact phase a Factory run may spawn, in canonical form. `/factory-verbose`
+ * accepts one of these (case-insensitively); anything else is an invalid argument.
  */
-export function extractVisibleStream(messages: readonly StreamMessageLike[]): StreamEvent[] {
-  const out: StreamEvent[] = [];
-  for (const msg of messages) {
-    if (msg.role === "assistant") {
-      if (!Array.isArray(msg.content)) continue;
-      for (const raw of msg.content) {
-        const part = raw as { type?: string; text?: string; name?: string; toolName?: string };
-        if (part == null) continue;
-        if (part.type === "text" && typeof part.text === "string" && part.text.trim() !== "") {
-          out.push({ kind: "text", text: part.text.trim() });
-        } else if (part.type === "toolCall" || part.type === "tool_use") {
-          out.push({ kind: "toolCall", name: String(part.name ?? part.toolName ?? "unknown") });
-        }
-      }
-    } else if (msg.role === "user") {
-      const text = extractText(msg.content).trim();
-      if (text) out.push({ kind: "user", text });
-    } else if (msg.role === "toolResult") {
-      const text = extractText(msg.content).trim();
-      if (!text) continue;
-      const capped = cap(text);
-      out.push({ kind: "toolResult", text: capped.text, ...(capped.elided > 0 ? { elided: capped.elided } : {}) });
-    } else if (msg.role === "bashExecution") {
-      const command = typeof msg.command === "string" ? msg.command : "";
-      if (!command) continue;
-      const rawOutput = typeof msg.output === "string" ? msg.output : extractText(msg.output);
-      const capped = cap(rawOutput.trim());
-      const ev: StreamEvent = { kind: "bash", command };
-      if (capped.text) {
-        ev.output = capped.text;
-        if (capped.elided > 0) ev.elided = capped.elided;
-      }
-      out.push(ev);
-    }
-  }
-  return out;
+export const FACTORY_PHASES: readonly string[] = [
+  "discovery.lead",
+  "initial.architect",
+  "execution.engineer",
+  "review.reviewer",
+  "integration.lead",
+  "final.architect",
+  "final_recheck.architect",
+  "final_synthesis.lead",
+  "remediation.engineer",
+  "remediation.reviewer",
+  "escalation.architect",
+  "escalation.lead",
+];
+
+/**
+ * Parse a `/factory-verbose` argument into a mode. Case-insensitive. Returns
+ * `undefined` for an empty or unrecognised argument, which callers render as
+ * help — never as a mode.
+ */
+export function parseVisibilityArg(ref: string): VisibilityMode | undefined {
+  const r = ref.trim().toLowerCase();
+  if (r === "on") return { kind: "all" };
+  if (r === "off") return { kind: "none" };
+  if (r === "active") return { kind: "active" };
+  if ((ROLE_NAMES as readonly string[]).includes(r)) return { kind: "role", role: r as RoleName };
+  if (FACTORY_PHASES.includes(r)) return { kind: "phase", phase: r };
+  return undefined;
 }
 
-/** Compact single-line rendering of one stream event. */
-export function formatStreamEvent(ev: StreamEvent): string[] {
-  switch (ev.kind) {
-    case "text":
-      return [ev.text];
-    case "user":
-      return [`[User] ${ev.text}`];
-    case "toolCall":
-      return [`[Tool] ${ev.name}`];
-    case "toolResult": {
-      const lines = ev.text.split("\n");
-      const first = lines[0] ?? "";
-      const extra = lines.length - 1;
-      return [`[Result] ${first}${extra > 0 ? ` (${extra} more line${extra === 1 ? "" : "s"})` : ""}${ev.elided ? " …" : ""}`];
-    }
-    case "bash": {
-      const lines = [`$ ${ev.command}`];
-      if (ev.output) {
-        const outputLines = ev.output.split("\n").slice(0, 4);
-        lines.push(...outputLines);
-        if (ev.elided !== undefined || ev.output.split("\n").length > outputLines.length) lines.push("…");
-      }
-      return lines;
-    }
+/** A short human-readable label for a visibility mode. */
+export function describeVisibilityMode(mode: VisibilityMode): string {
+  switch (mode.kind) {
+    case "all": return "on — detail follows the active agent";
+    case "none": return "off — compact progress only";
+    case "active": return "active — only the running agent";
+    case "role": return `role — only ${mode.role} agents`;
+    case "phase": return `phase — only the ${mode.phase} agent`;
   }
 }
 
-/** Expanded body lines for an agent, capped so the widget stays compact. */
-export function buildExpandedLines(events: readonly StreamEvent[], maxLines = EXPANDED_MAX_LINES): string[] {
-  const lines: string[] = [];
-  for (const ev of events) {
-    for (const line of formatStreamEvent(ev)) {
-      if (lines.length >= maxLines) break;
-      lines.push(line);
-    }
-    if (lines.length >= maxLines) break;
+/** The compact label the panel hint shows, e.g. `on`, `active`, `engineer`. */
+export function visibilityModeLabel(mode: VisibilityMode): string {
+  switch (mode.kind) {
+    case "all": return "on";
+    case "none": return "off";
+    case "active": return "active";
+    case "role": return mode.role;
+    case "phase": return mode.phase;
   }
-  if (lines.length === 0) lines.push("(no visible activity yet)");
-  if (events.length > 0 && lines.length >= maxLines) lines.push("… (truncated)");
-  return lines;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -204,36 +132,59 @@ export function collectAgents(state: FactoryRunState): PanelAgentView[] {
 }
 
 /**
- * Resolve a user reference to a run's agent id: `active`/empty → the in-flight
- * agent; a role name → the latest agent of that role; otherwise a phase
- * substring or raw id.
+ * The agent the focused live view should currently show for a mode, or
+ * `undefined` when nothing matches yet (e.g. the phase has not spawned). The
+ * live view re-resolves this on a timer, so `active`/`on` follow the run as
+ * phases change and a not-yet-spawned role/phase target appears when it does.
  */
-export function resolveAgentId(state: FactoryRunState, ref: string): string | undefined {
-  const r = ref.trim().toLowerCase();
-  if (r === "" || r === "active") return state.inFlight?.agentId;
-  if (r === "lead" || r === "architect" || r === "engineer" || r === "reviewer") {
-    const role = r as RoleName;
-    if (state.inFlight?.role === role) return state.inFlight.agentId;
-    const matches = collectAgents(state).filter((a) => a.role === role);
-    return matches[matches.length - 1]?.id;
-  }
+export function resolveFocusAgentId(state: FactoryRunState, mode: VisibilityMode): string | undefined {
   const agents = collectAgents(state);
-  const byPhase = agents.find((a) => a.phase.toLowerCase().includes(r));
-  if (byPhase) return byPhase.id;
-  return agents.find((a) => a.id === ref)?.id;
+  const activeId = state.inFlight?.agentId;
+  switch (mode.kind) {
+    case "none":
+      return undefined;
+    case "active":
+      return activeId;
+    case "all":
+      if (activeId) return activeId;
+      // Idle: prefer the final synthesis (the accepted run's newest artifact),
+      // else the last listed agent.
+      return state.results.finalReport?.agentId ?? agents[agents.length - 1]?.id;
+    case "role": {
+      if (state.inFlight?.role === mode.role) return activeId;
+      const matches = agents.filter((a) => a.role === mode.role);
+      return matches[matches.length - 1]?.id;
+    }
+    case "phase": {
+      if (state.inFlight?.phase === mode.phase) return activeId;
+      const matches = agents.filter((a) => a.phase === mode.phase);
+      return matches[matches.length - 1]?.id;
+    }
+  }
 }
 
 /* -------------------------------------------------------------------------- */
 /* Widget text                                                                */
 /* -------------------------------------------------------------------------- */
 
-/** Panel header lines: run id + state. */
-export function formatPanelHeader(state: FactoryRunState): string[] {
-  return [`Factory run ${state.runId}`, `State: ${state.state}${state.parked ? " (parked)" : ""}`];
-}
-
-/** One agent row: `▸/▾` + role — phase + optional status suffix. */
-export function formatAgentRow(agent: PanelAgentView, expanded: boolean, status: string): string {
-  const label = `${agent.role} — ${agent.phase}`;
-  return `${expanded ? "▾" : "▸"} ${label}${status ? `  ${status}` : ""}`;
+/**
+ * The compact orchestration summary the above-editor widget shows: run id,
+ * state, the active role/phase/model and the orchestration counters. It
+ * intentionally lists no agents and renders no transcript — pi-subagents' own
+ * agent tree is the single agent list, and the live transcript lives in the
+ * focused viewer.
+ */
+export function formatPanelSummary(state: FactoryRunState): string[] {
+  const m = state.metrics;
+  const active = state.inFlight;
+  return [
+    `Factory ${state.runId}`,
+    `State: ${state.state}${state.parked ? " (parked)" : ""}`,
+    active
+      ? `Active: ${active.role} — ${active.phase}${active.target ? `  ${active.target}` : ""}`
+      : "Active: none",
+    `Repair ${state.repairRound}/${state.config.maxRepairRounds} · `
+      + `Remediation ${state.remediationRounds}/${state.config.maxArchitectRemediationRounds} · `
+      + `Retries ${m.totalRetries} · Fallbacks ${m.totalFallbacks} · Capacity ${m.capacityWaits}`,
+  ];
 }

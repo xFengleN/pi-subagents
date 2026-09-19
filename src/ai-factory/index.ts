@@ -16,12 +16,14 @@
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { nanoid } from "nanoid";
+import type { AgentRecord } from "../types.js";
 import { systemClock } from "./clock.js";
 import { type FactoryCommandRuntime, type FactoryRunListItem, registerFactoryCommands, reportFactoryCompletion } from "./commands.js";
 import { loadFactoryConfig } from "./config.js";
 import { FactoryController, type FactoryControllerDeps } from "./controller.js";
+import { FactoryFocusView, type FocusTarget } from "./live-view.js";
 import { buildRunSummary } from "./metrics.js";
-import { FactoryPanelState, resolveAgentId } from "./panel.js";
+import { DEFAULT_VISIBILITY_MODE, describeVisibilityMode, resolveFocusAgentId, type VisibilityMode } from "./panel.js";
 import { FactoryRunPanel } from "./panel-widget.js";
 import { markdownMessage, textMessage, type WidgetTheme } from "./render.js";
 import { isTerminal } from "./state.js";
@@ -41,11 +43,14 @@ export default function (pi: ExtensionAPI): void {
   let store: FactoryStore | undefined;
   let sessionBound = false;
 
-  // Session-scoped Factory run panel state (the above-editor widget + expansion).
-  let panel: FactoryPanelState | undefined;
+  // Session-scoped Factory run panel state (the compact above-editor widget).
   let runPanel: FactoryRunPanel | undefined;
   let activeRunId: string | undefined;
   let reportedRuns = new Set<string>();
+  // The session-wide visibility preference. Lives OUTSIDE the per-session panel
+  // so session switches (which dispose the panel) and panel disposal never reset
+  // it; /factory-verbose writes it and the live view reads it.
+  let visibilityMode: VisibilityMode = { ...DEFAULT_VISIBILITY_MODE };
 
   const depsFor = (cwd: string): FactoryControllerDeps => ({
     transport,
@@ -74,10 +79,9 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     store = new FactoryStore(ctx.cwd);
     sessionBound = true;
-    panel = new FactoryPanelState();
     runPanel = new FactoryRunPanel({
-      panel,
       getRunState: () => (activeRunId !== undefined ? controllers.get(activeRunId)?.getState() : undefined),
+      getMode: () => visibilityMode,
     });
     reportedRuns = new Set();
     activeRunId = undefined;
@@ -87,7 +91,6 @@ export default function (pi: ExtensionAPI): void {
   const resetSessionUI = (): void => {
     runPanel?.dispose();
     runPanel = undefined;
-    panel = undefined;
     activeRunId = undefined;
     reportedRuns = new Set();
   };
@@ -213,20 +216,30 @@ export default function (pi: ExtensionAPI): void {
       if (!ctx.hasUI || !runPanel) return;
       ctx.ui.setWidget("factory", runPanel.content, { placement: "aboveEditor" });
     },
-    toggleAgent: (ref, cwd) => {
-      if (!panel) return undefined;
-      if (activeRunId === undefined) {
-        const runs = listRuns(cwd);
-        if (runs.length === 0) return undefined;
-        activeRunId = runs[0].runId;
-      }
-      const state = controllers.get(activeRunId)?.getState() ?? activeStore(cwd).load(activeRunId);
-      if (!state) return undefined;
-      const id = resolveAgentId(state, ref);
-      if (!id) return `No Factory agent matches "${ref}".`;
-      panel.toggle(id);
+    setVisibility: (mode) => {
+      visibilityMode = mode;
       runPanel?.refresh();
-      return `Factory agent ${panel.isExpanded(id) ? "expanded" : "collapsed"}.`;
+      return `Factory panel visibility: ${describeVisibilityMode(mode)}.`;
+    },
+    visibilityStatus: () => describeVisibilityMode(visibilityMode),
+    openFocusView: async (ctx, mode) => {
+      if (!ctx.hasUI) return;
+      // `/factory` sets activeRunId; a run started through the `Factory` tool is
+      // only in `controllers`, so fall back to the newest in-process run.
+      const runId = activeRunId ?? newestControllerId();
+      if (runId === undefined) {
+        ctx.ui.notify("No active Factory run to inspect. Start one with /factory.", "info");
+        return;
+      }
+      // The focused live transcript, reusing pi-subagents' own viewer. The
+      // resolver is polled by the view, so `on`/`active` follow the run and a
+      // not-yet-spawned role/phase target appears when it starts.
+      await ctx.ui.custom<undefined>(
+        (tui, theme, keybindings, done) => new FactoryFocusView(tui, theme, keybindings, done, {
+          resolveTarget: () => resolveFocusTarget(runId, mode),
+        }),
+        { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "70%" } },
+      );
     },
     reportCompletion: (state) => {
       runPanel?.stop();
@@ -234,6 +247,24 @@ export default function (pi: ExtensionAPI): void {
     },
   };
   registerFactoryCommands(pi, runtime);
+
+  /** The id of the most recently created in-process controller, if any. */
+  function newestControllerId(): string | undefined {
+    let id: string | undefined;
+    for (const key of controllers.keys()) id = key;
+    return id;
+  }
+
+  /** The agent the focused live view should show now, with its retained session. */
+  function resolveFocusTarget(runId: string, mode: VisibilityMode): FocusTarget | undefined {
+    const state = controllers.get(runId)?.getState();
+    if (!state) return undefined;
+    const agentId = resolveFocusAgentId(state, mode);
+    if (!agentId) return undefined;
+    const record = globalManagerRegistry()?.getRecord(agentId) as unknown as AgentRecord | undefined;
+    if (!record?.session) return undefined;
+    return { agentId, record, session: record.session };
+  }
 
   function activeStore(cwd: string): FactoryStore {
     return store ?? new FactoryStore(cwd);

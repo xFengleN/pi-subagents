@@ -20,6 +20,7 @@ import { loadFactoryConfig, validateFactoryConfig } from "./config.js";
 import { type ConfigUI, filterModels, type MenuRow, type ModelOption, showFactoryConfigUI } from "./config-ui.js";
 import type { FactoryController } from "./controller.js";
 import { formatDuration, formatRunMetrics } from "./metrics.js";
+import { parseVisibilityArg, type VisibilityMode } from "./panel.js";
 import { isTerminal } from "./state.js";
 import { FACTORY_DIR } from "./store.js";
 import {
@@ -56,8 +57,12 @@ export interface FactoryCommandRuntime {
   stop(runId: string, cwd: string): boolean;
   /** Register/refresh the Factory run panel widget for this session. */
   showRunPanel(ctx: ExtensionCommandContext, runId: string): void;
-  /** Toggle an agent's expansion by role/phase/active; returns a status message. */
-  toggleAgent(ref: string, cwd: string): string | undefined;
+  /** Apply a visibility mode to the run panel (session-wide); returns a status message. */
+  setVisibility(mode: VisibilityMode): string;
+  /** Describe the currently active visibility mode. */
+  visibilityStatus(): string;
+  /** Open the focused live agent view for a mode; resolves when it is closed. */
+  openFocusView(ctx: ExtensionCommandContext, mode: VisibilityMode): Promise<void>;
   /** Append the accepted final report to the conversation (deduplicated). */
   reportCompletion(state: FactoryRunState): void;
 }
@@ -427,19 +432,53 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
     },
   });
 
+  const verboseUsage = [
+    "Usage: /factory-verbose <mode>",
+    "  on            follow the active agent, then the last finished one (the default)",
+    "  off           compact progress only; no live view",
+    "  active        follow only the running agent as phases change",
+    "  lead | architect | engineer | reviewer   follow the latest agent of that role",
+    "  <exact-phase> follow that phase's agent, e.g. execution.engineer",
+    "The detail opens in a scrollable live view (Esc closes it); the run panel above",
+    "the editor always shows compact orchestration state. /agents is the full history.",
+    "With no argument it shows the current mode and this usage. Invalid arguments",
+    "show this help and never invoke a model.",
+  ].join("\n");
+
+  const handleVerbose = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    const ref = args.trim();
+    if (ref === "") {
+      ctx.ui.notify(`Factory panel visibility: ${runtime.visibilityStatus()}.\n\n${verboseUsage}`, "info");
+      return;
+    }
+    const mode = parseVisibilityArg(ref);
+    if (mode === undefined) {
+      ctx.ui.notify(verboseUsage, "info");
+      return;
+    }
+    const message = runtime.setVisibility(mode);
+    if (mode.kind === "none") {
+      ctx.ui.notify(message, "info");
+      return;
+    }
+    ctx.ui.notify(`${message}\nOpening the live view — Esc closes it, arrows/PgUp/PgDn scroll.`, "info");
+    await runtime.openFocusView(ctx, mode);
+  };
+
+  pi.registerCommand("factory-verbose", {
+    description:
+      "Set the run panel's visibility mode: on|off|active|<role>|<exact-phase> " +
+      "(read-only; no model call). e.g. /factory-verbose on, /factory-verbose active, /factory-verbose execution.engineer.",
+    handler: handleVerbose,
+  });
+
+  // Deprecated alias: /factory-agent now means /factory-verbose, not a per-agent
+  // toggle. It shares the same handler and the same single visibility state —
+  // no second state system. Not advertised; docs reference /factory-verbose.
   pi.registerCommand("factory-agent", {
     description:
-      "Expand/collapse a Factory run agent by role, phase or 'active' (read-only; no model call). " +
-      "e.g. /factory-agent lead, /factory-agent execution.engineer, /factory-agent active.",
-    handler: async (args, ctx) => {
-      const ref = args.trim();
-      if (ref === "") {
-        ctx.ui.notify("Usage: /factory-agent <role|phase|active>", "info");
-        return;
-      }
-      const message = runtime.toggleAgent(ref, ctx.cwd);
-      ctx.ui.notify(message ?? "No Factory run with a matching agent found for this project.", "info");
-    },
+      "Deprecated alias for /factory-verbose — set the run panel's visibility mode (read-only; no model call).",
+    handler: handleVerbose,
   });
 
   pi.registerCommand("factory-report", {

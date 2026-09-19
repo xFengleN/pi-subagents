@@ -64,11 +64,37 @@ async function boot(cwd: string) {
   const { pi, tools, commands, lifecycle } = makePi();
   pi.setModel = vi.fn(async () => true);
   const b = makeDispatchingBus();
+  // The controller consumes every settle synchronously; reply so the best-effort
+  // consume RPC does not leave a 5s timer pending behind each completed agent.
+  b.handlers.set("subagents:rpc:consume", (d: any) => {
+    b.bus.emit(`subagents:rpc:consume:reply:${d.requestId}`, { success: true, data: {} });
+  });
   pi.events = b.bus;
   factoryExtension(pi);
   await lifecycle.get("session_start")({}, baseCtx({ cwd }));
   b.bus.emit("subagents:ready", {});
   return { pi, tools, commands, lifecycle, ...b };
+}
+
+/** Render the currently-registered Factory run panel widget to plain lines. */
+function renderFactoryPanel(ui: any): string[] {
+  const call = ui.setWidget.mock.calls.find(
+    (c: any[]) => c[0] === "factory" && typeof c[1] === "function",
+  );
+  if (!call) throw new Error("factory panel widget is not registered");
+  const tui = { terminal: { columns: 120 }, requestRender: () => {} };
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const component = call[1](tui, theme);
+  const lines = component.render();
+  component.dispose?.();
+  return lines;
+}
+
+/** Complete the most recently spawned role child with a packet (prose fallback). */
+async function completeChild(b: Awaited<ReturnType<typeof boot>>, packet: unknown): Promise<void> {
+  const id = `child-${b.spawns.length}`;
+  b.bus.emit("subagents:completed", { id, status: "completed", result: JSON.stringify(packet) });
+  await flush();
 }
 
 /** A command context with a scriptable UI and a model registry. */
@@ -574,8 +600,8 @@ describe("AI Factory — /factory-status compactness", () => {
   });
 });
 
-describe("AI Factory — run panel expansion", () => {
-  it("P. /factory registers the run panel widget above the editor", async () => {
+describe("AI Factory — run panel visibility (/factory-verbose)", () => {
+  it("P. /factory registers the compact run panel widget above the editor", async () => {
     const cwd = workdir();
     const b = await boot(cwd);
     const { ctx, ui } = commandCtx(cwd);
@@ -584,29 +610,138 @@ describe("AI Factory — run panel expansion", () => {
     await flush();
 
     expect(ui.setWidget).toHaveBeenCalledWith("factory", expect.any(Function), { placement: "aboveEditor" });
+    const lines = renderFactoryPanel(ui);
+    const text = lines.join("\n");
+    // Orchestration only: run id, state, active role/phase and counters.
+    expect(text).toContain("Factory ");
+    expect(text).toContain("State: DISCOVERY");
+    expect(text).toContain("Active: lead — discovery.lead");
+    expect(text).toContain("Repair 0/");
+    // It never duplicates the pi-subagents agent tree.
+    expect(text).not.toContain("Agents");
   });
 
-  it("O. /factory-agent toggles an agent's expansion, with no model call", async () => {
+  it("Q. with no argument reports the current mode and usage, with no model call", async () => {
     const cwd = workdir();
-    const store = new FactoryStore(cwd);
-    store.save(completedState(cwd, "factory_toggle", "s", {
-      results: {
-        engineers: [{ round: 0, outcome: { packet: packets.engineer, agentId: "agent-eng" } }],
-        reviewers: [],
-      },
-    }));
     const b = await boot(cwd);
     const { ctx, notifications } = commandCtx(cwd);
 
-    await b.commands.get("factory-agent").handler("engineer", ctx);
-    expect(notifications.some((n) => n.message.includes("Factory agent expanded"))).toBe(true);
+    await b.commands.get("factory-verbose").handler("", ctx);
 
-    await b.commands.get("factory-agent").handler("engineer", ctx);
-    expect(notifications.some((n) => n.message.includes("Factory agent collapsed"))).toBe(true);
+    const text = notifications[notifications.length - 1]?.message ?? "";
+    expect(text).toContain("Factory panel visibility: on");
+    expect(text).toContain("Usage: /factory-verbose");
+    expect(text).toContain("exact-phase");
+    expect(b.spawns).toHaveLength(0);
+  });
 
-    await b.commands.get("factory-agent").handler("bogus", ctx);
-    expect(notifications.some((n) => n.message.includes("No Factory agent matches"))).toBe(true);
+  it("R. off sets the mode, keeps progress, and opens no live view", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, ui, notifications } = commandCtx(cwd);
+    await b.commands.get("factory").handler("do it", ctx);
+    await flush();
 
+    await b.commands.get("factory-verbose").handler("off", ctx);
+
+    const text = notifications[notifications.length - 1]?.message ?? "";
+    expect(text).toContain("Factory panel visibility: off");
+    expect(text).toContain("compact progress only");
+    expect(ui.custom).not.toHaveBeenCalled(); // no focused live view
+    expect(text).not.toContain("Opening the live view");
+    // The compact summary is still shown, now reporting the mode.
+    expect(renderFactoryPanel(ui).join("\n")).toContain("Visibility: off");
+    expect(b.spawns).toHaveLength(1); // only the run's first spawn
+    expect(b.pi.sendMessage).not.toHaveBeenCalled(); // no context/message pollution
+  });
+
+  it("S. on/active/role/phase open the focused live view (no model call)", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, ui, notifications } = commandCtx(cwd);
+    await b.commands.get("factory").handler("do it", ctx);
+    await flush();
+
+    for (const arg of ["active", "on", "engineer", "execution.engineer"]) {
+      ui.custom.mockClear();
+      notifications.length = 0;
+      await b.commands.get("factory-verbose").handler(arg, ctx);
+      expect(ui.custom, arg).toHaveBeenCalledTimes(1);
+      const options = ui.custom.mock.calls[0]?.[1];
+      expect(options, arg).toMatchObject({ overlay: true });
+      expect(options?.overlayOptions, arg).toMatchObject({ width: "90%", maxHeight: "70%" });
+      expect(notifications[notifications.length - 1]?.message ?? "", arg).toContain("Opening the live view");
+    }
+
+    // The two commands above never spawned a role or sent a message.
+    expect(b.spawns).toHaveLength(1);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("T. the summary follows the active agent as the run advances", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, ui } = commandCtx(cwd);
+    await b.commands.get("factory").handler("do it", ctx);
+    await flush();
+
+    expect(renderFactoryPanel(ui).join("\n")).toContain("Active: lead — discovery.lead");
+
+    await completeChild(b, packets.proposal); // spawns the architect
+    expect(renderFactoryPanel(ui).join("\n")).toContain("Active: architect — initial.architect");
+    expect(b.spawns).toHaveLength(2);
+  });
+
+  it("U. an invalid argument shows help, changes nothing, and never spawns", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-verbose").handler("bogus", ctx);
+    expect(notifications[notifications.length - 1]?.message ?? "").toContain("Usage: /factory-verbose");
+
+    // The mode is unchanged: still the default.
+    await b.commands.get("factory-verbose").handler("", ctx);
+    expect(notifications[notifications.length - 1]?.message ?? "").toContain("Factory panel visibility: on");
+    expect(b.spawns).toHaveLength(0);
+  });
+
+  it("V. the mode persists across session switches and is shown on the new run panel", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx } = commandCtx(cwd);
+
+    await b.commands.get("factory-verbose").handler("off", ctx);
+    expect(b.spawns).toHaveLength(0);
+
+    // A session switch disposes the panel and detaches runs...
+    b.lifecycle.get("session_before_switch")();
+    await b.lifecycle.get("session_start")({}, baseCtx({ cwd }));
+    b.bus.emit("subagents:ready", {});
+
+    // ...but the session's visibility preference survives.
+    const { ctx: ctx2, ui: ui2, notifications } = commandCtx(cwd);
+    await b.commands.get("factory-verbose").handler("", ctx2);
+    expect(notifications[notifications.length - 1]?.message ?? "").toContain("Factory panel visibility: off");
+
+    // A new run's panel reports the persisted mode.
+    await b.commands.get("factory").handler("run again", ctx2);
+    await flush();
+    expect(renderFactoryPanel(ui2).join("\n")).toContain("Visibility: off");
+  });
+
+  it("W. /factory-agent is a deprecated alias over the same visibility state", async () => {
+    const cwd = workdir();
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    expect(b.commands.has("factory-agent")).toBe(true);
+    await b.commands.get("factory-agent").handler("off", ctx);
+    expect(notifications[notifications.length - 1]?.message ?? "").toContain("Factory panel visibility: off");
+
+    // The single state system reports the same mode through /factory-verbose.
+    await b.commands.get("factory-verbose").handler("", ctx);
+    expect(notifications[notifications.length - 1]?.message ?? "").toContain("Factory panel visibility: off");
     expect(b.spawns).toHaveLength(0);
   });
 });
