@@ -303,10 +303,75 @@ export interface FactoryError {
   at: number;
 }
 
-export const FACTORY_STATE_VERSION = 1 as const;
+export const LEGACY_FACTORY_STATE_VERSION = 1 as const;
+export const FACTORY_STATE_VERSION = 2 as const;
+export type FactoryStateVersion = typeof LEGACY_FACTORY_STATE_VERSION | typeof FACTORY_STATE_VERSION;
+
+/** Durable provenance for one role invocation. */
+export type AttemptProvenance =
+  | "not_started"
+  | "prepared"
+  | "spawn_requested"
+  | "spawned"
+  | "settled_validated_packet"
+  | "settled_without_valid_packet";
+
+/** Recovery-relevant risk carried with an attempt; it is never inferred from park state. */
+export type AttemptRecoveryRisk =
+  | "none"
+  | "uncertain_outcome"
+  | "workspace_may_have_changed"
+  | "validated_packet"
+  | "invalid_packet";
+
+/** Persisted lifecycle record for every invocation that reaches preparation. */
+export interface FactoryAttempt {
+  attemptId: string;
+  role: RoleName;
+  phase: string;
+  round: number;
+  target: string;
+  provenance: AttemptProvenance;
+  recoveryRisk: AttemptRecoveryRisk;
+  preparedAt: number;
+  spawnRequestedAt?: number;
+  spawnedAt?: number;
+  settledAt?: number;
+  agentId?: string;
+  packetKind?: string;
+  packetValidated?: boolean;
+  /** Identity of the effective run configuration at attempt time (Task 3). */
+  configRevision?: string;
+}
+
+/** A durable, approval-bindable recovery checkpoint. */
+/** A validated preset replacement applied mid-run (resume V1). */
+export interface PresetReplacement {
+  /** The preset name selected by the user. */
+  preset: string;
+  /** The effective configuration for FUTURE children (original + role changes). */
+  snapshot: FactoryConfig;
+  appliedAt: number;
+  /** The state revision at which the replacement took effect. */
+  revision: number;
+}
+
+export interface FactoryCheckpoint {
+  id: string;
+  runId: string;
+  revision: number;
+  state: FactoryState;
+  phase: string;
+  repairRound: number;
+  remediationRounds: number;
+  architectEscalations: number;
+  leadEscalations: number;
+  attemptId?: string;
+  agentId?: string;
+}
 
 export interface FactoryRunState {
-  version: typeof FACTORY_STATE_VERSION;
+  version: FactoryStateVersion;
   runId: string;
   createdAt: number;
   updatedAt: number;
@@ -340,7 +405,68 @@ export interface FactoryRunState {
   stoppedReason?: string;
   /** True when the run is parked waiting for capacity or a backoff retry. */
   parked: boolean;
+  /** Monotonically increasing persisted snapshot revision (required for v2). */
+  stateRevision?: number;
+  /** Durable identity of this exact persisted recovery checkpoint (required for v2). */
+  checkpoint?: FactoryCheckpoint;
+  /** Append-only attempt provenance (required for v2). */
+  attempts?: FactoryAttempt[];
+  /** Optional preset replacement for future children (original config kept). */
+  presetReplacement?: PresetReplacement;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Recovery eligibility                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Deterministic assessment of whether a persisted Factory run can be recovered.
+ *
+ * This is a pure function over persisted state — it never calls a model, never
+ * mutates anything, and never reaches into the filesystem. It is the single
+ * source of truth for all resume eligibility decisions.
+ *
+ * Design invariants:
+ *   - Atomic JSON writes do NOT provide cross-process ownership protection.
+ *     This assessment only answers "is the persisted state recoverable?";
+ *     actual resume coordination is handled by the in-process `controllers` Map.
+ *   - Interrupted Engineer phases may have left partial workspace changes.
+ *     These are flagged but not auto-recovered — the user must approve.
+ *   - Only non-terminal states are recoverable. DONE, STOPPED, and FAILED
+ *     runs are terminal and cannot be resumed.
+ */
+export interface FactoryRecoveryEligibility {
+  /** Whether the run can be recovered at all. */
+  eligible: boolean;
+  /** Human-readable reason for the eligibility decision. */
+  reason: string;
+  /** Whether explicit user approval is required before recovery.
+   * True for interrupted phases (partial workspace changes) and
+   * STOPPED runs (user must confirm the stop reason is correctable).
+   * False for WAITING_CAPACITY and completed-phase resumes.
+   */
+  requiresApproval: boolean;
+  /** Additional context for the user or caller. */
+  notes: string[];
+  /** A stable identifier for the current checkpoint, used to bind approval tokens.
+   * Format: "<state>:<phase-or-parked>" e.g. "EXECUTION:execution.engineer" or
+   * "WAITING_CAPACITY:parked". Changes when the run advances to a new phase,
+   * making stale approvals invalid.
+   */
+  checkpointId: string;
+  /** Task-1 planner classification; omitted by legacy callers only. */
+  decision?: "automatic" | "approval_required" | "blocked";
+  /** Durable checkpoint data for callers that need revision/progress binding. */
+  checkpoint?: FactoryCheckpoint;
+}
+
+/** Result of an explicit `FactoryController.resume()` call. */
+export type FactoryResumeResult =
+  | { kind: "ok"; state: FactoryRunState["state"] }
+  | { kind: "terminal"; reason: string }
+  | { kind: "duplicate" }
+  | { kind: "approvalRequired"; reason: string }
+  | { kind: "staleApproval"; reason: string };
 
 /* -------------------------------------------------------------------------- */
 /* Metrics                                                                    */

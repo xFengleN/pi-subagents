@@ -71,6 +71,11 @@ export class FakeTransport implements FactoryTransport {
   /** Per-spawn outcome handler. Default: succeed with an incrementing id. */
   spawnHandler: (req: SpawnRequest) => SpawnOutcome | Promise<SpawnOutcome>;
   lastAgentId: string | undefined;
+  /** When set, a spawn whose cwd does not match is rejected before any child
+   * exists (Task 3 workspace binding). */
+  expectedCwd: string | undefined;
+  /** Settable map for agent-status probing (used by live-child-adoption tests). */
+  agentStatuses = new Map<string, string>();
 
   private nextId = 1;
   private started = new Set<(id: string) => void>();
@@ -87,6 +92,9 @@ export class FakeTransport implements FactoryTransport {
 
   async spawn(req: SpawnRequest): Promise<SpawnOutcome> {
     this.spawned.push(req);
+    if (this.expectedCwd !== undefined && req.cwd !== this.expectedCwd) {
+      return { ok: false, error: `workspace mismatch: expected ${this.expectedCwd}, got ${req.cwd}` };
+    }
     const outcome = await this.spawnHandler(req);
     if (outcome.ok) this.lastAgentId = outcome.agentId;
     return outcome;
@@ -113,6 +121,10 @@ export class FakeTransport implements FactoryTransport {
   onFailed(cb: (info: AgentSettleInfo) => void): () => void {
     this.failed.add(cb);
     return () => this.failed.delete(cb);
+  }
+
+  agentStatus(agentId: string): string | undefined {
+    return this.agentStatuses.get(agentId);
   }
 
   fireStarted(id: string): void {

@@ -153,7 +153,10 @@ describe("AI Factory end to end (faux model, no network)", () => {
           if (statusCalls >= 1) return fauxText("Factory run finished.");
           if (text.includes("Factory run started")) {
             statusCalls++;
-            const runId = text.match(/(factory_[A-Za-z0-9_]+)/)?.[1];
+            // runId is `factory_<base36>_<nanoid6>`; nanoid's URL-safe alphabet
+            // includes `-`, so the class must include it or the id is truncated
+            // and factory_status reports the run as not found (intermittent).
+            const runId = text.match(/(factory_[A-Za-z0-9_-]+)/)?.[1];
             return fauxToolCall("factory_status", { run_id: runId, wait: true }, { id: "fs-1" });
           }
           return fauxToolCall("Factory", { task: TASK }, { id: "factory-1" });

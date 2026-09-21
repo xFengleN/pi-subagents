@@ -64,21 +64,17 @@ describe("AI Factory — restart/recovery", () => {
       controller.getRunId(),
     );
     expect(restored).toBeDefined();
-    await flush();
+
+    // EXECUTION with an absent child requires approval: the run is parked,
+    // inFlight is preserved, and no replacement Engineer is spawned.
+    expect(restored!.getState().state).toBe("EXECUTION");
+    expect(restored!.getState().inFlight).toBeDefined();
+    expect(restored!.getState().parked).toBe(true);
+    expect(m2.transport.spawned.filter((s) => s.phase === "execution.engineer")).toHaveLength(0);
 
     // Completed phases are NOT re-spawned: no duplicate lead/architect.
     expect(m2.transport.spawned.filter((s) => s.phase === "discovery.lead")).toHaveLength(0);
     expect(m2.transport.spawned.filter((s) => s.phase === "initial.architect")).toHaveLength(0);
-    // The lost in-flight engineer is re-attempted (a fresh spawn, same phase).
-    expect(m2.transport.spawned.filter((s) => s.phase === "execution.engineer")).toHaveLength(1);
-    expect(restored!.getState().state).toBe("EXECUTION");
-
-    // The run can complete normally after restart.
-    m2.transport.completeLastPacket(packets.engineer);
-    await flush();
-    m2.transport.completeLastPacket(packets.reviewerPass);
-    await flush();
-    expect(restored!.getState().state).toBe("INTEGRATION");
   });
 
   it("22b. Restart restores a parked WAITING_CAPACITY run", async () => {
@@ -148,20 +144,27 @@ describe("AI Factory — restart/recovery", () => {
     expect(persisted.results.proposal?.packet.goal).toBe("Implement the widget");
     expect(persisted.results.initialArchitect?.packet.verdict).toBe("APPROVE");
 
-    // Restart: completed phases must not run again; only the pending Engineer
-    // phase proceeds (it had not completed yet).
+    // Restart: completed phases must not run again; the pending Engineer phase
+    // is blocked by approval (fail-closed for EXECUTION with absent child).
     const m2 = make();
     m2.store = m.store;
     const restored = FactoryController.restore(
       { transport: m2.transport, clock: m2.clock, store: m2.store, config: m2.config },
       controller.getRunId(),
     );
-    await flush();
+    expect(restored).toBeDefined();
+
+    // Completed phases are NOT re-spawned.
     expect(m2.transport.spawned.filter((s) => s.phase === "discovery.lead")).toHaveLength(0);
     expect(m2.transport.spawned.filter((s) => s.phase === "initial.architect")).toHaveLength(0);
-    expect(m2.transport.spawned.filter((s) => s.phase === "execution.engineer")).toHaveLength(1);
+    // The lost Engineer is NOT re-spawned (approval required).
+    expect(m2.transport.spawned.filter((s) => s.phase === "execution.engineer")).toHaveLength(0);
+    // Packets are preserved.
     expect(restored!.getState().results.proposal?.packet.goal).toBe("Implement the widget");
     expect(restored!.getState().results.initialArchitect?.packet.verdict).toBe("APPROVE");
+    // The run is parked with inFlight preserved.
+    expect(restored!.getState().parked).toBe(true);
+    expect(restored!.getState().inFlight).toBeDefined();
   });
 
   it("terminal runs stay terminal after restore (no re-drive)", async () => {
@@ -218,6 +221,7 @@ describe("AI Factory — restart/recovery", () => {
     await flush();
     m.transport.completeLastPacket(packets.approve);
     await flush();
+    // The Engineer was spawned with the persisted config.
     expect(m.transport.spawned.at(-1)?.model).toBe("p/persisted");
 
     // --- restart, with a project config that has since changed ---
@@ -230,10 +234,14 @@ describe("AI Factory — restart/recovery", () => {
       { transport: m2.transport, clock: m2.clock, store: m2.store, config: projectConfig },
       controller.getRunId(),
     );
-    await flush();
     expect(restored).toBeDefined();
-    // The run resumes with the targets it was started with, not the new ones.
-    expect(m2.transport.spawned.at(-1)?.model).toBe("p/persisted");
+
+    // EXECUTION with an absent child requires approval: no spawn during restore.
+    expect(m2.transport.spawned).toHaveLength(0);
+
+    // The run's persisted config is preserved (the Engineer would use "p/persisted"
+    // if resumed after approval, not the new project config's "p/project").
+    expect(restored!.getState().config?.roles.engineer?.targets?.primary).toBe("p/persisted");
   });
 
   it("restores a run parked on an in-memory backoff retry without deadlocking", async () => {
@@ -244,18 +252,19 @@ describe("AI Factory — restart/recovery", () => {
       "T",
       m.dir,
     );
+    // Read-only roles keep transient backoff; Engineer phases never auto-retry
+    // an uncertain spawn outcome (Task 3). Park on the Architect instead: its
+    // spawn is rejected transiently before any child can start.
+    m.transport.spawnHandler = (req) =>
+      req.role === "architect" ? ({ ok: false, error: "network timeout" } as const) : ({ ok: true, agentId: `agent-${Math.random()}` } as const);
     controller.start();
     await flush();
     m.transport.completeLastPacket(packets.proposal);
     await flush();
-    m.transport.completeLastPacket(packets.approve);
-    await flush();
-    // The Engineer spawn fails transiently → same-target backoff retry, i.e.
+    // The Architect spawn fails transiently → same-target backoff retry, i.e.
     // parked with retry bookkeeping held ONLY in memory.
-    const engineerAgentId = m.transport.lastAgentId!;
-    m.transport.fireFailed({ agentId: engineerAgentId, ok: false, status: "error", error: "network timeout" });
-    await flush();
     expect(controller.getState().parked).toBe(true);
+    expect(controller.getState().state).toBe("INITIAL_ARCHITECT");
     expect(controller.getState().state).not.toBe("WAITING_CAPACITY");
 
     // --- process restart before the backoff fires ---
@@ -270,8 +279,8 @@ describe("AI Factory — restart/recovery", () => {
 
     // The retry bookkeeping is gone, but the run must re-attempt the current
     // phase from a fresh spawn rather than sit idle forever.
-    expect(m2.transport.spawned.filter((s) => s.phase === "execution.engineer")).toHaveLength(1);
+    expect(m2.transport.spawned.filter((s) => s.phase === "initial.architect")).toHaveLength(1);
     expect(restored!.getState().parked).toBe(false);
-    expect(restored!.getState().state).toBe("EXECUTION");
+    expect(restored!.getState().state).toBe("INITIAL_ARCHITECT");
   });
 });

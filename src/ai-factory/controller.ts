@@ -12,7 +12,8 @@
  */
 
 import type { Clock } from "./clock.js";
-import { targetsForRole } from "./config.js";
+import { configRevision, replacementConfig, targetsForRole } from "./config.js";
+import { FactoryLeaseError } from "./lease.js";
 import { appendCallMetric, emptyFactoryMetrics, recordSettleMetrics } from "./metrics.js";
 import { type PacketKind, packetSchema, parsePacketTyped } from "./packets.js";
 import {
@@ -27,12 +28,16 @@ import {
   reviewerPrompt,
   roleDescription,
 } from "./prompts.js";
-import { assertTransition, isTerminal } from "./state.js";
+import { createFactoryCheckpoint, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
+import { assertTransition, assessRecoveryEligibility, isTerminal } from "./state.js";
 import type { FactoryStore } from "./store.js";
 import { type AgentSettleInfo, classifyError, type FactoryTransport, type SpawnRequest } from "./transport.js";
 import {
   type ArchitectInitialResult,
+  type FactoryAttempt,
   type FactoryConfig,
+  type FactoryRecoveryEligibility,
+  type FactoryResumeResult,
   type FactoryRunState,
   type LeadEscalationPacket,
   type LeadIntegrationPacket,
@@ -72,6 +77,7 @@ interface PendingSpawn {
   nextRetryAt?: number;
   attemptedTargets: string[];
   reasons: string[];
+  attemptId?: string;
   /** Provider-provided retry-after, parsed from an error message when present. */
   retryAfterMs?: number;
 }
@@ -82,9 +88,24 @@ export class FactoryController {
   private readonly transport: FactoryTransport;
   private readonly clock: Clock;
   private readonly store: FactoryStore;
-  private readonly config: FactoryConfig;
+  private config: FactoryConfig;
   private readonly runId: string;
   private readonly cwd: string;
+  /** Task 2 fencing token binding every commit to exclusive ownership. */
+  private leaseToken: string | undefined;
+  /** True once a fenced commit was rejected: the controller no longer owns the
+   * run and must stop driving and mutating (inert). */
+  private ownershipLost = false;
+  /** Why lease release was refused on dispose, when it was. */
+  private releaseBlockedReason: string | undefined;
+  /** True once dispose() ran: the controller must not act further. */
+  private disposed = false;
+  /** True after an explicit approval consumed an interrupted Engineer phase:
+   * the next Engineer spawn carries a resume instruction. Consumed once. */
+  private resumeApproved = false;
+  /** Settlements that arrived while a spawn RPC was pending (Task 3): keyed by
+   * child agent id, drained exactly once when the spawn resolves. */
+  private readonly earlySettlements = new Map<string, { info: AgentSettleInfo; ok: boolean }>();
   private state: FactoryRunState;
   private pending: PendingSpawn | undefined;
   private driving = false;
@@ -92,13 +113,17 @@ export class FactoryController {
   private readonly terminalResolvers = new Set<() => void>();
   private readonly unsubs: Array<() => void> = [];
 
-  private constructor(deps: FactoryControllerDeps, state: FactoryRunState) {
+  private constructor(deps: FactoryControllerDeps, state: FactoryRunState, leaseToken?: string) {
     this.transport = deps.transport;
     this.clock = deps.clock;
     this.store = deps.store;
+    this.leaseToken = leaseToken;
     // Prefer the run's own persisted config so a restart resumes with the same
     // role/model targets it started with, even if the project config changed.
-    this.config = state.config ?? deps.config;
+    // A validated preset replacement (if one was applied) is the effective
+    // configuration for FUTURE children; the original `state.config` stays as
+    // audit history.
+    this.config = state.presetReplacement?.snapshot ?? state.config ?? deps.config;
     this.runId = state.runId;
     this.cwd = state.cwd;
     this.state = state;
@@ -111,9 +136,13 @@ export class FactoryController {
 
   /** Create a brand-new run and persist its initial state. */
   static create(deps: FactoryControllerDeps, runId: string, task: string, cwd: string): FactoryController {
+    // Exclusive ownership first: a lease-backed store throws FactoryLeaseError
+    // when another live owner holds the run, so no state is created or written
+    // by a losing contender.
+    const leaseToken = deps.store.acquireLease(runId);
     const now = deps.clock.now();
     const state: FactoryRunState = {
-      version: 1,
+      version: 2,
       runId,
       createdAt: now,
       updatedAt: now,
@@ -131,14 +160,21 @@ export class FactoryController {
       metrics: emptyFactoryMetrics(now),
       errors: [],
       parked: false,
+      stateRevision: 0,
+      attempts: [],
     };
-    const controller = new FactoryController(deps, state);
+    const controller = new FactoryController(deps, state, leaseToken);
     controller.commit();
     return controller;
   }
 
   /**
    * Restore a run from its persisted state; returns undefined if absent.
+   *
+   * On a lease-backed store the lease must be acquired first: a run owned by a
+   * live process elsewhere is never restored into a driving controller, so the
+   * existing in-process `controllers` map remains a cache, never the ownership
+   * authority.
    *
    * `resume: false` loads the controller without driving it — used by
    * `/factory-stop`, where resuming first would (briefly) spawn a role agent
@@ -147,13 +183,29 @@ export class FactoryController {
   static restore(deps: FactoryControllerDeps, runId: string, opts: { resume?: boolean } = {}): FactoryController | undefined {
     const state = deps.store.load(runId);
     if (!state) return undefined;
-    const controller = new FactoryController(deps, state);
+    const leaseToken = deps.store.tryAcquireLease(runId);
+    if (deps.store.isLeaseBacked() && leaseToken === undefined) {
+      // Another live owner holds the run or reclamation was conservatively
+      // refused. Never construct a controller that could drive it.
+      return undefined;
+    }
+    const controller = new FactoryController(deps, state, leaseToken);
     if (opts.resume !== false) controller.onRestore();
     return controller;
   }
 
   getRunId(): string {
     return this.runId;
+  }
+
+  /** Whether this controller still holds a valid lease and may drive. */
+  hasOwnership(): boolean {
+    return this.leaseToken !== undefined && !this.ownershipLost;
+  }
+
+  /** Why lease release was refused on dispose, when it was refused. */
+  getReleaseBlockedReason(): string | undefined {
+    return this.releaseBlockedReason;
   }
 
   getState(): FactoryRunState {
@@ -165,9 +217,173 @@ export class FactoryController {
     return structuredClone(this.state);
   }
 
+  /** Read-only recovery eligibility assessment for the current run state. */
+  getRecoveryEligibility(): FactoryRecoveryEligibility {
+    return assessRecoveryEligibility(this.state);
+  }
+
+  /**
+   * Explicitly resume a persisted run at a clean checkpoint or WAITING_CAPACITY.
+   *
+   * Rejects terminal runs (DONE / STOPPED / FAILED), duplicate resume attempts
+   * while already driving or with an active child, and runs that require user
+   * approval (e.g. interrupted Engineer phases with partial workspace changes).
+   *
+   * Does not implement automatic replay of interrupted Engineer phases or
+   * partially modified workspaces — those require explicit user approval first.
+   */
+  resume(): FactoryResumeResult {
+    // 0. A disposed controller cannot act.
+    if (this.disposed) {
+      return { kind: "duplicate" };
+    }
+    // 1. Reject if the drive loop is currently executing.
+    if (this.driving) {
+      return { kind: "duplicate" };
+    }
+
+    // 2. Read-only liveness probe: if a child is still live, it owns the run.
+    //    No mutation — onRestore() is NOT called here.
+    if (this.state.inFlight !== undefined) {
+      const status = this.transport.agentStatus(this.state.inFlight.agentId);
+      if (status === "running" || status === "queued") {
+        return { kind: "duplicate" };
+      }
+    }
+
+    // 3. Eligibility check (read-only, no mutation).
+    const eligibility = this.getRecoveryEligibility();
+    if (!eligibility.eligible) {
+      return { kind: "terminal", reason: eligibility.reason };
+    }
+
+    // 4. Approval check (read-only, no mutation).
+    if (eligibility.requiresApproval) {
+      return { kind: "approvalRequired", reason: eligibility.reason };
+    }
+
+    // 5. Eligible, no approval needed — run onRestore() to reconcile state.
+    //    For a lost agent (absent/terminal child), this clears inFlight and
+    //    re-spawns. For WAITING_CAPACITY, it schedules the wake.
+    this.onRestore();
+    return { kind: "ok", state: this.state.state };
+  }
+
+  /**
+   * Resume a run that requires explicit approval, using a checkpoint-bound token.
+   *
+   * The `checkpointId` must match the run's current checkpoint (from
+   * `getRecoveryEligibility().checkpointId`). If the run has advanced since the
+   * token was issued, the approval is stale and rejected.
+   *
+   * This does NOT assert the workspace is clean — it only authorizes replay of
+   * the specific interrupted phase identified by the checkpoint. The caller is
+   * responsible for inspecting the workspace before approving.
+   */
+  resumeWithApproval(checkpointId: string): FactoryResumeResult {
+    // 0. A disposed controller cannot act.
+    if (this.disposed) return { kind: "duplicate" };
+    // 1. Reject if driving.
+    if (this.driving) return { kind: "duplicate" };
+
+    // 2. Liveness probe: live child owns the run.
+    if (this.state.inFlight !== undefined) {
+      const status = this.transport.agentStatus(this.state.inFlight.agentId);
+      if (status === "running" || status === "queued") {
+        return { kind: "duplicate" };
+      }
+    }
+
+    // 3. Eligibility check.
+    const eligibility = this.getRecoveryEligibility();
+    if (!eligibility.eligible) {
+      return { kind: "terminal", reason: eligibility.reason };
+    }
+
+    // 4. Validate the checkpoint token.
+    if (checkpointId !== eligibility.checkpointId) {
+      return { kind: "staleApproval", reason: `Checkpoint changed: expected "${eligibility.checkpointId}", got "${checkpointId}"` };
+    }
+
+    // 5. Consume the approval. The interrupted in-flight child (lost on
+    //    process death / session switch) is relinquished so the phase is
+    //    re-attempted exactly ONCE with a fresh attempt; the guards that would
+    //    block the replay (unresolved provenance, failed Engineer) are bypassed
+    //    once via `resumeApproved`. The next commit advances the checkpoint, so
+    //    a second or stale approval can never authorize another attempt.
+    this.resumeApproved = true;
+    if (this.state.inFlight !== undefined) {
+      this.state.inFlight = undefined;
+      this.state.parked = false;
+      this.pending = undefined;
+      this.commit();
+    }
+    this.onRestore();
+    return { kind: "ok", state: this.state.state };
+  }
+
+  /**
+   * Replace the effective configuration for FUTURE children with a validated
+   * preset. The original run config is preserved as history (state.config); the
+   * replacement snapshot and revision are persisted so a later restore resumes
+   * with the same effective config. Only role targets, fallbacks, retry
+   * settings, and turn limits change; workflow budgets, isolation policy, and
+   * agent types are preserved, and no live child's model is changed.
+   */
+  applyPresetReplacement(name: string, presetConfig: FactoryConfig): void {
+    this.config = replacementConfig(this.config, presetConfig);
+    this.state.presetReplacement = {
+      preset: name,
+      snapshot: this.config,
+      appliedAt: this.clock.now(),
+      revision: this.state.stateRevision ?? 0,
+    };
+    this.commit();
+  }
+
   dispose(): void {
+    this.disposed = true;
+    this.earlySettlements.clear();
     for (const unsub of this.unsubs.splice(0)) unsub();
     this.cancelWake();
+    this.releaseOwnership();
+  }
+
+  /**
+   * Release the run lease only when ownership has been safely relinquished.
+   *
+   * A lease is never released while an unresolved spawn may still create a
+   * child (an in-flight agent) or while the drive loop is mid-turn — another
+   * owner must not take over a run whose child could still touch the workspace.
+   * Such leases are reclaimed only after this process dies (same-host
+   * reclamation) or taken over by a later in-process restore. Full late-spawn
+   * cleanup is Task 3 scope (docs/ownership.md).
+   */
+  private releaseOwnership(): void {
+    if (this.leaseToken === undefined) return;
+    if (this.ownershipLost) {
+      this.releaseBlockedReason = "ownership was lost (fenced out)";
+      return;
+    }
+    if (this.driving) {
+      this.releaseBlockedReason = "the drive loop is mid-turn";
+      return;
+    }
+    // B2: a lease is never released while a child may still modify the
+    // workspace. An in-flight agent OR any registry-tracked outstanding
+    // spawn/child activity retains ownership — a best-effort stop request is
+    // not proof that a child terminated.
+    if (this.state.inFlight !== undefined) {
+      this.releaseBlockedReason = "an in-flight agent is still live";
+      return;
+    }
+    if (this.store.hasOutstandingActivity(this.runId, this.leaseToken)) {
+      this.releaseBlockedReason = "outstanding child or unresolved spawn activity";
+      return;
+    }
+    this.releaseBlockedReason = undefined;
+    this.store.releaseLease(this.runId, this.leaseToken);
+    this.leaseToken = undefined;
   }
 
   /** Start (or resume) driving the run. */
@@ -177,7 +393,7 @@ export class FactoryController {
 
   /** Wake the run — called by the (fake or real) clock when a wait is due. */
   wake(): void {
-    if (isTerminal(this.state.state)) return;
+    if (this.disposed || isTerminal(this.state.state)) return;
     if (this.wakeCancel) {
       this.wakeCancel();
       this.wakeCancel = undefined;
@@ -187,7 +403,7 @@ export class FactoryController {
 
   /** Stop the run now (user-initiated). Stops any in-flight child best-effort. */
   stop(reason: string): void {
-    if (isTerminal(this.state.state)) return;
+    if (this.disposed || this.ownershipLost || isTerminal(this.state.state)) return;
     if (this.state.inFlight) this.transport.stop(this.state.inFlight.agentId);
     this.state.inFlight = undefined;
     this.state.parked = false;
@@ -222,6 +438,7 @@ export class FactoryController {
   /* ------------------------------------------------------------------ */
 
   private onStarted(agentId: string): void {
+    if (this.disposed || this.ownershipLost) return;
     if (!this.state.inFlight || this.state.inFlight.agentId !== agentId) return;
     const rm = this.state.metrics.roles[this.state.inFlight.role];
     rm.status = "running";
@@ -229,10 +446,44 @@ export class FactoryController {
     this.commit();
   }
 
+  /**
+   * Child settlement dispatch (Task 3). Always accounts for the settle in the
+   * ownership registry (termination is independently confirmed even when
+   * inFlight was cleared, e.g. after stop()). A settlement for the current
+   * in-flight child is processed; one that arrives while a spawn RPC is still
+   * pending (inFlight not yet persisted) is buffered so it is not lost;
+   * anything else is ignored. Disposed or non-owning controllers only account
+   * the registry — they never advance on settle events.
+   */
   private onSettled(info: AgentSettleInfo, ok: boolean): void {
-    if (!this.state.inFlight || this.state.inFlight.agentId !== info.agentId) return;
-    const { role, phase, target } = this.state.inFlight;
+    this.store.endChild(this.runId, this.leaseToken, info.agentId);
+    if (this.disposed || this.ownershipLost) return;
+    if (this.state.inFlight !== undefined && this.state.inFlight.agentId === info.agentId) {
+      this.processSettled(info, ok);
+      return;
+    }
+    if (this.pending !== undefined && this.state.inFlight === undefined) {
+      // A child may have settled before its spawn RPC returned. Buffer it;
+      // performSpawn imports it exactly once once the spawn resolves.
+      this.earlySettlements.set(info.agentId, { info, ok });
+    }
+  }
+
+  /** Process a settlement for the current in-flight child exactly once. */
+  private processSettled(info: AgentSettleInfo, ok: boolean): void {
+    // Registry accounting idempotent with the onSettled call: the direct path
+    // already decremented; the buffered path decrements here (childSpawned ran
+    // between the buffer write and the drain).
+    this.store.endChild(this.runId, this.leaseToken, info.agentId);
+    const { role, phase, target } = this.state.inFlight!;
     this.state.inFlight = undefined;
+    const attempt = this.state.attempts?.find((candidate) => candidate.agentId === info.agentId);
+    if (attempt) {
+      attempt.settledAt = this.clock.now();
+      attempt.provenance = "settled_without_valid_packet";
+      attempt.recoveryRisk = role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome";
+      attempt.packetValidated = false;
+    }
 
     // Consume synchronously so pi-subagents does not deliver this completion as
     // another notification requiring a parent model turn (docs/rpc.md).
@@ -273,20 +524,29 @@ export class FactoryController {
     this.commit();
 
     if (!ok) {
+      this.commit();
       const message = info.error ?? `agent ${info.status}`;
-      this.handlePhaseFailure(phase, role, message, classifyError(message));
+      this.handlePhaseFailure(phase, role, message, classifyError(message), { childStarted: true });
       return;
     }
 
     const kind = this.kindForPhase(phase);
     const packet = parsePacketTyped(kind, info.structuredJson, info.result);
     if (!packet) {
+      this.commit();
       // Completed but no usable packet: one same-target retry to absorb a
-      // single model glitch, then surface as a hard failure.
-      this.handlePhaseFailure(phase, role, "agent completed but produced no usable packet", "hard", { noPacketRetry: true });
+      // single model glitch, then surface as a hard failure. Engineer phases
+      // never take that retry — the child started and may have changed files.
+      this.handlePhaseFailure(phase, role, "agent completed but produced no usable packet", "hard", { noPacketRetry: true, childStarted: true });
       return;
     }
 
+    if (attempt) {
+      attempt.provenance = "settled_validated_packet";
+      attempt.recoveryRisk = "validated_packet";
+      attempt.packetValidated = true;
+    }
+    this.commit();
     this.storePacket(phase, role, packet, info);
     this.commit();
     void this.drive();
@@ -304,6 +564,12 @@ export class FactoryController {
    */
   private nextAction(): Action | undefined {
     const s = this.state;
+    if (this.disposed || this.ownershipLost) return undefined;
+    // A failed Engineer attempt with possible workspace impact never auto-
+    // replays: the run stays in the phase awaiting explicit approval. An
+    // explicitly approved resume bypasses this once (resumeApproved is
+    // consumed by the next performSpawn).
+    if (engineerSpawnBlocked(s) && !this.resumeApproved) return undefined;
     if (isTerminal(s.state) || s.inFlight) return undefined;
     if (s.parked) return this.parkedAction();
 
@@ -413,7 +679,7 @@ export class FactoryController {
   /* Spawning                                                            */
   /* ------------------------------------------------------------------ */
 
-  private phaseSpec(phase: string): PhaseSpec {
+  private phaseSpec(phase: string, resumeNote?: string): PhaseSpec {
     const s = this.state;
     switch (phase) {
       case "discovery.lead":
@@ -421,7 +687,7 @@ export class FactoryController {
       case "initial.architect":
         return { role: "architect", kind: "architect_initial", prompt: initialArchitectPrompt(s.results.proposal!.packet) };
       case "execution.engineer":
-        return this.engineerSpec("execution");
+        return this.engineerSpec("execution", resumeNote);
       case "review.reviewer":
         return this.reviewerSpec();
       case "integration.lead":
@@ -493,7 +759,7 @@ export class FactoryController {
         };
       }
       case "remediation.engineer":
-        return this.engineerSpec("remediation");
+        return this.engineerSpec("remediation", resumeNote);
       case "remediation.reviewer":
         return {
           role: "reviewer",
@@ -539,7 +805,7 @@ export class FactoryController {
     }
   }
 
-  private engineerSpec(kind: "execution" | "remediation"): PhaseSpec {
+  private engineerSpec(kind: "execution" | "remediation", resumeNote?: string): PhaseSpec {
     const s = this.state;
     const wpId = s.results.proposal?.packet.workPackages[0] ?? FIRST_WORK_PACKAGE;
     const repair = s.repairRound > 0 ? lastReviewer(s)?.outcome.packet : undefined;
@@ -559,6 +825,7 @@ export class FactoryController {
         priorDecisions: leadEsc && leadEsc.packet.verdict === "continue"
           ? `Lead guidance: ${leadEsc.packet.guidance}`
           : undefined,
+        resumeNote,
       }),
     };
   }
@@ -589,7 +856,26 @@ export class FactoryController {
    */
   private async performSpawn(phase: string): Promise<"wait" | "handled"> {
     const s = this.state;
-    const spec = this.phaseSpec(phase);
+    // An approved resume is consumed once on the next spawn: the guards below
+    // are bypassed and the Engineer is told to inspect the existing workspace
+    // and finish only the missing work, never to blindly repeat the previous
+    // implementation.
+    const resumeApproved = this.resumeApproved;
+    this.resumeApproved = false;
+    const resumeNote = resumeApproved
+      ? `An earlier attempt at this work package was interrupted. Inspect the existing files, keep the original goal (${s.task}) and the approved architecture, and finish ONLY the missing work — do not blindly repeat or revert the previous implementation. The saved completion evidence and reviewer findings above are preserved.`
+      : undefined;
+    const spec = this.phaseSpec(phase, resumeNote);
+    // B1: never replay a phase whose latest attempt has unresolved spawn
+    // provenance (prepared / spawn_requested) — a child may have been
+    // dispatched whose outcome is unknown. Park instead of re-spawning;
+    // eligibility then requires explicit approval. An approved resume is the
+    // explicit authorization and bypasses this once.
+    if (unresolvedAttemptForPhase(s, phase) !== undefined && !resumeApproved) {
+      s.parked = true;
+      this.commit();
+      return "handled";
+    }
     const targets = targetsForRole(this.config, spec.role);
     if (this.pending === undefined || this.pending.phase !== phase || this.pending.role !== spec.role) {
       this.pending = { role: spec.role, phase, targetIndex: 0, retriesOnTarget: 0, noPacketRetries: 0, attemptedTargets: [], reasons: [] };
@@ -611,6 +897,9 @@ export class FactoryController {
       maxTurns: this.config.roles[spec.role].maxTurns,
       isolated: this.config.isolated,
       schema: packetSchema(spec.kind),
+      // The child must run in the canonical persisted workspace, never an
+      // incidental session directory. The transport refuses a broken cwd.
+      cwd: this.cwd,
     };
 
     const rm = s.metrics.roles[spec.role];
@@ -620,16 +909,94 @@ export class FactoryController {
     if (!rm.targetsAttempted.includes(target)) rm.targetsAttempted.push(target);
     rm.targetUsed = target;
 
+    // Persist preparation and the spawn request before crossing the transport
+    // boundary. A restart can therefore distinguish "never started" from an
+    // invocation whose outcome is uncertain.
+    const attemptId = `${this.runId}:${phase}:${s.metrics.totalAttempts}`;
+    const attempt: FactoryAttempt = {
+      attemptId,
+      role: spec.role,
+      phase,
+      round: s.repairRound,
+      target,
+      provenance: "prepared",
+      recoveryRisk: spec.role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome",
+      preparedAt: this.clock.now(),
+      packetKind: spec.kind,
+      configRevision: configRevision(this.config),
+    };
+    s.attempts = [...(s.attempts ?? []), attempt];
+    pending.attemptId = attemptId;
+    this.commit();
+    attempt.provenance = "spawn_requested";
+    attempt.spawnRequestedAt = this.clock.now();
+    this.commit();
+
+    // Register the outstanding spawn in the process-local ownership registry
+    // BEFORE the RPC crosses the transport, so a same-process takeover during
+    // the await is refused. A false result means ownership is inconsistent.
+    if (!this.store.beginSpawn(this.runId, this.leaseToken)) {
+      this.ownershipLost = true;
+      this.pending = undefined;
+      return "handled";
+    }
+
     const outcome = await this.transport.spawn(request);
+
+    // Disposal or ownership loss while the RPC was in flight: the outcome is
+    // never imported as owned work. A child that did start is stopped
+    // best-effort and stays tracked as outstanding until its settlement is
+    // independently confirmed (a stop request is not proof of termination).
+    if (this.disposed || this.ownershipLost) {
+      this.earlySettlements.clear();
+      attempt.settledAt = this.clock.now();
+      attempt.provenance = "settled_without_valid_packet";
+      if (outcome.ok) {
+        this.store.childSpawned(this.runId, this.leaseToken, outcome.agentId);
+        this.transport.stop(outcome.agentId);
+        attempt.agentId = outcome.agentId;
+      } else {
+        this.store.spawnFailed(this.runId, this.leaseToken);
+      }
+      attempt.recoveryRisk = spec.role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome";
+      s.metrics.roles[spec.role].error = "spawn resolved after disposal or ownership loss; outcome not imported as owned work";
+      return "handled";
+    }
+
     if (outcome.ok) {
+      this.store.childSpawned(this.runId, this.leaseToken, outcome.agentId);
+      attempt.provenance = "spawned";
+      attempt.agentId = outcome.agentId;
+      attempt.spawnedAt = this.clock.now();
       s.inFlight = { role: spec.role, phase, agentId: outcome.agentId, target, spawnedAt: this.clock.now() };
       rm.agentId = outcome.agentId;
       rm.startedAt = this.clock.now();
       rm.status = "running";
       this.commit();
+      // A settlement may have arrived before the spawn reply (inFlight was not
+      // yet persisted). Import it exactly once, then keep driving.
+      const early = this.earlySettlements.get(outcome.agentId);
+      this.earlySettlements.clear();
+      if (early !== undefined) {
+        this.processSettled(early.info, early.ok);
+        return "handled";
+      }
       return "wait";
     }
-    this.handlePhaseFailure(phase, spec.role, outcome.error, classifyError(outcome.error));
+
+    // Spawn RPC rejected. A definitive rejection (quota/hard) means no child
+    // could start; a transient failure (timeout/network) may have dispatched
+    // one, so it retains workspace risk for Engineer phases.
+    const klass = classifyError(outcome.error);
+    this.store.spawnFailed(this.runId, this.leaseToken);
+    this.earlySettlements.clear();
+    attempt.provenance = "settled_without_valid_packet";
+    attempt.recoveryRisk = spec.role === "engineer"
+      ? (klass === "transient" ? "workspace_may_have_changed" : "none")
+      : "uncertain_outcome";
+    attempt.settledAt = this.clock.now();
+    this.commit();
+    this.handlePhaseFailure(phase, spec.role, outcome.error, klass);
     return "handled";
   }
 
@@ -680,8 +1047,10 @@ export class FactoryController {
       nextRetryAt,
     };
     s.metrics.capacityWaits++;
+    s.parked = true;
     this.pending = undefined;
     this.applyTransition("WAITING_CAPACITY");
+    this.scheduleWake(nextRetryAt);
   }
 
   /** Handle a failed spawn or a settled-but-unusable phase. */
@@ -690,7 +1059,7 @@ export class FactoryController {
     role: RoleName,
     message: string,
     klass: "transient" | "quota" | "hard",
-    opts: { noPacketRetry?: boolean } = {},
+    opts: { noPacketRetry?: boolean; childStarted?: boolean } = {},
   ): void {
     const s = this.state;
     const pending = this.pending;
@@ -700,6 +1069,20 @@ export class FactoryController {
       pending.reasons.push(message);
       const retryAfter = parseRetryAfter(message);
       if (retryAfter !== undefined) pending.retryAfterMs = retryAfter;
+    }
+
+    // Engineer phases never auto-replay after a failure that may have touched
+    // the workspace: a child that started (settled, aborted, or stopped), an
+    // invalid or missing packet, or an uncertain spawn outcome (a transient
+    // RPC failure that may have dispatched a child). The run stays in the
+    // phase with the failed attempt recorded and requires explicit approval;
+    // it is never converted into a generic auto-recoverable parked or
+    // WAITING_CAPACITY state. Definite pre-spawn quota rejections (recoveryRisk
+    // "none") still take the normal fallback/capacity path below.
+    if (role === "engineer" && (opts.childStarted || klass === "transient")) {
+      s.parked = false;
+      this.pending = undefined;
+      return;
     }
 
     if (opts.noPacketRetry && pending && pending.noPacketRetries < 1) {
@@ -834,7 +1217,7 @@ export class FactoryController {
   /* ------------------------------------------------------------------ */
 
   private async drive(): Promise<void> {
-    if (this.driving || isTerminal(this.state.state)) return;
+    if (this.driving || this.disposed || this.ownershipLost || isTerminal(this.state.state)) return;
     this.driving = true;
     try {
       for (;;) {
@@ -903,10 +1286,28 @@ export class FactoryController {
     }
   }
 
-  /** Persist the current state. */
+  /** Persist the current state as the next durable recovery checkpoint. */
   private commit(): void {
+    if (this.disposed) return;
     this.state.updatedAt = this.clock.now();
-    this.store.save(this.state);
+    if (this.state.version === 2) {
+      this.state.stateRevision = (this.state.stateRevision ?? 0) + 1;
+      this.state.checkpoint = createFactoryCheckpoint(this.state, this.state.stateRevision);
+    }
+    // Every owner-controlled mutation is fenced: a stale controller that lost
+    // the lease is rejected here by the store. It fails closed (inert) rather
+    // than throwing into the event bus and must not drive further.
+    try {
+      this.store.save(this.state, this.leaseToken);
+    } catch (err) {
+      if (err instanceof FactoryLeaseError) {
+        this.ownershipLost = true;
+        this.earlySettlements.clear();
+        this.pending = undefined;
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -915,12 +1316,41 @@ export class FactoryController {
    * resumed. A mid-flight agent cannot have survived the process death (agents
    * are in-process), so it is treated as a failed attempt and retried
    * deterministically — never re-running a completed phase.
+   *
+   * Caveat: pi-subagents agents are session-scoped, not controller-scoped.
+   * On a Pi session switch the transport disposes all controllers (unsubscribing
+   * event callbacks but never aborting children), while the spawned child keeps
+   * running. A restored controller may therefore find a persisted inFlight agent
+   * that is still live. We probe the manager registry to distinguish this case.
    */
   private onRestore(): void {
     const s = this.state;
-    if (isTerminal(s.state)) return;
+    if (this.disposed || isTerminal(s.state)) return;
 
     if (s.inFlight) {
+      // Probe the manager registry for liveness. If the child is still running
+      // or queued, it survived a session switch — adopt it without re-spawning.
+      const status = this.transport.agentStatus(s.inFlight.agentId);
+      if (status === "running" || status === "queued") {
+        // Liveness verified via registry; event delivery via the constructor-time
+        // subscription (onCompleted/onFailed → onSettled, which matches on
+        // state.inFlight.agentId). No replacement spawn: the original child still
+        // owns the workspace. Track the adopted child as outstanding so a
+        // same-process takeover cannot race it.
+        this.store.adoptChild(this.runId, this.leaseToken, s.inFlight.agentId);
+        return;
+      }
+      // Status is undefined (unknown/absent) or terminal — treat as lost agent.
+      // Before clearing inFlight and re-spawning, check whether the phase
+      // requires user approval (e.g. an interrupted Engineer may have left
+      // partial workspace changes).  Fail closed: if approval is required,
+      // park the run without mutating inFlight so it remains inspectable.
+      const eligibility = assessRecoveryEligibility(s);
+      if (eligibility.requiresApproval) {
+        s.parked = true;
+        this.commit();
+        return;
+      }
       const { role, phase } = s.inFlight;
       const rm = s.metrics.roles[role];
       rm.status = "failed";
@@ -957,6 +1387,24 @@ export class FactoryController {
 function lastExecutionEngineer(s: FactoryRunState) {
   const engineers = s.results.engineers;
   return engineers[engineers.length - 1];
+}
+
+/**
+ * Whether the current Engineer phase must never auto-replay (Task 3): its
+ * latest attempt settled without a valid packet AND either a child started
+ * (agentId recorded) or the outcome was uncertain (workspace risk). Only an
+ * explicit approval may authorize a replay; the run stays in the phase.
+ */
+function engineerSpawnBlocked(s: FactoryRunState): boolean {
+  const phase = s.state === "EXECUTION"
+    ? "execution.engineer"
+    : s.state === "REMEDIATION"
+      ? "remediation.engineer"
+      : undefined;
+  if (phase === undefined) return false;
+  const attempt = latestAttemptForPhase(s, phase);
+  if (attempt === undefined || attempt.provenance !== "settled_without_valid_packet") return false;
+  return attempt.agentId !== undefined || attempt.recoveryRisk === "workspace_may_have_changed";
 }
 
 function lastReviewer(s: FactoryRunState) {

@@ -7,7 +7,10 @@
  * mandatory checkpoint.
  */
 
-import { type FactoryState, TERMINAL_STATES } from "./types.js";
+import { unresolvedSpawnAttempt } from "./recovery-model.js";
+import { type FactoryRecoveryEligibility, type FactoryRunState, type FactoryState, TERMINAL_STATES } from "./types.js";
+
+export { createFactoryCheckpoint, planFactoryRecovery, unresolvedSpawnAttempt } from "./recovery-model.js";
 
 /**
  * The legal transition table. Every entry is a decision the code is allowed to
@@ -91,4 +94,249 @@ export function isTerminal(state: FactoryState): boolean {
 /** Whether a state is one the run actively drives (not terminal, not parked). */
 export function isActive(state: FactoryState): boolean {
   return !isTerminal(state) && state !== "WAITING_CAPACITY";
+}
+
+/* -------------------------------------------------------------------------- */
+/* Recovery eligibility                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Deterministic assessment of whether a persisted Factory run can be recovered.
+ *
+ * This is a pure function over persisted state — it never calls a model, never
+ * mutates anything, and never reaches into the filesystem. It is the single
+ * source of truth for all resume eligibility decisions.
+ *
+ * Design invariants:
+ *   - Atomic JSON writes do NOT provide cross-process ownership protection.
+ *     This assessment only answers "is the persisted state recoverable?";
+ *     actual resume coordination is handled by the in-process `controllers` Map.
+ *   - Interrupted Engineer phases may have left partial workspace changes.
+ *     These are flagged but not auto-recovered — the user must approve.
+ *   - Only non-terminal states are recoverable. DONE, STOPPED, and FAILED
+ *     runs are terminal and cannot be resumed.
+ */
+/** Compute the checkpoint identifier for a given state snapshot. */
+function computeCheckpointId(state: FactoryRunState): string {
+  // Preserve the existing approval-token spelling for compatibility. The
+  // durable Task-1 identity is exposed separately as `checkpoint` by the
+  // recovery model and includes run id, progress, invocation, and revision.
+  const s = state.state;
+
+  // Terminal states
+  if (s === "DONE" || s === "STOPPED" || s === "FAILED") {
+    return `terminal:${s}`;
+  }
+
+  // WAITING_CAPACITY: park state
+  if (s === "WAITING_CAPACITY") {
+    return `WAITING_CAPACITY:${state.waiting?.phase ?? "unknown"}`;
+  }
+
+  // Active states with an in-flight agent: interrupted mid-invocation.
+  // Include the agentId so the checkpoint is unique per invocation — a new
+  // Engineer spawn in a later repair round gets a different agentId, making
+  // a stale approval token invalid.
+  if (state.inFlight !== undefined) {
+    return `${s}:${state.inFlight.phase}:${state.inFlight.agentId}`;
+  }
+
+  // Active states parked on backoff: safe to resume
+  if (state.parked) {
+    return `${s}:parked`;
+  }
+
+  // Clean boundary: no in-flight, not parked
+  return `${s}:clean`;
+}
+
+export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecoveryEligibility {
+  const { state: s, stoppedReason, errors } = state;
+
+  // --- Terminal states: never recoverable ---
+
+  if (s === "DONE") {
+    return {
+      eligible: false,
+      reason: "Run already completed",
+      requiresApproval: false,
+      notes: ["The run reached DONE. No recovery needed or possible."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  if (s === "STOPPED") {
+    return {
+      eligible: false,
+      reason: "Run was stopped",
+      requiresApproval: false,
+      notes: stoppedReason ? [`Stopped reason: ${stoppedReason}`] : ["No stop reason recorded."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  if (s === "FAILED") {
+    return {
+      eligible: false,
+      reason: "Run failed",
+      requiresApproval: false,
+      notes: errors.length > 0
+        ? [`Last error: ${errors[errors.length - 1].message}`]
+        : ["No error details recorded."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  // --- WAITING_CAPACITY: park state, recoverable without approval ---
+
+  if (s === "WAITING_CAPACITY") {
+    return {
+      eligible: true,
+      reason: "Parked waiting for capacity",
+      requiresApproval: false,
+      notes: [
+        `Will resume into state: ${state.waiting?.resumeState ?? "unknown"}`,
+        ...(state.waiting?.reasons.length ? ["Reasons: " + state.waiting.reasons.join(", ")] : []),
+      ],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  // --- Active states: recoverable, but may require approval ---
+
+  const activeStates = [
+    "DISCOVERY",
+    "INITIAL_ARCHITECT",
+    "EXECUTION",
+    "REVIEW",
+    "ARCHITECT_ESCALATION",
+    "INTEGRATION",
+    "FINAL_ARCHITECT",
+    "REMEDIATION",
+    "FINAL_ARCHITECT_RECHECK",
+    "FINAL_SYNTHESIS",
+  ] as const;
+
+  if (!activeStates.includes(s)) {
+    // Should never happen — the state machine enforces this.
+    return {
+      eligible: false,
+      reason: `Unknown state: ${s}`,
+      requiresApproval: false,
+      notes: ["This state is not recognized by the recovery system."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  // The run is in an active state. It is recoverable because the persisted
+  // state carries all completed phase packets (the controller never advances
+  // without persisting a valid result first).
+  //
+  // However, if the run was interrupted (no inFlight agent but not at a
+  // natural phase boundary), the interrupted phase may have left partial
+  // workspace changes. The user must approve before replaying.
+
+  // The phase the run would drive next may have an unresolved spawn attempt
+  // (prepared / spawn_requested with no settlement): a child may have been
+  // dispatched whose outcome is unknown. Automatic replay is never allowed;
+  // only explicit approval may authorize it. This is checked before the
+  // in-flight and parked branches so it cannot be masked by either flag.
+  const unresolved = unresolvedSpawnAttempt(state);
+  if (unresolved !== undefined) {
+    return {
+      eligible: true,
+      reason: `Phase "${unresolved.phase}" has unresolved spawn provenance (${unresolved.provenance}); automatic replay is not allowed`,
+      requiresApproval: true,
+      notes: [
+        `A spawn for ${unresolved.phase} was requested but never settled; its outcome is unknown.`,
+        "Explicit approval is required before the phase may be replayed.",
+      ],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  const inFlight = state.inFlight;
+  const isParked = state.parked;
+
+  // If the run has an in-flight agent, it was interrupted mid-invocation.
+  // The agent cannot have survived process death (agents are in-process),
+  // so the phase must be retried from scratch.
+  if (inFlight !== undefined) {
+    return {
+      eligible: true,
+      reason: `Interrupted in ${s} — phase "${inFlight.phase}" (${inFlight.role}) must be retried`,
+      requiresApproval: true,
+      notes: [
+        `Phase ${inFlight.phase} was in-flight when the run was interrupted.`,
+        `Retrying from scratch (no partial results to replay).`,
+      ],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  // If the run is parked (backoff retry), it is safe to resume without
+  // approval — no phase was interrupted, the run was just waiting.
+  if (isParked) {
+    return {
+      eligible: true,
+      reason: `Parked on backoff retry in ${s}`,
+      requiresApproval: false,
+      notes: ["The run was parked on a transient backoff; no phase was interrupted."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  // The run is in an active state with no in-flight agent and not parked.
+  // This means the process died between phases (after a phase completed but
+  // before the next action was taken). The persisted state is consistent
+  // (all completed phases have valid packets), so recovery is safe.
+  //
+  // However, if the current phase is one that modifies files (Engineer),
+  // we flag it for user approval because the Engineer may have left partial
+  // workspace changes before producing its result packet.
+  const phaseRequiresApproval = s === "EXECUTION" || s === "REMEDIATION";
+
+  return {
+    eligible: true,
+    reason: `Can resume from ${s} — all completed phases have valid persisted packets`,
+    requiresApproval: phaseRequiresApproval,
+    notes: phaseRequiresApproval
+      ? [
+          `The ${s} phase may have left partial workspace changes.`,
+          "User approval required before replaying.",
+        ]
+      : [
+          `Next action: ${nextPhaseLabel(s)}`,
+          "All completed phases have valid persisted packets — no replay needed.",
+        ],
+    checkpointId: computeCheckpointId(state),
+  };
+}
+
+/** Human-readable label for the next phase from a given state. */
+function nextPhaseLabel(state: FactoryState): string {
+  switch (state) {
+    case "DISCOVERY":
+      return "spawn Lead for DISCOVERY";
+    case "INITIAL_ARCHITECT":
+      return "spawn Architect for INITIAL_ARCHITECT";
+    case "EXECUTION":
+      return "spawn Engineer for EXECUTION";
+    case "REVIEW":
+      return "spawn Reviewer for REVIEW";
+    case "ARCHITECT_ESCALATION":
+      return "spawn Architect for ARCHITECT_ESCALATION";
+    case "INTEGRATION":
+      return "spawn Lead for INTEGRATION";
+    case "FINAL_ARCHITECT":
+      return "spawn Architect for FINAL_ARCHITECT";
+    case "REMEDIATION":
+      return "spawn Engineer for REMEDIATION";
+    case "FINAL_ARCHITECT_RECHECK":
+      return "spawn Architect for FINAL_ARCHITECT_RECHECK";
+    case "FINAL_SYNTHESIS":
+      return "spawn Lead for FINAL_SYNTHESIS";
+    default:
+      return "unknown";
+  }
 }

@@ -16,12 +16,13 @@ import {
   getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, getKeybindings, Input, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
-import { loadFactoryConfig, validateFactoryConfig } from "./config.js";
+import { configRevision, loadFactoryConfig, validateFactoryConfig } from "./config.js";
 import { type ConfigUI, filterModels, type MenuRow, type ModelOption, showFactoryConfigUI } from "./config-ui.js";
 import type { FactoryController } from "./controller.js";
 import { formatDuration, formatRunMetrics } from "./metrics.js";
 import { parseVisibilityArg, type VisibilityMode } from "./panel.js";
-import { isTerminal } from "./state.js";
+import type { RecoveryPlan } from "./recovery-model.js";
+import { assessRecoveryEligibility, isTerminal } from "./state.js";
 import { FACTORY_DIR } from "./store.js";
 import {
   type ArchitectFinalResult,
@@ -30,6 +31,57 @@ import {
   ROLE_NAMES,
   type RoleName,
 } from "./types.js";
+
+/** Display outcome of `/factory-resume` (read-only inspection or execution). */
+export interface FactoryResumeOutcome {
+  kind: "ok" | "preview" | "approvalRequired" | "blocked" | "terminal" | "notFound" | "locked" | "invalidPreset" | "staleApproval" | "duplicate";
+  text: string;
+  /** Preview only: whether explicit approval is required before continuing. */
+  requiresApproval?: boolean;
+  /** Preview only: the checkpoint-bound approval token. */
+  checkpointId?: string;
+}
+
+/** A concise, read-only recovery preview for an interrupted run. */
+export function formatResumePreview(
+  state: FactoryRunState,
+  plan: RecoveryPlan,
+  replacementPreset?: string,
+  modelWarnings: string[] = [],
+): string {
+  const lines: string[] = [];
+  lines.push(`Factory run ${state.runId}`);
+  lines.push(`state: ${state.state}${state.parked ? " (parked)" : ""}  phase: ${plan.phase}`);
+  const r = state.results;
+  const done: string[] = [];
+  if (r.proposal) done.push("proposal");
+  if (r.initialArchitect) done.push("initial architect");
+  if (r.engineers.length > 0) done.push(`engineer (${r.engineers.length} round${r.engineers.length > 1 ? "s" : ""})`);
+  if (r.reviewers.length > 0) done.push(`reviewer (${r.reviewers.length} round${r.reviewers.length > 1 ? "s" : ""})`);
+  if (r.integration) done.push("integration");
+  if (r.finalArchitect) done.push("final architect");
+  if (r.finalRecheck) done.push("final recheck");
+  if (r.finalReport) done.push("final report");
+  if (r.escalationArchitect) done.push("architect escalation");
+  if (r.leadEscalation) done.push("lead escalation");
+  if (r.remediation?.engineer) done.push("remediation engineer");
+  if (r.remediation?.reviewer) done.push("remediation reviewer");
+  lines.push(`completed: ${done.length > 0 ? done.join(", ") : "none"}`);
+  const decision = plan.decision === "automatic"
+    ? "safe automatic continuation"
+    : plan.decision === "approval_required"
+      ? "approval required (workspace-risking recovery)"
+      : "blocked";
+  lines.push(`next action: ${decision}`);
+  lines.push(`recovery checkpoint: ${state.checkpoint?.id ?? "(none)"}`);
+  lines.push(`approval token: ${assessRecoveryEligibility(state).checkpointId}`);
+  lines.push(`config revision: ${state.presetReplacement?.snapshot ? configRevision(state.presetReplacement.snapshot) : configRevision(state.config)}`);
+  if (state.presetReplacement) lines.push(`replacement applied: ${state.presetReplacement.preset} (revision ${state.presetReplacement.revision})`);
+  if (replacementPreset !== undefined) lines.push(`replacement preset requested: ${replacementPreset}`);
+  if (modelWarnings.length > 0) lines.push(`model warnings: ${modelWarnings.join("; ")}`);
+  lines.push(`reason: ${plan.reason}`);
+  return lines.join("\n");
+}
 
 export interface FactoryRunListItem {
   runId: string;
@@ -55,6 +107,19 @@ export interface FactoryCommandRuntime {
   listRuns(cwd: string): FactoryRunListItem[];
   /** Stop a run; restores without resuming when it is not in-process. */
   stop(runId: string, cwd: string): boolean;
+  /**
+   * Inspect and/or resume an interrupted run. With `dryRun` the persisted state
+   * is only read (no lease, no controller, no drive); otherwise ownership is
+   * acquired, the checkpoint revalidated, and the run continues from the next
+   * unfinished action. Returns a displayable outcome.
+   */
+  resume(runId: string, cwd: string, opts: {
+    preset?: string;
+    dryRun?: boolean;
+    approval?: boolean;
+    checkpointId?: string;
+    availableModels?: string[];
+  }): FactoryResumeOutcome;
   /** Register/refresh the Factory run panel widget for this session. */
   showRunPanel(ctx: ExtensionCommandContext, runId: string): void;
   /** Apply a visibility mode to the run panel (session-wide); returns a status message. */
@@ -538,6 +603,51 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
     },
   });
 
+  pi.registerCommand("factory-resume", {
+    description: "Inspect and resume an interrupted AI Factory run; optionally switch future agents to a preset. No replay of completed phases.",
+    handler: async (args, ctx) => {
+      const usage = "Usage: /factory-resume <runId> [--preset <presetName>]";
+      const parsed = parseResumeArgs(args);
+      if (!parsed) {
+        ctx.ui.notify(usage, "error");
+        return;
+      }
+      const { runId, preset } = parsed;
+      const models = availableModels(ctx);
+      // Read-only preview: never acquires a lease, drives, or calls an agent.
+      const preview = runtime.resume(runId, ctx.cwd, { preset, dryRun: true, availableModels: models });
+      if (preview.kind !== "preview") {
+        ctx.ui.notify(preview.text, "error");
+        return;
+      }
+      ctx.ui.notify(preview.text, "info");
+      if (preview.requiresApproval) {
+        // Explicit, checkpoint-bound confirmation (Pi's native confirm). The
+        // approval acknowledges the workspace is used as-is — not proof of
+        // cleanliness.
+        if (!ctx.hasUI) {
+          ctx.ui.notify("This run requires explicit approval; run /factory-resume again in the interactive UI to confirm.", "error");
+          return;
+        }
+        const ok = await ctx.ui.confirm(
+          "Resume Factory run",
+          `Interrupted work is not proven clean; the current workspace is used as-is. Continue from checkpoint ${preview.checkpointId}?`,
+        );
+        if (!ok) {
+          ctx.ui.notify("Resume cancelled; no state was changed and no agent was called.", "info");
+          return;
+        }
+      }
+      const outcome = runtime.resume(runId, ctx.cwd, {
+        preset,
+        approval: preview.requiresApproval,
+        checkpointId: preview.checkpointId,
+        availableModels: models,
+      });
+      ctx.ui.notify(outcome.text, outcome.kind === "ok" ? "info" : "error");
+    },
+  });
+
   pi.registerCommand("factory-config", {
     description: "Configure Factory roles, fallbacks, limits and presets (interactive; no model call).",
     handler: async (_args, ctx) => {
@@ -692,4 +802,27 @@ function commandUIContext(ctx: ExtensionCommandContext): ConfigUI {
     confirm: (title, message) => ctx.ui.confirm(title, message),
     notify: (message, type) => ctx.ui.notify(message, type),
   };
+}
+
+/** Parse `/factory-resume <runId> [--preset <name>]`. */
+function parseResumeArgs(args: string): { runId: string; preset?: string } | undefined {
+  const tokens = args.trim().split(/\s+/).filter((t) => t !== "");
+  if (tokens.length === 0) return undefined;
+  let preset: string | undefined;
+  let runId: string | undefined;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--preset") {
+      preset = tokens[i + 1];
+      if (preset === undefined) return undefined;
+      i++;
+    } else if (t.startsWith("--")) {
+      return undefined;
+    } else if (runId === undefined) {
+      runId = t;
+    } else {
+      return undefined;
+    }
+  }
+  return runId !== undefined ? { runId, preset } : undefined;
 }

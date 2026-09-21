@@ -939,6 +939,13 @@ src/
   index.ts            # Extension entry: tool/command registration, /agents menu, rendering
   types.ts            # Type definitions (AgentConfig, AgentRecord, etc.)
 
+  # AI Factory
+  ai-factory/         # Deterministic Lead/Architect/Engineer/Reviewer orchestration
+    recovery-model.ts # Strict persisted-state validation, checkpoints, and pure recovery planning
+    lease.ts          # Per-run exclusive ownership: leases, liveness probing, fencing
+    store.ts           # Atomic, fenced Factory run persistence
+    ownership.md      # Lease acquisition, reclamation, fencing, and filesystem guarantees (docs/)
+
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)
   custom-agents.ts    # Load user-defined agents from .pi/agents/, .agents/agents/, and global agents

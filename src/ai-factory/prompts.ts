@@ -72,6 +72,8 @@ export function engineerPrompt(input: {
   repairFindings?: ReviewerPacket;      // present on repair rounds
   remediationChanges?: ArchitectFinalResult; // present on remediation
   priorDecisions?: string;
+  /** Present on an explicitly approved resume of an interrupted Engineer. */
+  resumeNote?: string;
 }): string {
   const parts: string[] = [
     `You are the Engineer in an AI Factory run. Implement ONE coherent work package deterministically and thoroughly.`,
@@ -85,6 +87,7 @@ export function engineerPrompt(input: {
     list(input.constraints),
   ];
   if (input.priorDecisions) parts.push(`Prior important decisions:\n${input.priorDecisions}`);
+  if (input.resumeNote) parts.push(input.resumeNote);
   if (input.repairFindings) {
     parts.push(
       `A Reviewer found issues with the previous attempt. Address ONLY these concrete findings; do not rework unrelated code:`,

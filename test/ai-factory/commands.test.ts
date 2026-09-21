@@ -319,6 +319,9 @@ describe("AI Factory — slash commands", () => {
     );
     const done = controller.getSnapshot();
     done.state = "DONE";
+    // Version-2 DONE snapshots must carry the accepted final packet. This is
+    // the persisted-state invariant exercised by Task 1 validation.
+    done.results.finalReport = { packet: packets.finalReport, agentId: "legacy-test-report" };
     done.metrics.roles.lead.targetUsed = "old/lead";
     store.save(done);
     controller.dispose();

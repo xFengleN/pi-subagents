@@ -18,15 +18,17 @@ import { Type } from "@sinclair/typebox";
 import { nanoid } from "nanoid";
 import type { AgentRecord } from "../types.js";
 import { systemClock } from "./clock.js";
-import { type FactoryCommandRuntime, type FactoryRunListItem, registerFactoryCommands, reportFactoryCompletion } from "./commands.js";
-import { loadFactoryConfig } from "./config.js";
+import { type FactoryCommandRuntime, type FactoryRunListItem, formatResumePreview, registerFactoryCommands, reportFactoryCompletion } from "./commands.js";
+import { loadFactoryConfig, resolvePresetConfig, validateFactoryConfig } from "./config.js";
 import { FactoryController, type FactoryControllerDeps } from "./controller.js";
+import { LeaseStore } from "./lease.js";
 import { FactoryFocusView, type FocusTarget } from "./live-view.js";
 import { buildRunSummary } from "./metrics.js";
 import { DEFAULT_VISIBILITY_MODE, describeVisibilityMode, resolveFocusAgentId, type VisibilityMode } from "./panel.js";
 import { FactoryRunPanel } from "./panel-widget.js";
+import { hasPreset, listPresetNames } from "./presets.js";
 import { markdownMessage, textMessage, type WidgetTheme } from "./render.js";
-import { isTerminal } from "./state.js";
+import { assessRecoveryEligibility, isTerminal, planFactoryRecovery } from "./state.js";
 import { FactoryStore } from "./store.js";
 import { BusFactoryTransport, globalManagerRegistry } from "./transport.js";
 
@@ -39,6 +41,9 @@ const runId = (): string => `factory_${Date.now().toString(36)}_${nanoid(6)}`;
 
 export default function (pi: ExtensionAPI): void {
   const transport = new BusFactoryTransport({ events: pi.events, getRegistry: globalManagerRegistry });
+  // Cache of in-process controllers, NOT the ownership authority. Exclusive
+  // per-run ownership lives in the durable lease (lease.ts); the map only
+  // avoids re-restoring what this process already drives.
   const controllers = new Map<string, FactoryController>();
   let store: FactoryStore | undefined;
   let sessionBound = false;
@@ -55,7 +60,10 @@ export default function (pi: ExtensionAPI): void {
   const depsFor = (cwd: string): FactoryControllerDeps => ({
     transport,
     clock: systemClock,
-    store: new FactoryStore(cwd),
+    // Production controllers are lease-backed: every commit is fenced by the
+    // exclusive ownership token. Read-only inspection uses `activeStore`, a
+    // plain store, so it never acquires a lease.
+    store: new FactoryStore(cwd, { leaseStore: new LeaseStore({ cwd, clock: systemClock }) }),
     config: loadFactoryConfig(cwd),
   });
 
@@ -197,6 +205,62 @@ export default function (pi: ExtensionAPI): void {
     // Read-only: never restores/drives, so `/factory-status` costs no model calls.
     peekState: (id, cwd) => controllers.get(id)?.getState() ?? activeStore(cwd).load(id),
     listRuns: (cwd) => listRuns(cwd),
+    resume: (id, cwd, opts) => {
+      const state = activeStore(cwd).load(id);
+      if (!state) return { kind: "notFound", text: `Factory run not found: ${id}` };
+      if (isTerminal(state.state)) {
+        return { kind: "terminal", text: `Run ${id} is terminal (${state.state}) and is not resumed.` };
+      }
+      const plan = planFactoryRecovery(state);
+      const eligibility = assessRecoveryEligibility(state);
+      let presetName: string | undefined;
+      let modelWarnings: string[] = [];
+      if (opts.preset !== undefined) {
+        if (!hasPreset(opts.preset)) {
+          return { kind: "invalidPreset", text: `No saved preset named "${opts.preset}". Presets: ${listPresetNames().join(", ") || "(none)"}` };
+        }
+        presetName = opts.preset;
+        modelWarnings = validateFactoryConfig(resolvePresetConfig(presetName), opts.availableModels ?? []);
+      }
+      // Read-only preview: no lease, no controller, no drive, no mutation.
+      if (opts.dryRun) {
+        return {
+          kind: "preview",
+          text: formatResumePreview(state, plan, presetName, modelWarnings),
+          requiresApproval: eligibility.requiresApproval || plan.decision === "approval_required",
+          checkpointId: eligibility.checkpointId,
+        };
+      }
+      if (eligibility.requiresApproval && !opts.approval) {
+        return { kind: "approvalRequired", text: `Approval required for ${id}: ${eligibility.reason}`, checkpointId: eligibility.checkpointId };
+      }
+      // Execution: acquire ownership, reload + revalidate, then continue.
+      const restored = FactoryController.restore(depsFor(state.cwd), id, { resume: false });
+      if (!restored) {
+        return { kind: "locked", text: `Run ${id} is owned by a live process elsewhere; reclamation is refused.` };
+      }
+      if (presetName !== undefined) {
+        restored.applyPresetReplacement(presetName, resolvePresetConfig(presetName));
+      }
+      const result = eligibility.requiresApproval
+        ? restored.resumeWithApproval(eligibility.checkpointId)
+        : restored.resume();
+      controllers.set(id, restored);
+      if (result.kind === "ok") {
+        const resumed = restored.getState();
+        return {
+          kind: "ok",
+          text: `Resumed run ${id}. state: ${resumed.state}${presetName !== undefined ? `, replacement preset: ${presetName}` : ""}. Completed phases were preserved; the next action continues from the checkpoint.`,
+        };
+      }
+      if (result.kind === "staleApproval") {
+        return { kind: "staleApproval", text: `Stale approval for ${id}: ${result.reason}` };
+      }
+      if (result.kind === "duplicate") {
+        return { kind: "duplicate", text: `Run ${id} is already being driven or has a live child.` };
+      }
+      return { kind: "terminal", text: `Run ${id} cannot resume: ${result.reason}` };
+    },
     stop: (id, cwd) => {
       let controller = controllers.get(id);
       if (!controller) {

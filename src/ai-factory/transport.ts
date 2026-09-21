@@ -12,6 +12,7 @@
  * drive the whole state machine against a fake transport with no pi at all.
  */
 
+import { isAbsolute } from "node:path";
 import { nanoid } from "nanoid";
 import type { ReportedUsage } from "../usage.js";
 import type { CompiledSchema } from "../workflow/json-schema.js";
@@ -39,6 +40,8 @@ export interface SpawnRequest {
   isolated: boolean;
   /** Packet schema → the child gets a StructuredOutput tool. */
   schema?: CompiledSchema;
+  /** The canonical persisted workspace the child must run in (Task 3). */
+  cwd: string;
 }
 
 export type SpawnOutcome = { ok: true; agentId: string } | { ok: false; error: string };
@@ -100,6 +103,9 @@ export interface FactoryTransport {
   stop(agentId: string): void;
   /** Mark a settled child's result consumed (suppresses duplicate notification). */
   consume(agentId: string): void;
+  /** Probe an agent's current status via the manager registry. Returns
+   * undefined when the agent is unknown/absent. */
+  agentStatus(agentId: string): string | undefined;
   onStarted(cb: (agentId: string) => void): () => void;
   onCompleted(cb: (info: AgentSettleInfo) => void): () => void;
   onFailed(cb: (info: AgentSettleInfo) => void): () => void;
@@ -220,9 +226,17 @@ export class BusFactoryTransport implements FactoryTransport {
 
   async spawn(req: SpawnRequest): Promise<SpawnOutcome> {
     if (!this.ready) return { ok: false, error: "pi-subagents is not available (no bound session)" };
+    // Bind the child to the canonical persisted workspace directory, never an
+    // incidental session directory. pi-subagents rejects a non-absolute or
+    // non-existent cwd, so a broken workspace rejects the spawn before any
+    // child executes.
+    if (req.cwd === undefined || req.cwd === "" || !isAbsolute(req.cwd)) {
+      return { ok: false, error: `refusing to spawn without a canonical workspace (cwd=${req.cwd})` };
+    }
     const options: Record<string, unknown> = {
       description: req.description,
       isolated: req.isolated,
+      cwd: req.cwd,
     };
     if (req.model !== undefined) options.model = req.model;
     if (req.maxTurns !== undefined) options.maxTurns = req.maxTurns;
@@ -257,6 +271,10 @@ export class BusFactoryTransport implements FactoryTransport {
   onFailed(cb: (info: AgentSettleInfo) => void): () => void {
     this.failed.add(cb);
     return () => this.failed.delete(cb);
+  }
+
+  agentStatus(agentId: string): string | undefined {
+    return this.getRegistry()?.getRecord(agentId)?.status;
   }
 
   /** Merge the lifecycle-event payload with the settled record from the registry. */

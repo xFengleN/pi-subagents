@@ -61,7 +61,11 @@ describe("AI Factory transport — direct RPC spawning", () => {
       maxTurns: 100,
       isolated: true,
       schema: packetSchema("engineer"),
+      cwd: "/tmp/workspace",
     });
+
+    // The canonical workspace is forwarded to the child's spawn options.
+    expect(spawns.at(-1)?.options.cwd).toBe("/tmp/workspace");
 
     expect(outcome).toEqual({ ok: true, agentId: "child-1" });
     // The ONLY channels this transport ever emits are the documented RPC

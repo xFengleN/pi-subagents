@@ -241,8 +241,47 @@ export function factoryConfigEquals(a: FactoryConfig, b: FactoryConfig): boolean
 }
 
 /** Structural equality of two role configs. */
+
 export function roleConfigEquals(a: RoleConfig, b: RoleConfig): boolean {
   return stableStringify(a) === stableStringify(b);
+}
+
+/**
+ * The effective configuration after a preset replacement (resume V1). Only
+ * future-child settings change — role targets, fallbacks, retry settings, and
+ * role turn limits. Workflow budgets (repair/remediation/escalation limits),
+ * isolation policy, agent types, and the original role policy are preserved,
+ * so no live child's model is ever changed mid-invocation.
+ */
+export function replacementConfig(original: FactoryConfig, preset: FactoryConfig): FactoryConfig {
+  const roles = { ...original.roles };
+  for (const role of ROLE_NAMES) {
+    const from = preset.roles[role];
+    if (from === undefined) continue;
+    roles[role] = {
+      ...roles[role],
+      targets: from.targets,
+      maxTransientRetries: from.maxTransientRetries,
+      retryDelayMs: from.retryDelayMs,
+      ...(from.maxTurns !== undefined ? { maxTurns: from.maxTurns } : {}),
+    };
+  }
+  return { ...original, roles };
+}
+
+/**
+ * A stable revision identity for a resolved Factory config snapshot (sorted
+ * keys, deterministic hash). Records which configuration an attempt ran under;
+ * constant per run because the run config is an immutable snapshot.
+ */
+export function configRevision(config: FactoryConfig): string {
+  let hash = 0x811c9dc5;
+  const text = JSON.stringify(sortKeysDeep(config));
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `cfg-${(hash >>> 0).toString(36)}`;
 }
 
 /** Roles whose effective config differs from the base preset. */
