@@ -22,6 +22,15 @@ import { FACTORY_STATE_VERSION, type FactoryRunState } from "./types.js";
 
 export const FACTORY_DIR = ".pi/factory";
 
+interface ReportDeliveryMarker {
+  version: 1;
+  runId: string;
+  status: "pending" | "delivered";
+  preparedAt: number;
+  deliveredAt?: number;
+  terminalState?: FactoryRunState["state"];
+}
+
 export { assertValidRunId, isValidRunId, validateRunId } from "./recovery-model.js";
 
 /** Where Factory run state files live for a project. */
@@ -177,6 +186,57 @@ export class FactoryStore {
     writeJsonAtomic(this.pathFor(next.runId), next);
   }
 
+  private reportDeliveryPathFor(runId: string): string {
+    assertValidRunId(runId);
+    return join(factoryDir(this.cwd), `${runId}.report-delivery`);
+  }
+
+  /** Register a new run for durable automatic terminal-report delivery. */
+  prepareReportDelivery(runId: string, preparedAt = Date.now()): void {
+    const existing = this.loadReportDelivery(runId);
+    if (existing !== undefined) return;
+    writeJsonAtomic(this.reportDeliveryPathFor(runId), {
+      version: 1,
+      runId,
+      status: "pending",
+      preparedAt,
+    } satisfies ReportDeliveryMarker);
+  }
+
+  /** Whether this run was created under the durable report-delivery lifecycle. */
+  hasPreparedReportDelivery(runId: string): boolean {
+    return this.loadReportDelivery(runId) !== undefined;
+  }
+
+  /** Whether automatic terminal-report delivery has been durably recorded. */
+  hasDeliveredReport(runId: string): boolean {
+    return this.loadReportDelivery(runId)?.status === "delivered";
+  }
+
+  /** Record successful automatic delivery without mutating orchestration state. */
+  markReportDelivered(runId: string, terminalState: FactoryRunState["state"], deliveredAt = Date.now()): void {
+    const marker = this.loadReportDelivery(runId);
+    if (marker === undefined || marker.status === "delivered") return;
+    writeJsonAtomic(this.reportDeliveryPathFor(runId), {
+      ...marker,
+      status: "delivered",
+      deliveredAt,
+      terminalState,
+    } satisfies ReportDeliveryMarker);
+  }
+
+  private loadReportDelivery(runId: string): ReportDeliveryMarker | undefined {
+    const file = this.reportDeliveryPathFor(runId);
+    if (!existsSync(file)) return undefined;
+    try {
+      const value = JSON.parse(readFileSync(file, "utf8")) as Partial<ReportDeliveryMarker>;
+      if (value.version !== 1 || value.runId !== runId || (value.status !== "pending" && value.status !== "delivered") || typeof value.preparedAt !== "number") return undefined;
+      return value as ReportDeliveryMarker;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Load a persisted run state, or undefined when absent/corrupt. */
   load(runId: string): FactoryRunState | undefined {
     const file = this.pathFor(runId);
@@ -217,9 +277,10 @@ export class FactoryStore {
     }
   }
 
-  /** Delete a run's persisted state and its lease (tests and explicit cleanup). */
+  /** Delete a run's persisted state, report marker, and lease (tests and explicit cleanup). */
   remove(runId: string): void {
     rmSync(this.pathFor(runId), { force: true });
+    rmSync(this.reportDeliveryPathFor(runId), { force: true });
     this.leaseStore?.remove(runId);
   }
 }

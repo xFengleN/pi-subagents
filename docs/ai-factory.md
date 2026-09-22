@@ -144,10 +144,10 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 
 | Command | What it does |
 |---|---|
-| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A compact run panel appears above the editor showing orchestration state (run id, state, active role/phase/model, counters) — it deliberately does not duplicate the pi-subagents agent tree. When the run reaches `DONE`, the accepted final report is appended automatically as a normal rendered (Markdown) message at the bottom of the conversation — exactly once per run. |
+| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A compact run panel appears above the editor showing orchestration state (run id, state, active role/phase/model, counters) — it deliberately does not duplicate the pi-subagents agent tree. Every terminal outcome (`DONE`, controlled `STOPPED`, or `FAILED`) appends an evidence-based final report automatically as a normal rendered (Markdown) message at the bottom of the conversation. Reporting is observational: it never changes the terminal state or verdict. |
 | `/factory-verbose [mode]` | Selects what the Factory's focused live view shows (read-only; no model call). With no argument it reports the current mode and usage. Modes: `on` (follow the active agent, then the last finished one — the default), `off` (compact progress only, no live view), `active` (only the running agent, following phase changes), a role (`lead`/`architect`/`engineer`/`reviewer`, the latest agent of that role), or an exact phase (e.g. `execution.engineer`, that phase's agent). For every mode except `off` the command opens a scrollable, live-updating transcript overlay (Esc closes it) that reuses pi-subagents' own conversation viewer; `/agents` remains the full history. The mode is a session-scoped UI preference, independent of Factory configuration and persisted run data, and never affects execution. Invalid arguments show usage and never invoke a model. |
 | `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
-| `/factory-report [runId]` | Prints the human-readable final report for the latest completed run, or for an explicit run id. Reads persisted state only — no model call. Legacy runs without a final Lead synthesis fall back to the accepted Architect/integration packet, clearly labelled. |
+| `/factory-report [runId]` | Prints the human-readable final report again for the latest terminal run, or for an explicit run id. Reads persisted state only — no model call — and is not suppressed by the automatic-delivery marker. Legacy runs without a final Lead synthesis use the latest authoritative Architect outcome first, then the integration fallback where valid, all clearly labelled. |
 | `/factory-metrics [runId]` | Appends operational metrics for the latest run, or an explicit run id, as a normal message at the current bottom of the conversation: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
 | `/factory-resume <runId> [--preset <name>]` | Inspects an interrupted run read-only (state, phase, completed vs incomplete work, recovery checkpoint, next-action classification) and resumes it after confirmation where necessary. Preserves all completed packets and never replays a finished phase. Safe automatic continuation (clean checkpoints, WAITING_CAPACITY) proceeds directly; an interrupted Engineer whose workspace outcome is uncertain requires explicit approval (acknowledging the workspace is used as-is) before exactly one new attempt. `--preset <name>` swaps ONLY future children's model targets/fallbacks/retry/turn limits to a saved preset — workflow budgets, isolation, and the original config history are preserved. DONE/STOPPED/FAILED runs are not resumed. |
@@ -304,15 +304,27 @@ Because the panel is a fixed few lines and the transcript lives in the overlay,
 there is no widget truncation: the underlying transcript is never deleted or
 mutated, and the full inspection remains available through `/agents → Enter`.
 
-At completion the accepted final report is appended to the conversation as a
+At every terminal outcome the final report is appended to the conversation as a
 normal rendered message at the bottom: the same single-source formatter
 `/factory-report` uses, with section titles promoted to Markdown headings, sent
 through pi's custom-message renderer (the same mechanism pi-subagents uses for
-its completion notifications). It is appended exactly once per run; replayed
-completion events are ignored. `/factory-metrics` likewise appends its output as
-a normal message at the invocation point rather than updating a top status
-region. `/factory-status` and `/factory-report` remain compact `notify` recall
-commands.
+its completion notifications). `DONE` keeps its accepted final synthesis.
+`STOPPED` keeps its rejecting verdict and includes the failed gate, counters,
+available partial/incomplete-work and validation evidence, a bounded recovery
+recommendation, and the artifact path; `FAILED` is explicitly labelled as a
+runtime/unrecoverable failure rather than a controlled rejection. Missing
+optional evidence is omitted or labelled unavailable rather than inferred.
+
+Automatic delivery uses a durable sidecar marker beside the run artifact, so
+repeated terminal callbacks, status refreshes, and ordinary session rehydration
+do not print the report twice. The message is sent before the marker is written:
+if the process crashes in that narrow interval, or the marker write fails,
+rehydration may print a duplicate. This is intentionally at-least-once rather
+than a false exactly-once claim.
+`/factory-report` is an explicit recall and always prints again without changing
+the marker. `/factory-status` is read-only and never triggers delivery.
+`/factory-metrics` likewise appends its output as a normal message at the
+invocation point rather than updating a top status region.
 
 ## Metrics
 
@@ -347,7 +359,7 @@ pi install /path/to/pi-subagents
 # 4. choose what the live view shows (default: on), then inspect / stop
 /factory-verbose active   # opens a live transcript overlay following the run; off/<role>/<exact-phase> also work
 /factory-status
-/factory-report      # the final report, once the run is DONE
+/factory-report      # reprint the latest terminal report (DONE/STOPPED/FAILED)
 /factory-metrics     # per-call tokens, cost, context and orchestration counts
 /factory-stop
 ```

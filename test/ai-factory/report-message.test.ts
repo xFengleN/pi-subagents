@@ -13,7 +13,7 @@ import factoryExtension from "../../src/ai-factory/index.js";
 import { emptyFactoryMetrics } from "../../src/ai-factory/metrics.js";
 import type { FactoryRunState } from "../../src/ai-factory/types.js";
 import { makePi } from "../helpers/boot-extension.js";
-import { packets } from "./fakes.js";
+import { packets, tempStore } from "./fakes.js";
 
 function makeDoneState(runId = "factory_done"): FactoryRunState {
   const now = 1_000;
@@ -77,14 +77,86 @@ describe("AI Factory — final report as a normal message", () => {
     expect(sent).toHaveLength(1);
   });
 
-  it("non-DONE terminal states do not append a final report message", () => {
+  it("STOPPED appends an evidence-based report without changing the terminal state or verdict", () => {
     const sent: Array<{ customType: string; content: string; display: boolean }> = [];
     const reported = new Set<string>();
-    const stopped: FactoryRunState = { ...makeDoneState(), state: "STOPPED" };
+    const stopped: FactoryRunState = {
+      ...makeDoneState(),
+      state: "STOPPED",
+      stoppedReason: "remediation budget exhausted",
+      results: {
+        engineers: [],
+        reviewers: [],
+        finalArchitect: { packet: packets.remediate, agentId: "fa" },
+        finalRecheck: { packet: packets.remediate, agentId: "fr" },
+      },
+    };
 
     reportFactoryCompletion({ sendMessage: (m) => sent.push(m) }, stopped, reported);
 
-    expect(sent).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].content).toContain("Terminal state: STOPPED");
+    expect(sent[0].content).toContain("Authoritative final verdict: NEEDS_REMEDIATION");
+    expect(sent[0].content).toContain("controlled stop (not a runtime crash)");
+    expect(stopped.state).toBe("STOPPED");
+    expect(stopped.results.finalRecheck?.packet.verdict).toBe("NEEDS_REMEDIATION");
+  });
+
+  it("durable delivery evidence prevents a duplicate after process-local state is lost", () => {
+    const fixture = tempStore();
+    try {
+      const state = makeDoneState("factory_durable_report");
+      state.cwd = fixture.dir;
+      fixture.store.prepareReportDelivery(state.runId, 1_000);
+      const first: Array<{ customType: string; content: string; display: boolean }> = [];
+      reportFactoryCompletion({ sendMessage: (m) => first.push(m) }, state, new Set(), fixture.store);
+      expect(first).toHaveLength(1);
+      expect(fixture.store.hasDeliveredReport(state.runId)).toBe(true);
+
+      const afterRestart: typeof first = [];
+      reportFactoryCompletion({ sendMessage: (m) => afterRestart.push(m) }, state, new Set(), fixture.store);
+      expect(afterRestart).toHaveLength(0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("an early controlled stop renders limited evidence instead of inventing results", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_early_stop"),
+      state: "STOPPED",
+      remediationRounds: 0,
+      results: { engineers: [], reviewers: [] },
+      metrics: emptyFactoryMetrics(1_000),
+      stoppedReason: "Stopped via /factory-stop",
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Authoritative final verdict: not available");
+    expect(report).toContain("Failed gate: no final acceptance gate was reached");
+    expect(report).toContain("Stopped via /factory-stop");
+    expect(report).not.toContain("Delivered\n");
+    expect(report).not.toContain("npm test: pass");
+  });
+
+  it("a later rejecting recheck supersedes an earlier accepted synthesis", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_superseded"),
+      state: "STOPPED",
+      results: {
+        engineers: [],
+        reviewers: [],
+        finalArchitect: { packet: packets.accept, agentId: "fa" },
+        finalRecheck: { packet: packets.remediate, agentId: "fr" },
+        finalReport: { packet: packets.finalReport, agentId: "stale-report" },
+      },
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Authoritative final verdict: NEEDS_REMEDIATION");
+    expect(report).toContain("Authoritative source: Final Architect recheck");
+    expect(report).toContain("Superseded artifacts (historical evidence only)");
+    expect(report).not.toContain(packets.finalReport.summary);
   });
 
   it("message renderers are registered and return components (normal pi path)", () => {

@@ -57,6 +57,15 @@ export default function (pi: ExtensionAPI): void {
   // it; /factory-verbose writes it and the live view reads it.
   let visibilityMode: VisibilityMode = { ...DEFAULT_VISIBILITY_MODE };
 
+  const deliverCompletion = (state: ReturnType<FactoryController["getSnapshot"]>): void => {
+    runPanel?.stop();
+    reportFactoryCompletion(pi, state, reportedRuns, activeStore(state.cwd));
+  };
+
+  const watchController = (controller: FactoryController): void => {
+    void controller.waitForTerminal().then(deliverCompletion);
+  };
+
   const depsFor = (cwd: string): FactoryControllerDeps => ({
     transport,
     clock: systemClock,
@@ -93,6 +102,13 @@ export default function (pi: ExtensionAPI): void {
     });
     reportedRuns = new Set();
     activeRunId = undefined;
+    // Recover automatic delivery only for runs explicitly prepared by this
+    // reporting lifecycle. Legacy artifacts remain explicit /factory-report
+    // material and are never dumped into a new session unexpectedly.
+    for (const id of store.list()) {
+      const state = store.load(id);
+      if (state && isTerminal(state.state)) deliverCompletion(state);
+    }
     void transport.ping(750).then((ok) => { if (ok) transport.markReady(); });
   });
 
@@ -143,12 +159,14 @@ export default function (pi: ExtensionAPI): void {
         return textResult("pi-subagents is not available in this session; Factory cannot run without it.");
       }
       const id = runId();
+      activeStore(ctx.cwd).prepareReportDelivery(id);
       const deps = depsFor(ctx.cwd);
       // Apply per-call config overrides on top of the project file.
       deps.config = loadFactoryConfig(ctx.cwd, params.config as Record<string, unknown> | undefined);
       const controller = FactoryController.create(deps, id, params.task, ctx.cwd);
       controllers.set(id, controller);
       controller.start();
+      watchController(controller);
       return textResult(
         `Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}\n`
         + `Track progress with factory_status({run_id: "${id}"}).`,
@@ -197,9 +215,11 @@ export default function (pi: ExtensionAPI): void {
     isAvailable: async () => transport.isAvailable() || (await transport.ping(1_000)),
     launch: (cwd, task) => {
       const id = runId();
+      activeStore(cwd).prepareReportDelivery(id);
       const controller = FactoryController.create(depsFor(cwd), id, task, cwd);
       controllers.set(id, controller);
       controller.start();
+      watchController(controller);
       return { id, controller };
     },
     // Read-only: never restores/drives, so `/factory-status` costs no model calls.
@@ -248,6 +268,7 @@ export default function (pi: ExtensionAPI): void {
       controllers.set(id, restored);
       if (result.kind === "ok") {
         const resumed = restored.getState();
+        watchController(restored);
         return {
           kind: "ok",
           text: `Resumed run ${id}. state: ${resumed.state}${presetName !== undefined ? `, replacement preset: ${presetName}` : ""}. Completed phases were preserved; the next action continues from the checkpoint.`,
@@ -271,6 +292,7 @@ export default function (pi: ExtensionAPI): void {
         controller = FactoryController.restore(depsFor(persisted.cwd), id, { resume: false });
         if (!controller) return false;
         controllers.set(id, controller);
+        watchController(controller);
       }
       controller.stop("Stopped via /factory-stop");
       return true;
@@ -305,10 +327,7 @@ export default function (pi: ExtensionAPI): void {
         { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "70%" } },
       );
     },
-    reportCompletion: (state) => {
-      runPanel?.stop();
-      reportFactoryCompletion(pi, state, reportedRuns);
-    },
+    reportCompletion: deliverCompletion,
   };
   registerFactoryCommands(pi, runtime);
 
@@ -365,6 +384,7 @@ export default function (pi: ExtensionAPI): void {
     if (!restored) return undefined;
     controllers.set(id, restored);
     restored.start();
+    watchController(restored);
     return restored;
   }
 }

@@ -171,7 +171,7 @@ describe("AI Factory — final Lead synthesis", () => {
     expect(auto).toContain(`Full report persisted: .pi/factory/${state.runId}.json`);
   });
 
-  it("a non-DONE completion renders a short notice rather than a report", async () => {
+  it("a STOPPED completion renders the rejected final outcome without changing it", async () => {
     const m = make();
     await driveToFinalArchitect(m);
     complete(m, packets.remediate);
@@ -184,8 +184,11 @@ describe("AI Factory — final Lead synthesis", () => {
     await flush();
 
     expect(m.controller.getState().state).toBe("STOPPED");
-    const notice = formatFactoryCompletion(m.controller.getState());
-    expect(notice).toContain("ended STOPPED");
-    expect(notice).not.toContain("Factory final report");
+    const report = formatFactoryCompletion(m.controller.getState());
+    expect(report).toContain("Factory final report");
+    expect(report).toContain("Terminal state: STOPPED");
+    expect(report).toContain("Authoritative final verdict: NEEDS_REMEDIATION");
+    expect(report).toContain("remediation allowance reached 1/1");
+    expect(m.controller.getState().state).toBe("STOPPED");
   });
 });

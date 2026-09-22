@@ -128,7 +128,7 @@ export interface FactoryCommandRuntime {
   visibilityStatus(): string;
   /** Open the focused live agent view for a mode; resolves when it is closed. */
   openFocusView(ctx: ExtensionCommandContext, mode: VisibilityMode): Promise<void>;
-  /** Append the accepted final report to the conversation (deduplicated). */
+  /** Append the terminal report to the conversation (deduplicated). */
   reportCompletion(state: FactoryRunState): void;
 }
 
@@ -154,11 +154,12 @@ export function formatRunStatus(state: FactoryRunState): string {
   const m = state.metrics;
   const terminal = isTerminal(state.state);
   const finalReport = state.results.finalReport?.packet;
+  const architectOutcome = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+  const currentFinalReport = state.state === "DONE" && architectOutcome?.verdict !== "NEEDS_REMEDIATION" ? finalReport : undefined;
   const lines: string[] = [];
   if (terminal) {
-    const verdict = finalReport?.result
-      ?? state.results.finalRecheck?.packet.verdict
-      ?? state.results.finalArchitect?.packet.verdict
+    const verdict = architectOutcome?.verdict
+      ?? currentFinalReport?.result
       ?? state.stoppedReason
       ?? "-";
     lines.push(`Latest completed run: ${state.runId}`);
@@ -175,10 +176,10 @@ export function formatRunStatus(state: FactoryRunState): string {
   lines.push(`repairRound: ${state.repairRound}   remediationRounds: ${state.remediationRounds}`);
   lines.push(`retries: ${m.totalRetries}   fallbacks: ${m.totalFallbacks}   capacityWaits: ${m.capacityWaits}`);
   if (terminal) {
-    const head = finalReport?.endingHead ?? "-";
-    const commits = finalReport ? finalReport.commits.length : "-";
-    const validation = finalReport?.validation[0] ?? state.results.integration?.packet.systemVerification ?? "-";
-    const pending = finalReport?.humanVerification.length ?? 0;
+    const head = currentFinalReport?.endingHead ?? "-";
+    const commits = currentFinalReport ? currentFinalReport.commits.length : "-";
+    const validation = currentFinalReport?.validation[0] ?? state.results.integration?.packet.systemVerification ?? "-";
+    const pending = currentFinalReport?.humanVerification.length ?? 0;
     lines.push(`final HEAD: ${head}   commits: ${commits}`);
     lines.push(`validation: ${validation}`);
     lines.push(`human verification: ${pending > 0 ? `PENDING (${pending})` : "none recorded"}`);
@@ -218,12 +219,23 @@ interface AcceptedGate {
   label: "Final Architect recheck" | "Final Architect";
 }
 
-function acceptedGate(state: FactoryRunState): AcceptedGate | undefined {
+interface AuthoritativeArchitectOutcome {
+  packet: ArchitectFinalResult;
+  label: "Final Architect recheck" | "Final Architect";
+}
+
+/** The latest Architect acceptance decision always wins, including rejection. */
+function authoritativeArchitectOutcome(state: FactoryRunState): AuthoritativeArchitectOutcome | undefined {
   const recheck = state.results.finalRecheck?.packet;
-  if (recheck?.verdict === "ACCEPT") return { packet: recheck, label: "Final Architect recheck" };
+  if (recheck) return { packet: recheck, label: "Final Architect recheck" };
   const finalGate = state.results.finalArchitect?.packet;
-  if (finalGate?.verdict === "ACCEPT") return { packet: finalGate, label: "Final Architect" };
+  if (finalGate) return { packet: finalGate, label: "Final Architect" };
   return undefined;
+}
+
+function acceptedGate(state: FactoryRunState): AcceptedGate | undefined {
+  const outcome = authoritativeArchitectOutcome(state);
+  return outcome?.packet.verdict === "ACCEPT" ? outcome : undefined;
 }
 
 /** Short history for a run accepted only after remediation. Empty when no
@@ -265,7 +277,7 @@ function renderAcceptedIntegration(integration: LeadIntegrationPacket): string[]
 /** No accepted final artifact: show the latest result and label it rejected. */
 function renderUnacceptedEvidence(state: FactoryRunState): string[] {
   const integration = state.results.integration?.packet;
-  const finalGate = state.results.finalArchitect?.packet;
+  const authoritative = authoritativeArchitectOutcome(state);
   const lines = [`Run state: ${state.state}`, "No accepted final artifact exists for this run."];
   if (integration) {
     lines.push("");
@@ -274,11 +286,11 @@ function renderUnacceptedEvidence(state: FactoryRunState): string[] {
     lines.push(`- Factual assessment: ${integration.factualAssessment}`);
     for (const finding of integration.reviewerFindingsUnresolved) lines.push(`- Unresolved reviewer finding: ${finding}`);
   }
-  if (finalGate) {
+  if (authoritative) {
     lines.push("");
-    lines.push(`Final Architect verdict: ${finalGate.verdict}`);
-    for (const issue of finalGate.blockingIssues) lines.push(`- Blocking issue: ${issue}`);
-    for (const change of finalGate.requiredChanges) lines.push(`- Required change: ${change}`);
+    lines.push(`${authoritative.label} verdict: ${authoritative.packet.verdict}`);
+    for (const issue of authoritative.packet.blockingIssues) lines.push(`- Blocking issue: ${issue}`);
+    for (const change of authoritative.packet.requiredChanges) lines.push(`- Required change: ${change}`);
   }
   return lines;
 }
@@ -333,17 +345,45 @@ function legacyReportView(state: FactoryRunState): LegacyReportView {
  */
 export function formatFactoryReport(state: FactoryRunState): string {
   const finalReport = state.results.finalReport?.packet;
-  const legacy = finalReport ? undefined : legacyReportView(state);
-  const lines: string[] = ["Factory final report", `Run: ${state.runId}`];
-  if (finalReport) {
+  const authoritative = authoritativeArchitectOutcome(state);
+  const finalReportIsCurrent = finalReport !== undefined
+    && state.state === "DONE"
+    && authoritative?.packet.verdict !== "NEEDS_REMEDIATION";
+  const legacy = finalReportIsCurrent ? undefined : legacyReportView(state);
+  const lines: string[] = ["Factory final report", `Run: ${state.runId}`, `Terminal state: ${state.state}`];
+
+  if (state.state === "STOPPED") lines.push("Terminal classification: controlled stop (not a runtime crash)");
+  else if (state.state === "FAILED") lines.push("Terminal classification: unrecoverable/runtime failure (not an acceptance verdict)");
+  else if (state.state === "DONE") lines.push("Terminal classification: completed accepted run");
+
+  if (finalReportIsCurrent) {
     lines.push(`Result: ${finalReport.result}`);
   } else {
     lines.push(`Result: ${legacy!.result}`);
     lines.push(`Source: ${legacy!.source}`);
   }
+  if (authoritative) {
+    lines.push(`Authoritative final verdict: ${authoritative.packet.verdict}`);
+    lines.push(`Authoritative source: ${authoritative.label}`);
+  } else {
+    lines.push("Authoritative final verdict: not available");
+  }
   if (state.metrics.runDurationMs !== undefined) lines.push(`Duration: ${formatDuration(state.metrics.runDurationMs)}`);
   lines.push(`Remediation rounds: ${state.remediationRounds}`);
-  if (finalReport) {
+  lines.push(
+    `Counters: repair ${state.repairRound}/${state.config.maxRepairRounds}; remediation ${state.remediationRounds}/${state.config.maxArchitectRemediationRounds}; `
+    + `architect escalations ${state.architectEscalations}/${state.config.maxArchitectEscalations}; lead escalations ${state.leadEscalations}/${state.config.maxLeadEscalations}; `
+    + `attempts ${state.metrics.totalAttempts}; retries ${state.metrics.totalRetries}; fallbacks ${state.metrics.totalFallbacks}; capacity waits ${state.metrics.capacityWaits}`,
+  );
+
+  if (state.state === "STOPPED") {
+    lines.push(`Stop reason: ${controlledStopReason(state)}`);
+    lines.push(`Failed gate: ${authoritative ? `${authoritative.label} (${authoritative.packet.verdict})` : "no final acceptance gate was reached"}`);
+  } else if (state.state === "FAILED") {
+    lines.push(`Failure reason: ${state.stoppedReason ?? state.errors[state.errors.length - 1]?.message ?? "No failure reason was persisted."}`);
+  }
+
+  if (finalReportIsCurrent) {
     if (finalReport.summary.trim() !== "") {
       lines.push("");
       lines.push(finalReport.summary.trim());
@@ -360,16 +400,89 @@ export function formatFactoryReport(state: FactoryRunState): string {
   } else {
     lines.push("");
     lines.push(...legacy!.body);
+    renderTerminalEvidence(lines, state, finalReport !== undefined);
   }
+
+  if (state.state === "STOPPED") {
+    lines.push("");
+    lines.push("Recovery recommendation");
+    lines.push("- The controlled STOPPED state is terminal and was not changed by reporting.");
+    lines.push("- Persisted packets and the current working tree can be inspected manually; remaining work requires a new task or explicit manual assessment.");
+    lines.push("- No claim is made that unaccepted workspace changes are safe, complete, or automatically recoverable.");
+  } else if (state.state === "FAILED") {
+    lines.push("");
+    lines.push("Recovery recommendation");
+    lines.push("- Inspect the persisted error and workspace manually. This report does not classify a runtime failure as a controlled rejection or acceptance.");
+  }
+
   lines.push("");
   lines.push(`Full report persisted: ${FACTORY_DIR}/${state.runId}.json`);
   return lines.join("\n");
 }
 
-/** Automatic post-run rendering: the persisted final report, or a short notice. */
+function controlledStopReason(state: FactoryRunState): string {
+  if (state.stoppedReason?.trim()) return state.stoppedReason.trim();
+  const authoritative = authoritativeArchitectOutcome(state);
+  if (authoritative?.label === "Final Architect recheck" && authoritative.packet.verdict === "NEEDS_REMEDIATION") {
+    return `Final Architect recheck returned NEEDS_REMEDIATION after the remediation allowance reached ${state.remediationRounds}/${state.config.maxArchitectRemediationRounds}.`;
+  }
+  if (authoritative?.packet.verdict === "NEEDS_REMEDIATION") {
+    return `Final Architect returned NEEDS_REMEDIATION and no remediation allowance remained (${state.remediationRounds}/${state.config.maxArchitectRemediationRounds}).`;
+  }
+  if (state.repairExhausted) return "The Engineer/Reviewer repair allowance was exhausted.";
+  return "The run stopped before acceptance; no more specific stop reason was persisted.";
+}
+
+function renderTerminalEvidence(lines: string[], state: FactoryRunState, supersededFinalReport: boolean): void {
+  const authoritative = authoritativeArchitectOutcome(state);
+  if (supersededFinalReport) {
+    lines.push("");
+    lines.push("Superseded artifacts (historical evidence only)");
+    lines.push("- An earlier final Lead synthesis exists, but a later authoritative Architect outcome supersedes it.");
+  }
+  const accepted = acceptedGate(state);
+  if (accepted && state.state !== "DONE") {
+    section(lines, "Accepted partial work", [
+      `${accepted.label} returned ACCEPT before the run ended ${state.state}.`,
+      ...(state.results.integration?.packet.completedWorkPackages ?? []),
+    ]);
+  }
+  const incomplete: string[] = authoritative?.packet.verdict === "NEEDS_REMEDIATION"
+    ? [
+        ...authoritative.packet.blockingIssues,
+        ...authoritative.packet.requiredChanges.map((item) => `Required change: ${item}`),
+      ]
+    : [];
+  const latestEngineer = state.results.remediation?.engineer?.packet
+    ?? state.results.engineers[state.results.engineers.length - 1]?.outcome.packet;
+  if (latestEngineer && latestEngineer.status !== "completed") {
+    incomplete.push(`Work package ${latestEngineer.workPackageId}: ${latestEngineer.status} — ${latestEngineer.summary}`);
+  } else if (!latestEngineer && state.results.proposal) {
+    incomplete.push(...state.results.proposal.packet.workPackages.map((item) => `No Engineer completion evidence: ${item}`));
+  }
+  section(lines, "Unaccepted or incomplete work", incomplete);
+  if (authoritative?.packet.verdict === "NEEDS_REMEDIATION") {
+    section(lines, "Relevant validation failures", authoritative.packet.requiredEvidence.map((item) => `Required evidence not satisfied at the failed gate: ${item}`));
+  }
+  const latestReviewer = state.results.remediation?.reviewer?.packet
+    ?? state.results.reviewers[state.results.reviewers.length - 1]?.outcome.packet;
+  if (latestReviewer) {
+    section(lines, "Reviewer evidence", [
+      `Verdict: ${latestReviewer.verdict}`,
+      ...latestReviewer.blockingFindings,
+      ...latestReviewer.testConcerns,
+    ]);
+  }
+  const integration = state.results.integration?.packet;
+  if (integration) {
+    section(lines, "Historical validation evidence (not final acceptance)", [integration.systemVerification]);
+  }
+  section(lines, "Recorded runtime errors", state.errors.map((error) => `${error.phase}: ${error.message}`));
+}
+
+/** Automatic post-run rendering uses the same report for every terminal state. */
 export function formatFactoryCompletion(state: FactoryRunState): string {
-  if (state.state === "DONE") return formatFactoryReport(state);
-  return `Factory run ${state.runId} ended ${state.state}. Use /factory-status for details.`;
+  return isTerminal(state.state) ? formatFactoryReport(state) : `Factory run ${state.runId} is not terminal (${state.state}).`;
 }
 
 /** Section titles promoted to `##` headings in the Markdown report message. */
@@ -385,6 +498,14 @@ const REPORT_HEADINGS = new Set([
   "Remediation history",
   "Final accepted evidence",
   "Latest integration (NOT accepted)",
+  "Superseded artifacts (historical evidence only)",
+  "Accepted partial work",
+  "Unaccepted or incomplete work",
+  "Relevant validation failures",
+  "Reviewer evidence",
+  "Historical validation evidence (not final acceptance)",
+  "Recorded runtime errors",
+  "Recovery recommendation",
 ]);
 
 /**
@@ -409,20 +530,39 @@ export interface CompletionSink {
   sendMessage(message: { customType: string; content: string; display: boolean }): void;
 }
 
+/** Durable automatic-delivery evidence, kept outside orchestration state. */
+export interface ReportDeliveryStore {
+  hasPreparedReportDelivery(runId: string): boolean;
+  hasDeliveredReport(runId: string): boolean;
+  markReportDelivered(runId: string, terminalState: FactoryRunState["state"]): void;
+}
+
 /**
- * Append the accepted final report to the conversation exactly once per run,
- * as a normal rendered message. Replayed/duplicate DONE events are ignored via
- * the caller-supplied `reported` set.
+ * Append the terminal report to the conversation once per run. The in-memory
+ * set absorbs repeated callbacks in one process; the optional durable marker
+ * absorbs rehydration/restart callbacks. Delivery happens before marking, so a
+ * crash in that narrow interval can duplicate a report but cannot suppress it.
  */
-export function reportFactoryCompletion(sink: CompletionSink, state: FactoryRunState, reported: Set<string>): void {
-  if (reported.has(state.runId)) return;
-  reported.add(state.runId);
-  if (state.state !== "DONE") return;
+export function reportFactoryCompletion(
+  sink: CompletionSink,
+  state: FactoryRunState,
+  reported: Set<string>,
+  delivery?: ReportDeliveryStore,
+): void {
+  if (!isTerminal(state.state) || reported.has(state.runId)) return;
+  if (delivery && (!delivery.hasPreparedReportDelivery(state.runId) || delivery.hasDeliveredReport(state.runId))) return;
   sink.sendMessage({
     customType: "factory-final-report",
     content: formatFactoryReportMarkdown(state),
     display: true,
   });
+  reported.add(state.runId);
+  try {
+    delivery?.markReportDelivered(state.runId, state.state);
+  } catch {
+    // The report was already delivered. Keep the in-process guard; a later
+    // session may repeat it because durable evidence could not be written.
+  }
 }
 
 /** State for a run or undefined, reading persisted state only (no model calls). */
@@ -430,8 +570,7 @@ function reportStateFor(runId: string | undefined, cwd: string, runtime: Factory
   if (runId !== undefined && runId !== "") return runtime.peekState(runId, cwd);
   const runs = runtime.listRuns(cwd); // newest first
   const newestFirst = runs.map((run) => runtime.peekState(run.runId, cwd)).filter((s): s is FactoryRunState => s !== undefined);
-  return newestFirst.find((s) => s.results.finalReport !== undefined)
-    ?? newestFirst.find((s) => s.state === "DONE");
+  return newestFirst.find((s) => isTerminal(s.state));
 }
 
 function latestStateFor(cwd: string, runtime: FactoryCommandRuntime): FactoryRunState | undefined {
@@ -466,16 +605,9 @@ export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryComman
       const { id, controller } = runtime.launch(ctx.cwd, task);
       ctx.ui.notify(`Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}`, "info");
       runtime.showRunPanel(ctx, id);
-      // Auto-append the accepted final report when the run finishes, as a
-      // normal rendered message at the bottom of the conversation (deduplicated
-      // by run id). Non-DONE terminal states stay a short notification.
-      if (ctx.hasUI) {
-        void controller.waitForTerminal().then((final) => {
-          // Stops the live panel and appends the rich report on DONE.
-          runtime.reportCompletion(final);
-          if (final.state !== "DONE") ctx.ui.notify(formatFactoryCompletion(final), "warning");
-        });
-      }
+      // Auto-append the same evidence-based report for every terminal outcome.
+      // The runtime deduplicates repeated completion callbacks durably.
+      if (ctx.hasUI) void controller.waitForTerminal().then((final) => runtime.reportCompletion(final));
     },
   });
 

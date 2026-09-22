@@ -383,13 +383,12 @@ export function buildRunMetrics(state: FactoryRunState): RunMetricsSummary {
     notes,
   };
   const finalReport = state.results.finalReport?.packet;
-  if (finalReport) {
-    report.completion.finalResult = finalReport.result;
-    report.completion.validation = finalReport.validation[0];
-    report.completion.commits = finalReport.commits.length;
-  } else {
-    const accepted = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
-    if (accepted) report.completion.finalResult = accepted.verdict;
+  const architectOutcome = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+  const currentFinalReport = state.state === "DONE" && architectOutcome?.verdict !== "NEEDS_REMEDIATION" ? finalReport : undefined;
+  report.completion.finalResult = architectOutcome?.verdict ?? currentFinalReport?.result;
+  if (currentFinalReport) {
+    report.completion.validation = currentFinalReport.validation[0];
+    report.completion.commits = currentFinalReport.commits.length;
   }
   return report;
 }

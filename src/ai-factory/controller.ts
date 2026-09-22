@@ -615,7 +615,13 @@ export class FactoryController {
       }
       case "FINAL_ARCHITECT_RECHECK": {
         if (!s.results.finalRecheck) return { kind: "spawn", phase: "final_recheck.architect" };
-        return { kind: "transition", to: s.results.finalRecheck.packet.verdict === "ACCEPT" ? "FINAL_SYNTHESIS" : "STOPPED" };
+        return s.results.finalRecheck.packet.verdict === "ACCEPT"
+          ? { kind: "transition", to: "FINAL_SYNTHESIS" }
+          : {
+              kind: "transition",
+              to: "STOPPED",
+              note: `Final Architect recheck returned NEEDS_REMEDIATION after the remediation allowance reached ${s.remediationRounds}/${this.config.maxArchitectRemediationRounds}.`,
+            };
       }
       case "FINAL_SYNTHESIS":
         // The accepted state gets one bounded Lead synthesis, then DONE. The
@@ -1250,9 +1256,10 @@ export class FactoryController {
     }
   }
 
-  private applyTransition(to: FactoryRunState["state"], _note?: string): void {
+  private applyTransition(to: FactoryRunState["state"], note?: string): void {
     const from = this.state.state;
     assertTransition(from, to);
+    if (to === "STOPPED" && note?.trim()) this.state.stoppedReason = note.trim();
     if (from === "WAITING_CAPACITY") {
       this.state.waiting = undefined;
       this.state.parked = false;

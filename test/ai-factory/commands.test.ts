@@ -412,6 +412,24 @@ describe("AI Factory — /factory-report", () => {
     expect(b.spawns).toHaveLength(0);
   });
 
+  it("F2. explicit report request renders again after automatic delivery was recorded", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const state = completedState(cwd, "factory_report_again", "Report me again.");
+    store.save(state);
+    store.prepareReportDelivery(state.runId, 1_000);
+    store.markReportDelivered(state.runId, "DONE", 2_000);
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+
+    await b.commands.get("factory-report").handler(state.runId, ctx);
+
+    const text = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    expect(text).toContain("factory_report_again");
+    expect(text).toContain("Report me again.");
+    expect(b.spawns).toHaveLength(0);
+  });
+
   it("G. legacy remediation run uses the ACCEPT recheck, not the stale integration", async () => {
     const cwd = workdir();
     const store = new FactoryStore(cwd);
