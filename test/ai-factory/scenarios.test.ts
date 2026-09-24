@@ -81,6 +81,45 @@ describe("AI Factory — section 29 demonstrations", () => {
     expect(m.controller.getState().state).toBe("DONE");
   });
 
+  it("dispatches the next approved target after the first Reviewer PASS", async () => {
+    const m = make();
+    m.controller.start();
+    await flush();
+    const targets = [
+      { id: "WP0", description: "Build shared model", dependsOn: [], acceptanceCriteria: ["model tested"] },
+      { id: "WP1", description: "Integrate UI", dependsOn: ["WP0"], acceptanceCriteria: ["UI tested"] },
+    ];
+    const proposal = { ...packets.proposal, workPackages: ["WP0", "WP1"], targets };
+    complete(m, proposal);
+    await flush();
+    const requirements = [...packets.proposal.constraints, ...packets.proposal.acceptanceCriteria, "model tested", "UI tested"];
+    complete(m, {
+      ...packets.approve,
+      constraints: [...packets.proposal.constraints, "preserve the public API"],
+      approvedTargets: targets,
+      planAssessment: {
+        verdict: "complete",
+        missionRequirements: requirements,
+        missionDependencies: [],
+        requirementCoverage: [{ requirementId: "REQ-001", targetIds: targets.map((target) => target.id) }],
+        preservedConstraintIds: ["REQ-001"],
+        uncoveredRequirements: [],
+      },
+    });
+    await flush();
+    complete(m, { ...packets.engineer, workPackageId: "WP0" });
+    await flush();
+    complete(m, packets.reviewerPass);
+    await flush();
+
+    expect(phases(m)).toEqual([
+      "discovery.lead", "initial.architect", "execution.engineer", "review.reviewer", "execution.engineer",
+    ]);
+    expect(m.transport.spawned[2]?.prompt).toContain("preserve the public API");
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Work package: WP1");
+    expect(m.controller.getState().results.integration).toBeUndefined();
+  });
+
   it("2. primary Engineer unavailable -> configured fallback selected", async () => {
     const m = make({ roles: { engineer: { targets: { primary: "p/primary", fallbacks: ["p/fallback"] } } } });
     m.transport.spawnHandler = (req) =>

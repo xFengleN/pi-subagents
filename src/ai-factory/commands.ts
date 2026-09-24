@@ -27,10 +27,16 @@ import { FACTORY_DIR } from "./store.js";
 import {
   type ArchitectFinalResult,
   type FactoryRunState,
+  type FactoryTargetPlan,
   type LeadIntegrationPacket,
   ROLE_NAMES,
   type RoleName,
 } from "./types.js";
+
+function targetDisplayStatus(plan: FactoryTargetPlan, id: string): string {
+  if (!plan.revalidationIds?.includes(id)) return plan.outcomes[id].status;
+  return plan.currentTargetId === id ? "revalidating" : "awaiting revalidation";
+}
 
 /** Display outcome of `/factory-resume` (read-only inspection or execution). */
 export interface FactoryResumeOutcome {
@@ -67,6 +73,7 @@ export function formatResumePreview(
   if (r.remediation?.engineer) done.push("remediation engineer");
   if (r.remediation?.reviewer) done.push("remediation reviewer");
   lines.push(`completed: ${done.length > 0 ? done.join(", ") : "none"}`);
+  if (state.targetPlan) lines.push(`targets: ${state.targetPlan.targets.map((target) => `${target.id}=${targetDisplayStatus(state.targetPlan!, target.id)}`).join(", ")}; active: ${state.targetPlan.currentTargetId ?? "none"}`);
   const decision = plan.decision === "automatic"
     ? "safe automatic continuation"
     : plan.decision === "approval_required"
@@ -174,6 +181,7 @@ export function formatRunStatus(state: FactoryRunState): string {
     if (m.runStartedAt > 0) lines.push(`elapsed: ${formatDuration(Math.max(0, Date.now() - m.runStartedAt))}`);
   }
   lines.push(`repairRound: ${state.repairRound}   remediationRounds: ${state.remediationRounds}`);
+  if (state.targetPlan) lines.push(`targets: ${state.targetPlan.targets.map((target) => `${target.id}=${targetDisplayStatus(state.targetPlan!, target.id)}`).join(", ")}`);
   lines.push(`retries: ${m.totalRetries}   fallbacks: ${m.totalFallbacks}   capacityWaits: ${m.capacityWaits}`);
   if (terminal) {
     const head = currentFinalReport?.endingHead ?? "-";
@@ -281,7 +289,9 @@ function renderUnacceptedEvidence(state: FactoryRunState): string[] {
   const lines = [`Run state: ${state.state}`, "No accepted final artifact exists for this run."];
   if (integration) {
     lines.push("");
-    lines.push("Latest integration (NOT accepted)");
+    lines.push(state.results.remediation
+      ? "Historical integration (before remediation; not current workspace evidence)"
+      : "Latest integration (NOT accepted)");
     lines.push(`- System verification: ${integration.systemVerification}`);
     lines.push(`- Factual assessment: ${integration.factualAssessment}`);
     for (const finding of integration.reviewerFindingsUnresolved) lines.push(`- Unresolved reviewer finding: ${finding}`);
@@ -403,6 +413,25 @@ export function formatFactoryReport(state: FactoryRunState): string {
     renderTerminalEvidence(lines, state, finalReport !== undefined);
   }
 
+  if (state.targetPlan && isTerminal(state.state)) {
+    const plan = state.targetPlan;
+    const counts = { passed: 0, failed: 0, blocked: 0, pending: 0, active: 0, revalidation: 0 };
+    for (const target of plan.targets) {
+      if (plan.revalidationIds?.includes(target.id)) counts.revalidation++;
+      else counts[plan.outcomes[target.id].status]++;
+    }
+    section(lines, "Target outcomes (packet evidence; not a workspace snapshot)", [
+      `Proposed: ${plan.targets.length}; completed and reviewed: ${counts.passed}; failed: ${counts.failed}; blocked: ${counts.blocked}; not attempted: ${counts.pending}; in progress: ${counts.active}; awaiting revalidation: ${counts.revalidation}`,
+      ...plan.targets.map((target) => {
+        const outcome = plan.outcomes[target.id];
+        const engineer = state.results.engineers.find((item) => item.outcome.agentId === outcome.engineerAgentId)?.outcome.packet;
+        const evidence = outcome.status === "passed" && !plan.revalidationIds?.includes(target.id) ? `; Reviewer PASS ${outcome.reviewerAgentId}; ${outcome.architectAgentId ? `package Architect acceptance ${outcome.architectAgentId}` : "no separate package Architect acceptance"}` : "";
+        return `${target.id}: ${targetDisplayStatus(plan, target.id)}${evidence}${outcome.reason ? `; ${outcome.reason}` : ""}${outcome.blockedBy?.length ? `; blocked by ${outcome.blockedBy.join(", ")}` : ""}${engineer?.changedFiles.length ? `; Engineer-reported artifacts: ${engineer.changedFiles.join(", ")}` : ""}`;
+      }),
+      "Repository contents and post-run edits have not been independently verified by this report.",
+    ]);
+  }
+
   if (state.state === "STOPPED") {
     lines.push("");
     lines.push("Recovery recommendation");
@@ -453,8 +482,15 @@ function renderTerminalEvidence(lines: string[], state: FactoryRunState, superse
         ...authoritative.packet.requiredChanges.map((item) => `Required change: ${item}`),
       ]
     : [];
-  const latestEngineer = state.results.remediation?.engineer?.packet
-    ?? state.results.engineers[state.results.engineers.length - 1]?.outcome.packet;
+  const remediationEngineer = state.results.remediation?.engineer?.packet;
+  if (remediationEngineer) {
+    section(lines, "Latest remediation implementation (not mission acceptance)", [
+      `Work package ${remediationEngineer.workPackageId}: ${remediationEngineer.status} — ${remediationEngineer.summary}`,
+      ...remediationEngineer.changedFiles.map((file) => `Reported changed file: ${file}`),
+      ...(remediationEngineer.testResults ? [`Reported validation: ${remediationEngineer.testResults}`] : []),
+    ]);
+  }
+  const latestEngineer = remediationEngineer ?? state.results.engineers[state.results.engineers.length - 1]?.outcome.packet;
   if (latestEngineer && latestEngineer.status !== "completed") {
     incomplete.push(`Work package ${latestEngineer.workPackageId}: ${latestEngineer.status} — ${latestEngineer.summary}`);
   } else if (!latestEngineer && state.results.proposal) {
@@ -497,7 +533,9 @@ const REPORT_HEADINGS = new Set([
   "Warnings / limitations",
   "Remediation history",
   "Final accepted evidence",
+  "Historical integration (before remediation; not current workspace evidence)",
   "Latest integration (NOT accepted)",
+  "Latest remediation implementation (not mission acceptance)",
   "Superseded artifacts (historical evidence only)",
   "Accepted partial work",
   "Unaccepted or incomplete work",
@@ -505,6 +543,7 @@ const REPORT_HEADINGS = new Set([
   "Reviewer evidence",
   "Historical validation evidence (not final acceptance)",
   "Recorded runtime errors",
+  "Target outcomes (packet evidence; not a workspace snapshot)",
   "Recovery recommendation",
 ]);
 

@@ -138,7 +138,7 @@ describe("AI Factory end to end (faux model, no network)", () => {
           if (tools.some((t) => t.name === "StructuredOutput")) {
             if (text.includes("Recorded.")) return fauxText("done");
             if (text.includes("bounded repository reconnaissance")) return fauxToolCall("StructuredOutput", PACKETS.proposal, { id: "so-proposal" });
-            if (text.includes("A Technical Lead has produced")) return fauxToolCall("StructuredOutput", PACKETS.approve, { id: "so-arch" });
+            if (text.includes("Original human request (authoritative")) return fauxToolCall("StructuredOutput", PACKETS.approve, { id: "so-arch" });
             if (text.includes("Implement ONE coherent work package")) return fauxToolCall("StructuredOutput", PACKETS.engineer, { id: "so-eng" });
             if (text.includes("independent implementation-correctness role")) return fauxToolCall("StructuredOutput", PACKETS.pass, { id: "so-rev" });
             if (text.includes("The implementation work is complete")) return fauxToolCall("StructuredOutput", PACKETS.integration, { id: "so-int" });
@@ -195,4 +195,78 @@ describe("AI Factory end to end (faux model, no network)", () => {
     },
     120_000,
   );
+
+  it("dispatches two dependent approved targets before final integration (isolated faux session)", async () => {
+    const cwd = factoryProject();
+    dirs.push(cwd);
+    const targets = [
+      { id: "wp-1", description: "Build the library", dependsOn: [], acceptanceCriteria: ["library tests pass"] },
+      { id: "wp-2", description: "Build the consumer", dependsOn: ["wp-1"], acceptanceCriteria: ["consumer tests pass"] },
+    ];
+    let statusCalls = 0;
+    run = await runPrintMode({
+      prompt: "Use the Factory tool to run this task, then wait for it to finish.",
+      cwd,
+      maxModelCalls: 60,
+      live: false,
+      extensionPaths: [
+        new URL("../../src/index.ts", import.meta.url).pathname,
+        new URL("../../src/ai-factory/index.ts", import.meta.url).pathname,
+      ],
+      respond: (context) => {
+        const text = asText(context);
+        if (context.tools?.some((tool) => tool.name === "StructuredOutput")) {
+          if (text.includes("Recorded.")) return fauxText("done");
+          if (text.includes("bounded repository reconnaissance")) return fauxToolCall("StructuredOutput", { ...PACKETS.proposal, workPackages: ["wp-1", "wp-2"], targets, humanRequirements: [TASK] }, { id: "proposal" });
+          if (text.includes("Original human request (authoritative")) {
+            const requirements = [TASK, ...PACKETS.proposal.constraints, ...PACKETS.proposal.acceptanceCriteria, ...targets.flatMap((target) => target.acceptanceCriteria)];
+            return fauxToolCall("StructuredOutput", {
+              ...PACKETS.approve,
+              constraints: PACKETS.proposal.constraints,
+              approvedTargets: targets,
+              planAssessment: {
+                verdict: "complete",
+                missionRequirements: requirements,
+                missionDependencies: [],
+                requirementCoverage: [
+                  { requirementId: "REQ-001", targetIds: targets.map((target) => target.id) },
+                  { requirementId: "REQ-002", targetIds: targets.map((target) => target.id) },
+                ],
+                preservedConstraintIds: ["REQ-002"],
+                uncoveredRequirements: [],
+              },
+            }, { id: "architect" });
+          }
+          if (text.includes("Implement ONE coherent work package")) return fauxToolCall("StructuredOutput", { ...PACKETS.engineer, workPackageId: text.includes("Work package: wp-2") ? "wp-2" : "wp-1" }, { id: "engineer" });
+          if (text.includes("independent implementation-correctness role")) return fauxToolCall("StructuredOutput", PACKETS.pass, { id: "reviewer" });
+          if (text.includes("The implementation work is complete")) return fauxToolCall("StructuredOutput", { ...PACKETS.integration, completedWorkPackages: ["wp-1", "wp-2"] }, { id: "integration" });
+          if (text.includes("final architecture/acceptance checkpoint")) return fauxToolCall("StructuredOutput", PACKETS.accept, { id: "final" });
+          if (text.includes("bounded synthesis of accepted evidence")) return fauxToolCall("StructuredOutput", PACKETS.finalReport, { id: "synthesis" });
+          return fauxText("unexpected child");
+        }
+        if (statusCalls >= 1) return fauxText("Factory run finished.");
+        if (text.includes("Factory run started")) {
+          statusCalls++;
+          return fauxToolCall("factory_status", { run_id: text.match(/(factory_[A-Za-z0-9_-]+)/)?.[1], wait: true }, { id: "status" });
+        }
+        return fauxToolCall("Factory", { task: TASK }, { id: "factory" });
+      },
+      timeoutMs: 90_000,
+    });
+    const statusText = toolResultsNamed(run.parentSession, "factory_status").join("\n");
+    expect(statusText).toContain('"state": "DONE"');
+    const runId = statusText.match(/"runId": "(\S+)"/)?.[1];
+    expect(runId).toBeTruthy();
+    const state = JSON.parse(readFileSync(join(cwd, FACTORY_DIR, `${runId}.json`), "utf8")) as {
+      targetPlan: { outcomes: Record<string, { status: string; reviewerAgentId?: string }> };
+      results: { engineers: Array<{ targetId: string }> };
+      metrics: { roles: Record<string, { attempts: number }> };
+    };
+    expect(state.results.engineers.map((item) => item.targetId)).toEqual(["wp-1", "wp-2"]);
+    expect(state.targetPlan.outcomes["wp-1"].status).toBe("passed");
+    expect(state.targetPlan.outcomes["wp-2"].reviewerAgentId).toBeTruthy();
+    expect(state.metrics.roles.engineer.attempts).toBe(2);
+    expect(state.metrics.roles.reviewer.attempts).toBe(2);
+    expect(state.metrics.roles.architect.attempts).toBe(2);
+  }, 120_000);
 });

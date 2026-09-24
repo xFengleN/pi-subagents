@@ -139,6 +139,33 @@ describe("AI Factory — final report as a normal message", () => {
     expect(report).not.toContain("npm test: pass");
   });
 
+  it("a rejecting recheck reports completed remediation after historical integration", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_remediated_stop"),
+      state: "STOPPED",
+      results: {
+        engineers: [],
+        reviewers: [],
+        integration: { packet: { ...packets.integration, factualAssessment: "No product implementation exists" }, agentId: "lead" },
+        finalArchitect: { packet: packets.remediate, agentId: "fa" },
+        remediation: {
+          engineer: { packet: { ...packets.engineer, summary: "Implemented the inspector", changedFiles: ["Inspector.swift"] }, agentId: "eng" },
+          reviewer: { packet: packets.reviewerPass, agentId: "rev" },
+        },
+        finalRecheck: { packet: packets.remediate, agentId: "fr" },
+      },
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Historical integration (before remediation; not current workspace evidence)");
+    expect(report).toContain("Latest remediation implementation (not mission acceptance)");
+    expect(report).toContain("Implemented the inspector");
+    expect(report).toContain("Inspector.swift");
+    expect(report).toContain("No product implementation exists");
+    expect(report.indexOf("No product implementation exists")).toBeLessThan(report.indexOf("Implemented the inspector"));
+    expect(report).toContain("Authoritative final verdict: NEEDS_REMEDIATION");
+  });
+
   it("a later rejecting recheck supersedes an earlier accepted synthesis", () => {
     const state: FactoryRunState = {
       ...makeDoneState("factory_superseded"),

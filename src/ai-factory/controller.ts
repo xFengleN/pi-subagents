@@ -28,17 +28,20 @@ import {
   reviewerPrompt,
   roleDescription,
 } from "./prompts.js";
-import { createFactoryCheckpoint, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
+import { createFactoryCheckpoint, hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
 import { assertTransition, assessRecoveryEligibility, isTerminal } from "./state.js";
 import type { FactoryStore } from "./store.js";
+import { blockFailedDependencies, createTargetPlan, dependentsInOrder, nextEligibleTarget, TARGET_ID, validateArchitectTargetApproval, validateTargets } from "./targets.js";
 import { type AgentSettleInfo, classifyError, type FactoryTransport, type SpawnRequest } from "./transport.js";
 import {
   type ArchitectInitialResult,
+  FACTORY_STATE_VERSION,
   type FactoryAttempt,
   type FactoryConfig,
   type FactoryRecoveryEligibility,
   type FactoryResumeResult,
   type FactoryRunState,
+  type FactoryTarget,
   type LeadEscalationPacket,
   type LeadIntegrationPacket,
   type ReviewerOutcome,
@@ -142,7 +145,7 @@ export class FactoryController {
     const leaseToken = deps.store.acquireLease(runId);
     const now = deps.clock.now();
     const state: FactoryRunState = {
-      version: 2,
+      version: FACTORY_STATE_VERSION,
       runId,
       createdAt: now,
       updatedAt: now,
@@ -541,13 +544,16 @@ export class FactoryController {
       return;
     }
 
-    if (attempt) {
+    // Store the packet before marking the attempt validated. If packet storage
+    // itself terminally rejects the result, its commit retains the fail-closed
+    // settled_without_valid_packet provenance instead of claiming a missing packet.
+    this.storePacket(phase, role, packet, info);
+    if (attempt && !isTerminal(this.state.state)) {
       attempt.provenance = "settled_validated_packet";
       attempt.recoveryRisk = "validated_packet";
       attempt.packetValidated = true;
     }
-    this.commit();
-    this.storePacket(phase, role, packet, info);
+    // Packet and validated provenance become durable in one atomic snapshot.
     this.commit();
     void this.drive();
   }
@@ -577,11 +583,32 @@ export class FactoryController {
       case "DISCOVERY":
         return s.results.proposal ? { kind: "transition", to: "INITIAL_ARCHITECT" } : { kind: "spawn", phase: "discovery.lead" };
       case "INITIAL_ARCHITECT":
-        return s.results.initialArchitect ? { kind: "transition", to: "EXECUTION" } : { kind: "spawn", phase: "initial.architect" };
+        if (!s.results.initialArchitect) return { kind: "spawn", phase: "initial.architect" };
+        if (s.results.initialArchitect.packet.verdict === "CLARIFY" || (s.version === 3 && !s.targetPlan)) {
+          return { kind: "transition", to: "STOPPED", note: s.stoppedReason ?? "Approved executable target plan unavailable; clarification required" };
+        }
+        return { kind: "transition", to: "EXECUTION" };
       case "EXECUTION": {
+        if (s.targetPlan) {
+          const plan = s.targetPlan;
+          blockFailedDependencies(plan);
+          if (!plan.currentTargetId) {
+            const next = nextEligibleTarget(plan);
+            if (!next) {
+              if (plan.targets.every((target) => plan.outcomes[target.id].status === "passed")) return { kind: "transition", to: "INTEGRATION" };
+              return { kind: "transition", to: "STOPPED", note: "Execution ended with failed, blocked or unresolved targets; mission not accepted" };
+            }
+            plan.currentTargetId = next.id;
+            plan.outcomes[next.id] = { status: "active" };
+            s.repairRound = 0;
+            s.repairExhausted = false;
+            s.results.leadEscalation = undefined;
+            s.results.escalationArchitect = undefined;
+          }
+        }
         if (s.repairExhausted) {
           if (s.leadEscalations < this.config.maxLeadEscalations) return { kind: "spawn", phase: "escalation.lead" };
-          return { kind: "transition", to: "STOPPED", note: "repair loop exhausted after the Lead escalation budget" };
+          return this.failTargetOrStop("repair loop exhausted after the Lead escalation budget");
         }
         const lastEngineer = lastExecutionEngineer(s);
         if (!lastEngineer || lastEngineer.round !== s.repairRound) return { kind: "spawn", phase: "execution.engineer" };
@@ -589,7 +616,44 @@ export class FactoryController {
       }
       case "REVIEW": {
         const reviewer = lastReviewer(s);
-        if (!reviewer || reviewer.round !== s.repairRound) return { kind: "spawn", phase: "review.reviewer" };
+        if (!reviewer || reviewer.round !== s.repairRound || (s.targetPlan?.revalidationIds?.includes(s.targetPlan.currentTargetId ?? "") && reviewer.outcome.agentId === s.targetPlan.outcomes[s.targetPlan.currentTargetId!].reviewerAgentId)) return { kind: "spawn", phase: "review.reviewer" };
+        if (s.targetPlan?.revalidationIds?.includes(s.targetPlan.currentTargetId ?? "") && reviewer.outcome.packet.verdict === "PASS") {
+          const plan = s.targetPlan;
+          const id = plan.currentTargetId!;
+          plan.outcomes[id] = { ...plan.outcomes[id], status: "passed", reviewerAgentId: reviewer.outcome.agentId, reason: "Revalidated after scoped remediation" };
+          plan.revalidationIds!.shift();
+          if (plan.revalidationIds!.length === 0) {
+            plan.revalidationIds = undefined;
+            plan.currentTargetId = undefined;
+            if (!plan.targets.every((target) => plan.outcomes[target.id].status === "passed")) {
+              return { kind: "transition", to: "STOPPED", note: "Revalidation completed with failed or blocked targets; mission not accepted" };
+            }
+            return { kind: "transition", to: "FINAL_ARCHITECT_RECHECK", note: "All affected dependents revalidated" };
+          }
+          plan.currentTargetId = plan.revalidationIds![0];
+          plan.outcomes[plan.currentTargetId].status = "active";
+          s.repairRound = 0;
+          return { kind: "transition", to: "REVIEW", note: `Revalidating dependent ${plan.currentTargetId}` };
+        }
+        if (s.targetPlan && reviewer.outcome.packet.verdict === "PASS") {
+          const engineer = lastExecutionEngineer(s);
+          const id = s.targetPlan.currentTargetId!;
+          if (engineer?.outcome.packet.status !== "completed") {
+            s.targetPlan.outcomes[id] = { status: "failed", reason: `Engineer reported ${engineer?.outcome.packet.status ?? "no result"}`, engineerAgentId: engineer?.outcome.agentId, reviewerAgentId: reviewer.outcome.agentId };
+            s.targetPlan.currentTargetId = undefined;
+            return { kind: "transition", to: "EXECUTION", note: `Target ${id} did not complete` };
+          }
+          const target = s.targetPlan.targets.find((item) => item.id === id)!;
+          s.targetPlan.outcomes[id] = { status: "passed", engineerAgentId: engineer.outcome.agentId, reviewerAgentId: reviewer.outcome.agentId };
+          if (target.requiresArchitectAcceptance || engineer.outcome.packet.architecturalEscalationRequired) {
+            if (s.architectEscalations >= this.config.maxArchitectEscalations) return this.failTargetOrStop(`Architect assessment allowance exhausted for ${id}`);
+            s.targetPlan.awaitingArchitectAcceptance = true;
+            return { kind: "transition", to: "ARCHITECT_ESCALATION", note: `Target ${id} requires Architect assessment` };
+          }
+          s.targetPlan.currentTargetId = undefined;
+          blockFailedDependencies(s.targetPlan);
+          return { kind: "transition", to: s.targetPlan.targets.every((item) => s.targetPlan!.outcomes[item.id].status === "passed") ? "INTEGRATION" : "EXECUTION", note: `Reviewer PASS for ${id}` };
+        }
         return this.reviewTransition(reviewer.outcome.packet);
       }
       case "ARCHITECT_ESCALATION":
@@ -597,11 +661,21 @@ export class FactoryController {
       case "INTEGRATION":
         return s.results.integration ? { kind: "transition", to: "FINAL_ARCHITECT" } : { kind: "spawn", phase: "integration.lead" };
       case "FINAL_ARCHITECT": {
+        if (s.targetPlan && !s.targetPlan.targets.every((target) => s.targetPlan!.outcomes[target.id].status === "passed")) return { kind: "transition", to: "STOPPED", note: "Mission cannot be accepted with unfinished targets" };
         if (!s.results.finalArchitect) return { kind: "spawn", phase: "final.architect" };
         // ACCEPT never goes straight to DONE: every accepted run must pass
         // through exactly one bounded final Lead synthesis first.
         if (s.results.finalArchitect.packet.verdict === "ACCEPT") return { kind: "transition", to: "FINAL_SYNTHESIS" };
         if (s.remediationRounds < this.config.maxArchitectRemediationRounds) {
+          if (s.targetPlan && s.targetPlan.targets.length > 1) {
+            const verdict = s.results.finalArchitect.packet;
+            const ids = verdict.affectedTargetIds ?? [];
+            if ((!verdict.integrationOnly && (ids.length !== 1 || !s.targetPlan.outcomes[ids[0]] || s.targetPlan.outcomes[ids[0]].status !== "passed"))
+              || (verdict.integrationOnly && ids.length > 0)) return { kind: "transition", to: "STOPPED", note: "Final Architect rejection has no safe, unique target or integration correction scope" };
+            if (ids.length === 1) {
+              if ([s.targetPlan.targets.find((target) => target.id === ids[0])!, ...dependentsInOrder(s.targetPlan, ids[0])].some((target) => target.requiresArchitectAcceptance)) return { kind: "transition", to: "STOPPED", note: "Scoped correction affects a target requiring renewed Architect acceptance; cannot safely revalidate automatically" };
+            }
+          }
           s.remediationRounds++;
           return { kind: "transition", to: "REMEDIATION" };
         }
@@ -611,9 +685,32 @@ export class FactoryController {
         const rem = s.results.remediation;
         if (!rem?.engineer) return { kind: "spawn", phase: "remediation.engineer" };
         if (!rem?.reviewer) return { kind: "spawn", phase: "remediation.reviewer" };
+        if (rem.engineer.packet.status !== "completed" || rem.reviewer.packet.verdict !== "PASS") {
+          return this.failRemediation("Remediation was not completed and Reviewer-approved");
+        }
+        if (s.targetPlan && s.targetPlan.targets.length > 1 && !s.results.finalRecheck) {
+          const id = s.results.finalArchitect?.packet.affectedTargetIds?.[0];
+          if (id) {
+            const plan = s.targetPlan;
+            const descendants = dependentsInOrder(plan, id);
+            const dependents = descendants.filter((target) => plan.outcomes[target.id].status === "passed").map((target) => target.id);
+            if ([plan.targets.find((target) => target.id === id)!, ...descendants].some((target) => target.requiresArchitectAcceptance)) return this.failRemediation("Scoped correction affects a target requiring renewed Architect acceptance; cannot safely revalidate automatically");
+            if (rem.engineer.packet.workPackageId !== id) return this.failRemediation(`Remediation packet did not match target ${id}`);
+            plan.outcomes[id] = { status: "passed", engineerAgentId: rem.engineer.agentId, reviewerAgentId: rem.reviewer.agentId, reason: "Scoped remediation Reviewer PASS" };
+            if (dependents.length > 0) {
+              plan.revalidationIds = dependents;
+              plan.currentTargetId = dependents[0];
+              plan.outcomes[dependents[0]].status = "active";
+              s.repairRound = 0;
+              return { kind: "transition", to: "REVIEW", note: `Revalidate ${dependents.join(", ")} after ${id} remediation` };
+            }
+            plan.currentTargetId = undefined;
+          } else if (rem.engineer.packet.workPackageId !== "integration") return this.failRemediation("Integration-only remediation packet had an unexpected scope");
+        }
         return { kind: "transition", to: "FINAL_ARCHITECT_RECHECK" };
       }
       case "FINAL_ARCHITECT_RECHECK": {
+        if (s.targetPlan && (s.targetPlan.revalidationIds?.length || !s.targetPlan.targets.every((target) => s.targetPlan!.outcomes[target.id].status === "passed"))) return { kind: "transition", to: "STOPPED", note: "Corrected targets still require validation before final recheck" };
         if (!s.results.finalRecheck) return { kind: "spawn", phase: "final_recheck.architect" };
         return s.results.finalRecheck.packet.verdict === "ACCEPT"
           ? { kind: "transition", to: "FINAL_SYNTHESIS" }
@@ -624,6 +721,7 @@ export class FactoryController {
             };
       }
       case "FINAL_SYNTHESIS":
+        if (s.targetPlan && (s.targetPlan.revalidationIds?.length || !s.targetPlan.targets.every((target) => s.targetPlan!.outcomes[target.id].status === "passed"))) return { kind: "transition", to: "STOPPED", note: "Final synthesis cannot accept unfinished targets" };
         // The accepted state gets one bounded Lead synthesis, then DONE. The
         // presence of the persisted packet is the deterministic completion
         // signal; the synthesis can never send the run back into remediation.
@@ -635,8 +733,62 @@ export class FactoryController {
     }
   }
 
-  /** Decide the review verdict's consequence — the deterministic heart of the
-   * bounded Engineer/Reviewer repair loop. */
+  /** Mark a single exhausted target without discarding independent work. */
+  private failTargetOrStop(reason: string): { kind: "transition"; to: FactoryRunState["state"]; note: string } {
+    const plan = this.state.targetPlan;
+    const id = plan?.currentTargetId;
+    if (!plan || !id) return { kind: "transition", to: "STOPPED", note: reason };
+    const engineer = lastExecutionEngineer(this.state);
+    const reviewer = lastReviewer(this.state);
+    plan.outcomes[id] = {
+      status: "failed", reason,
+      ...(engineer ? { engineerAgentId: engineer.outcome.agentId } : {}),
+      ...(reviewer ? { reviewerAgentId: reviewer.outcome.agentId } : {}),
+    };
+    const revalidationQueue = plan.revalidationIds;
+    if (revalidationQueue?.length) {
+      const descendants = new Set(dependentsInOrder(plan, id).map((target) => target.id));
+      const blocked = new Set(revalidationQueue.filter((targetId) => descendants.has(targetId)));
+      for (const dependent of blocked) {
+        plan.outcomes[dependent] = { status: "blocked", blockedBy: [id], reason: `Revalidation cannot complete after prerequisite ${id} failed` };
+      }
+      const remaining = revalidationQueue.filter((targetId) => targetId !== id && !blocked.has(targetId));
+      plan.revalidationIds = remaining.length > 0 ? remaining : undefined;
+      plan.currentTargetId = remaining[0];
+      if (plan.currentTargetId) {
+        plan.outcomes[plan.currentTargetId].status = "active";
+        this.state.repairRound = 0;
+        blockFailedDependencies(plan);
+        return { kind: "transition", to: "REVIEW", note: `Target ${id} failed revalidation; continuing independent targets` };
+      }
+      blockFailedDependencies(plan);
+      return { kind: "transition", to: "STOPPED", note: `Target ${id} failed revalidation: ${reason}` };
+    }
+    plan.currentTargetId = undefined;
+    blockFailedDependencies(plan);
+    return { kind: "transition", to: "EXECUTION", note: `Target ${id} failed: ${reason}` };
+  }
+
+  /** Invalidate stale target PASS evidence when scoped remediation fails. */
+  private failRemediation(reason: string): Action {
+    const plan = this.state.targetPlan;
+    const id = this.state.results.finalArchitect?.packet.affectedTargetIds?.[0]
+      ?? plan?.currentTargetId
+      ?? (plan?.targets.length === 1 ? plan.targets[0].id : undefined);
+    if (plan && id && plan.outcomes[id]) {
+      plan.outcomes[id] = { status: "failed", reason: `Scoped remediation failed: ${reason}` };
+      for (const dependent of dependentsInOrder(plan, id)) {
+        if (plan.outcomes[dependent.id].status === "passed") {
+          plan.outcomes[dependent.id] = { status: "blocked", blockedBy: [id], reason: `Upstream target ${id} remediation failed` };
+        }
+      }
+      plan.currentTargetId = undefined;
+      plan.revalidationIds = undefined;
+    }
+    return { kind: "transition", to: "STOPPED", note: reason };
+  }
+
+  /** Decide the review verdict's consequence — the bounded target-local repair loop. */
   private reviewTransition(verdict: ReviewerPacket): Action | undefined {
     const s = this.state;
     switch (verdict.verdict) {
@@ -651,7 +803,7 @@ export class FactoryController {
           if (s.architectEscalations < this.config.maxArchitectEscalations) {
             return { kind: "transition", to: "ARCHITECT_ESCALATION", note: "architectural issue after repair budget" };
           }
-          return { kind: "transition", to: "STOPPED", note: "architectural escalation budget exhausted" };
+          return this.failTargetOrStop("architectural escalation budget exhausted");
         }
         s.repairExhausted = true;
         return { kind: "transition", to: "EXECUTION", note: "repair loop exhausted — escalate to Lead" };
@@ -660,7 +812,7 @@ export class FactoryController {
         if (s.architectEscalations < this.config.maxArchitectEscalations) {
           return { kind: "transition", to: "ARCHITECT_ESCALATION" };
         }
-        return { kind: "transition", to: "STOPPED", note: "architectural escalation budget exhausted" };
+        return this.failTargetOrStop("architectural escalation budget exhausted");
     }
   }
 
@@ -691,7 +843,7 @@ export class FactoryController {
       case "discovery.lead":
         return { role: "lead", kind: "proposal", prompt: leadProposalPrompt(s.task) };
       case "initial.architect":
-        return { role: "architect", kind: "architect_initial", prompt: initialArchitectPrompt(s.results.proposal!.packet) };
+        return { role: "architect", kind: "architect_initial", prompt: initialArchitectPrompt(s.task, s.results.proposal!.packet) };
       case "execution.engineer":
         return this.engineerSpec("execution", resumeNote);
       case "review.reviewer":
@@ -705,6 +857,7 @@ export class FactoryController {
             architecture: s.effectiveArchitecture,
             engineers: s.results.engineers.map((e) => e.outcome.packet),
             reviewers: s.results.reviewers.map((r) => r.outcome.packet),
+            ...(s.targetPlan ? { targetSummary: s.targetPlan.targets.map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].status}`) } : {}),
           }),
         };
       case "final.architect":
@@ -716,6 +869,8 @@ export class FactoryController {
             // Sweep again at the checkpoint so the guarantee holds even for a
             // legacy/restored integration packet. Idempotent.
             integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
+            targets: s.targetPlan?.targets,
+            targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].status}; reviewer ${s.targetPlan!.outcomes[target.id].reviewerAgentId ?? "none"}`),
           }),
         };
       case "final_recheck.architect": {
@@ -726,6 +881,8 @@ export class FactoryController {
           prompt: finalArchitectPrompt({
             task: s.task,
             integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
+            targets: s.targetPlan?.targets,
+            targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].status}; reviewer ${s.targetPlan!.outcomes[target.id].reviewerAgentId ?? "none"}`),
             // Surface the actual remediation so the recheck assesses the fixed
             // system, not the pre-fix packet it already rejected.
             ...(rem?.engineer && rem.reviewer
@@ -792,6 +949,7 @@ export class FactoryController {
             reason: reasons.join(" "),
             engineering: lastEng?.outcome.packet,
             review: lastRev?.outcome.packet,
+            targetPlan: s.targetPlan?.targets,
           }),
         };
       }
@@ -813,7 +971,11 @@ export class FactoryController {
 
   private engineerSpec(kind: "execution" | "remediation", resumeNote?: string): PhaseSpec {
     const s = this.state;
-    const wpId = s.results.proposal?.packet.workPackages[0] ?? FIRST_WORK_PACKAGE;
+    const target = s.targetPlan?.targets.find((item) => item.id === s.targetPlan?.currentTargetId);
+    const remediatedId = kind === "remediation" && s.targetPlan && s.targetPlan.targets.length > 1
+      ? s.results.finalArchitect?.packet.affectedTargetIds?.[0] ?? "integration" : undefined;
+    const scopedTarget = remediatedId ? s.targetPlan?.targets.find((item) => item.id === remediatedId) : target;
+    const wpId = remediatedId ?? target?.id ?? s.results.proposal?.packet.workPackages[0] ?? FIRST_WORK_PACKAGE;
     const repair = s.repairRound > 0 ? lastReviewer(s)?.outcome.packet : undefined;
     const leadEsc = s.results.leadEscalation;
     const remediation = s.results.finalArchitect?.packet;
@@ -822,12 +984,19 @@ export class FactoryController {
       kind: "engineer",
       prompt: engineerPrompt({
         workPackageId: wpId,
+        target: scopedTarget,
+        dependencies: scopedTarget?.dependsOn,
         architecture: s.effectiveArchitecture,
         task: s.task,
         acceptanceCriteria: s.results.proposal?.packet.acceptanceCriteria ?? [],
-        constraints: s.results.proposal?.packet.constraints ?? [],
+        constraints: [...new Set([
+          ...(s.results.proposal?.packet.constraints ?? []),
+          ...(s.results.initialArchitect?.packet.constraints ?? []),
+          ...(s.results.escalationArchitect?.packet.constraints ?? []),
+        ])],
         repairFindings: kind === "execution" ? repair : undefined,
         remediationChanges: kind === "remediation" ? remediation : undefined,
+        remediationScope: kind === "remediation" ? remediatedId : undefined,
         priorDecisions: leadEsc && leadEsc.packet.verdict === "continue"
           ? `Lead guidance: ${leadEsc.packet.guidance}`
           : undefined,
@@ -846,6 +1015,7 @@ export class FactoryController {
         workPackageId: engineer.outcome.packet.workPackageId,
         engineer: engineer.outcome.packet,
         task: s.task,
+        revalidation: s.targetPlan?.revalidationIds?.includes(s.targetPlan.currentTargetId ?? "") ? s.results.finalArchitect?.packet.affectedTargetIds?.[0] : undefined,
       }),
     };
   }
@@ -925,6 +1095,8 @@ export class FactoryController {
       phase,
       round: s.repairRound,
       target,
+      ...(s.targetPlan && (phase === "execution.engineer" || phase === "review.reviewer") && s.targetPlan.currentTargetId ? { targetId: s.targetPlan.currentTargetId } : {}),
+      ...(s.targetPlan && phase === "remediation.engineer" ? { targetId: s.results.finalArchitect?.packet.affectedTargetIds?.[0] ?? "integration" } : {}),
       provenance: "prepared",
       recoveryRisk: spec.role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome",
       preparedAt: this.clock.now(),
@@ -1146,16 +1318,40 @@ export class FactoryController {
       case "initial.architect": {
         const arch = packet as ArchitectInitialResult;
         s.results.initialArchitect = outcome;
-        // APPROVE → proposal stands; CORRECT → the corrected architecture wins.
         s.effectiveArchitecture = arch.approvedArchitecture
           || (arch.verdict === "CORRECT" ? arch.correctedWorkPackages.join("\n") : s.results.proposal?.packet.proposedSolution ?? "");
+        if (s.version === 3) {
+          if (arch.verdict === "CLARIFY") {
+            s.stoppedReason = `Clarification required: ${(arch.clarificationQuestions ?? []).join("; ") || "Architect could not approve the target plan"}`;
+            break;
+          }
+          const proposal = s.results.proposal!.packet;
+          const fallback: FactoryTarget[] = proposal.workPackages.length === 1
+            ? [{ id: TARGET_ID.test(proposal.workPackages[0]) ? proposal.workPackages[0] : "WP0", description: proposal.workPackages[0], dependsOn: [], acceptanceCriteria: proposal.acceptanceCriteria }]
+            : [];
+          const proposedCount = Math.max(proposal.targets?.length ?? 0, proposal.workPackages.length);
+          const requiresExplicitPlan = proposedCount > 1 || (arch.approvedTargets?.length ?? 0) > 1;
+          const targets = arch.approvedTargets ?? (requiresExplicitPlan ? [] : proposal.targets ?? fallback);
+          const errors = validateTargets(targets);
+          if (requiresExplicitPlan && !arch.approvedTargets) errors.push("Multi-target Architect approval must include the complete approvedTargets plan");
+          if (requiresExplicitPlan && !proposal.requirementCatalog?.length) errors.push("Multi-target Lead proposal has no stable original requirement identities");
+          if (requiresExplicitPlan && !arch.planAssessment) errors.push("Multi-target Architect approval must include a complete mission-coverage assessment");
+          if (arch.planAssessment) errors.push(...validateArchitectTargetApproval(proposal, targets, arch.planAssessment, arch.constraints));
+          if ((arch.clarificationQuestions?.length ?? 0) > 0) errors.push("Architect approval contains unresolved clarification questions");
+          if (errors.length > 0) s.stoppedReason = `Invalid Architect target approval: ${[...new Set(errors)].join("; ")}`;
+          else s.targetPlan = createTargetPlan(targets);
+        }
         break;
       }
       case "execution.engineer":
-        s.results.engineers.push({ round: s.repairRound, outcome });
+        if (s.targetPlan && (packet as { workPackageId: string }).workPackageId !== s.targetPlan.currentTargetId) {
+          this.failRun(`Engineer packet target ID does not match dispatched target ${s.targetPlan.currentTargetId}`);
+          return;
+        }
+        s.results.engineers.push({ ...(s.targetPlan ? { targetId: s.targetPlan.currentTargetId } : {}), round: s.repairRound, outcome });
         break;
       case "review.reviewer":
-        s.results.reviewers.push({ round: s.repairRound, outcome });
+        s.results.reviewers.push({ ...(s.targetPlan ? { targetId: s.targetPlan.currentTargetId } : {}), round: s.repairRound, outcome });
         break;
       case "integration.lead": {
         // Deterministic fidelity guard: the Lead may summarize, but it may not
@@ -1193,11 +1389,43 @@ export class FactoryController {
       case "escalation.architect": {
         const arch = packet as ArchitectInitialResult;
         s.architectEscalations++;
+        s.results.escalationArchitect = outcome;
+        if (arch.verdict === "CLARIFY") {
+          s.stoppedReason = `Architect requires clarification: ${(arch.clarificationQuestions ?? []).join("; ")}`;
+          this.applyTransition("STOPPED");
+          return;
+        }
+        if (s.targetPlan && arch.approvedTargets) {
+          const issues = validateTargets(arch.approvedTargets);
+          const old = s.targetPlan;
+          if (arch.approvedTargets.length !== old.targets.length || arch.approvedTargets.some((target, index) => {
+            const previous = old.targets[index];
+            return target.id !== previous.id || (old.outcomes[target.id].status === "passed" && JSON.stringify(target) !== JSON.stringify(previous));
+          })) issues.push("plan revision cannot change identities or previously passed contracts");
+          if (issues.length > 0) {
+            s.stoppedReason = `Unsafe Architect plan revision: ${issues.join("; ")}`;
+            this.applyTransition("STOPPED");
+            return;
+          }
+          old.targets = arch.approvedTargets;
+          old.revision++;
+          old.rationale.push(`Architect reassessment: ${arch.approvedArchitecture}`);
+        } else if (s.targetPlan && s.targetPlan.targets.length > 1 && arch.verdict === "CORRECT") {
+          s.stoppedReason = "Architect correction lacks a safe structured target revision";
+          this.applyTransition("STOPPED");
+          return;
+        }
         s.effectiveArchitecture = arch.approvedArchitecture
           || (arch.verdict === "CORRECT" ? arch.correctedWorkPackages.join("\n") : s.effectiveArchitecture);
+        if (s.targetPlan?.awaitingArchitectAcceptance) {
+          const id = s.targetPlan.currentTargetId!;
+          s.targetPlan.outcomes[id].architectAgentId = info.agentId;
+          s.targetPlan.awaitingArchitectAcceptance = false;
+          s.targetPlan.currentTargetId = undefined;
+        } else {
+          s.repairRound = s.targetPlan && s.targetPlan.targets.length > 1 ? s.repairRound + 1 : 0;
+        }
         s.repairExhausted = false;
-        s.repairRound = 0;
-        s.results.escalationArchitect = outcome;
         break;
       }
       case "escalation.lead": {
@@ -1205,12 +1433,12 @@ export class FactoryController {
         s.leadEscalations++;
         s.results.leadEscalation = outcome;
         if (esc.verdict === "stop") {
-          s.stoppedReason = "Lead decided to stop after the repair loop was exhausted.";
-          this.applyTransition("STOPPED");
+          const action = this.failTargetOrStop("Lead decided to stop after the repair loop was exhausted.");
+          this.applyTransition(action.to, action.note);
           return;
         }
         s.repairExhausted = false;
-        s.repairRound = 0;
+        s.repairRound = s.targetPlan ? s.repairRound + 1 : 0;
         break;
       }
       default:
@@ -1259,6 +1487,7 @@ export class FactoryController {
   private applyTransition(to: FactoryRunState["state"], note?: string): void {
     const from = this.state.state;
     assertTransition(from, to);
+    if (to === "ARCHITECT_ESCALATION") this.state.results.escalationArchitect = undefined;
     if (to === "STOPPED" && note?.trim()) this.state.stoppedReason = note.trim();
     if (from === "WAITING_CAPACITY") {
       this.state.waiting = undefined;
@@ -1297,7 +1526,7 @@ export class FactoryController {
   private commit(): void {
     if (this.disposed) return;
     this.state.updatedAt = this.clock.now();
-    if (this.state.version === 2) {
+    if (this.state.version !== 1) {
       this.state.stateRevision = (this.state.stateRevision ?? 0) + 1;
       this.state.checkpoint = createFactoryCheckpoint(this.state, this.state.stateRevision);
     }
@@ -1392,8 +1621,7 @@ export class FactoryController {
 /* ------------------------------------------------------------------ */
 
 function lastExecutionEngineer(s: FactoryRunState) {
-  const engineers = s.results.engineers;
-  return engineers[engineers.length - 1];
+  return [...s.results.engineers].reverse().find((item) => !s.targetPlan || item.targetId === s.targetPlan.currentTargetId);
 }
 
 /**
@@ -1410,13 +1638,14 @@ function engineerSpawnBlocked(s: FactoryRunState): boolean {
       : undefined;
   if (phase === undefined) return false;
   const attempt = latestAttemptForPhase(s, phase);
-  if (attempt === undefined || attempt.provenance !== "settled_without_valid_packet") return false;
+  if (attempt === undefined) return false;
+  if (attempt.provenance === "settled_validated_packet") return !hasPersistedAttemptPacket(s, attempt);
+  if (attempt.provenance !== "settled_without_valid_packet") return false;
   return attempt.agentId !== undefined || attempt.recoveryRisk === "workspace_may_have_changed";
 }
 
 function lastReviewer(s: FactoryRunState) {
-  const reviewers = s.results.reviewers;
-  return reviewers[reviewers.length - 1];
+  return [...s.results.reviewers].reverse().find((item) => !s.targetPlan || item.targetId === s.targetPlan.currentTargetId);
 }
 
 /** Every finding any Reviewer raised, across every round, in a stable order. */

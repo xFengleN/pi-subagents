@@ -941,6 +941,7 @@ src/
 
   # AI Factory
   ai-factory/         # Deterministic Lead/Architect/Engineer/Reviewer orchestration
+    targets.ts        # Requirement identity coverage, approved target graph, eligibility and blocking
     recovery-model.ts # Strict persisted-state validation, checkpoints, and pure recovery planning
     lease.ts          # Per-run exclusive ownership: leases, liveness probing, fencing
     store.ts           # Atomic, fenced Factory run persistence

@@ -10,6 +10,7 @@
 import type {
   ArchitectFinalResult,
   EngineerPacket,
+  FactoryTarget,
   LeadIntegrationPacket,
   LeadProposalPacket,
   ReviewerPacket,
@@ -29,16 +30,19 @@ export function leadProposalPrompt(task: string): string {
 User goal:
 ${task}
 
-Perform enough repository reconnaissance to ground your proposal (read key files, note the current architecture), then produce a compact architecture packet containing: the original goal, relevant repository findings, the important current architecture, assumptions, the proposed solution, constraints, proposed work packages, dependencies, risks/uncertainties, acceptance criteria, and specific architectural questions for the Architect.
+Perform enough repository reconnaissance to ground your proposal (read key files, note the current architecture), then produce a compact architecture packet containing: the original goal, relevant repository findings, the important current architecture, assumptions, the proposed solution, constraints, proposed work packages, dependencies, risks/uncertainties, acceptance criteria, and specific architectural questions for the Architect. Infer coherent, independently reviewable implementation targets without requiring the user to list milestones. Targets represent implementation deliverables only; give each a stable ID, description, explicit dependsOn IDs, and target-specific acceptance criteria, including its own tests and verification. workPackages is a short summary of those implementation targets, not a separate lifecycle work item. Do not create a target/work package for Factory orchestration: cross-target integration and mission-level validation run after target reviews, final acceptance is the Architect's existing gate, and evidence-based final reporting is the Lead's existing synthesis phase. Keep the requested validation/reporting obligations in humanRequirements and identify the implementation evidence they concern. Separately enumerate humanRequirements: every explicit deliverable, behavioral requirement, and hard constraint from the user's exact request. Record humanDependencies only for ordering/prerequisite edges expressly required by the user, using targetId and dependsOn IDs. Target dependsOn edges not in humanDependencies are technical/inferred proposals, not human-mandated requirements. Respect human-stated requirements, ordering and constraints. Declare independence only when technically justified; resolve meaningful uncertainty with a prerequisite or a clear interface contract, never a guessed dependency from shared file proximity.
 
 ${STRUCTURED}`;
 }
 
 /** Initial Architect checkpoint (INITIAL_ARCHITECT). */
-export function initialArchitectPrompt(proposal: LeadProposalPacket): string {
-  return `You are the Architect — a premium, temporary consultant. A Technical Lead has produced the following architecture proposal. Review it for structural soundness.
+export function initialArchitectPrompt(task: string, proposal: LeadProposalPacket): string {
+  return `You are the Architect — a premium, temporary consultant. Independently assess whether the proposed executable plan covers the original human request and is technically coherent. The controller will execute only the complete approvedTargets packet you return; APPROVE without that explicit plan is not approval for a multi-target mission.
 
-Proposal:
+Original human request (authoritative; do not replace it with the Lead's paraphrase):
+${task}
+
+Lead proposal:
 - Goal: ${proposal.goal}
 - Proposed solution: ${proposal.proposedSolution}
 - Current architecture: ${proposal.currentArchitecture || "(not described)"}
@@ -49,6 +53,10 @@ ${list(proposal.assumptions)}
 ${list(proposal.constraints)}
 - Proposed work packages:
 ${list(proposal.workPackages)}
+- Structured execution targets: ${JSON.stringify(proposal.targets ?? [])}
+- Original requirement identities (code-assigned and authoritative for this run): ${JSON.stringify(proposal.requirementCatalog ?? [])}
+- Lead's human-requirement extraction: ${JSON.stringify(proposal.humanRequirements ?? [])}
+- Explicit human dependency edges (only user-mandated ordering): ${JSON.stringify(proposal.humanDependencies ?? [])}
 - Dependencies: ${proposal.dependencies || "(none)"}
 - Risks:
 ${list(proposal.risks)}
@@ -57,7 +65,9 @@ ${list(proposal.acceptanceCriteria)}
 - Architectural questions:
 ${list(proposal.architecturalQuestions)}
 
-Respond with APPROVE (optionally with constraints/corrections) or CORRECT (a replacement/corrected architecture). One response; there will be no back-and-forth.
+Independently assess every material requirement in the original human request, including requirements omitted or weakened by the Lead. The requirementCatalog contains the authoritative original requirement/constraint identities. In planAssessment.requirementCoverage, map every catalog ID exactly once to the approved implementation target ID(s) whose work/evidence covers it; for cross-target checks or report obligations, attribute the identity to the affected implementation targets while leaving execution of mission-level validation/reporting to the Factory lifecycle. Never key a mapping by paraphrased text or invent/omit an ID. You may paraphrase or split your textual missionRequirements assessment and refine/split/rewrite existing target descriptions, acceptance criteria, dependencies, and inferred architectural constraints; identity is carried by requirementId, not string equality. Assign each implementation target its own specific tests and verification criteria. Report any genuinely uncovered requirement in uncoveredRequirements and set verdict incomplete; an empty uncoveredRequirements list alone is not proof of completeness. Preserve every explicit human constraint in the Architect constraints and list the corresponding IDs in planAssessment.preservedConstraintIds; each human_constraint catalog ID must appear there exactly once. Keep every humanDependencies edge in both missionDependencies and approvedTargets. Technical/inferred dependsOn edges are not user-mandated: you may correct or remove them when the approved graph remains structurally valid. Do not relabel inferred edges as humanDependencies.
+
+Target identity is strict: approvedTargets must contain exactly the same ID set as the Lead's proposed implementation targets—no additions, removals, or renamed IDs. Do not add a target for requested test execution, cross-target integration/mission validation, final Architect acceptance, remediation coordination, or final evidence-based reporting. Those are existing Factory lifecycle responsibilities: integration/validation follows every target's Reviewer PASS, the final Architect makes mission acceptance, and the Lead synthesis reports accepted evidence. If a genuinely missing implementation deliverable cannot be owned by any existing proposed target without dropping/weakened requirements, do not invent an ID or proceed: return CLARIFY with the exact uncovered requirement IDs, missing deliverable, why no proposed target can own it, and request an owner-authorized revised Lead plan. This is a bounded fail-closed outcome; there is no automatic replanning retry or extra Architect call. Set verdict complete only when the original request was independently assessed, all stable IDs have coherent target coverage, all explicit human constraints/dependencies remain, and no material conflict or unsafe gap remains. Return the complete executable graph in approvedTargets on every multi-target APPROVE or CORRECT. Respond CLARIFY when an essential uncertainty cannot be resolved safely. Do not silently override a user restriction. Set requiresArchitectAcceptance only for a genuinely justified target-level architecture gate. One response; there will be no back-and-forth.
 
 ${STRUCTURED}`;
 }
@@ -65,12 +75,15 @@ ${STRUCTURED}`;
 /** Engineer implementation prompt (EXECUTION / REMEDIATION). */
 export function engineerPrompt(input: {
   workPackageId: string;
+  target?: FactoryTarget;
+  dependencies?: string[];
   architecture: string;
   task: string;
   acceptanceCriteria: string[];
   constraints: string[];
   repairFindings?: ReviewerPacket;      // present on repair rounds
   remediationChanges?: ArchitectFinalResult; // present on remediation
+  remediationScope?: string;
   priorDecisions?: string;
   /** Present on an explicitly approved resume of an interrupted Engineer. */
   resumeNote?: string;
@@ -79,10 +92,11 @@ export function engineerPrompt(input: {
     `You are the Engineer in an AI Factory run. Implement ONE coherent work package deterministically and thoroughly.`,
     ``,
     `Work package: ${input.workPackageId}`,
+    ...(input.target ? [`Target deliverable: ${input.target.description}`, `Prerequisites already passed: ${list(input.dependencies)}`] : []),
     `Original goal: ${input.task}`,
     `Approved architecture: ${input.architecture}`,
     `Acceptance criteria:`,
-    list(input.acceptanceCriteria),
+    list(input.target?.acceptanceCriteria ?? input.acceptanceCriteria),
     `Constraints:`,
     list(input.constraints),
   ];
@@ -100,6 +114,7 @@ export function engineerPrompt(input: {
     );
   }
   if (input.remediationChanges) {
+    if (input.remediationScope) parts.push(`Correction scope: ${input.remediationScope}. Do not treat this as a new implementation of another target; preserve passed, unrelated work. Report workPackageId exactly as ${input.remediationScope}.`);
     parts.push(
       `The final Architect requires remediation. Apply these required changes (and do not change the listed do-not-change areas):`,
       `Required changes:`,
@@ -126,11 +141,13 @@ export function reviewerPrompt(input: {
   workPackageId: string;
   engineer: EngineerPacket;
   task: string;
+  revalidation?: string;
 }): string {
   return `You are the Reviewer — an independent implementation-correctness role in an AI Factory run. Answer one question: "Was this implementation done correctly?" You are NOT the Architect; you assess correctness, regressions, edge cases, required tests, unnecessary complexity, contract compliance, and implementation quality — not whether the overall architecture is right.
 
 Task: ${input.task}
 Work package: ${input.workPackageId}
+${input.revalidation ? `Revalidation after upstream correction: ${input.revalidation}. Inspect the current workspace and rerun relevant checks; the earlier PASS is not sufficient.` : ""}
 
 Engineer's completion packet:
 - Status: ${input.engineer.status}
@@ -161,13 +178,17 @@ export function leadIntegrationPrompt(input: {
   architecture: string;
   engineers: EngineerPacket[];
   reviewers: ReviewerPacket[];
+  targetSummary?: string[];
 }): string {
   return `You are the Technical Lead of an AI Factory run. The implementation work is complete. Integrate and verify the whole system, then produce a compact acceptance packet.
 
 Original goal: ${input.task}
 Approved architecture: ${input.architecture}
 
-Completed work packages:
+Reviewed target outcomes:
+${list(input.targetSummary)}
+
+Engineer work packages:
 ${input.engineers.map((e) => `- [${e.workPackageId}] ${e.summary}`).join("\n") || "(none)"}
 
 Reviewer findings — EVERY finding listed below must appear in exactly one of
@@ -175,7 +196,7 @@ reviewerFindingsResolved, reviewerFindingsAcceptedRisk or reviewerFindingsUnreso
 Do not write "None" while a finding is listed, and do not summarize a finding away:
 ${reviewerFindingsBlock(input.reviewers)}
 
-Verify the integrated system (run the relevant tests/checks), then report the acceptance packet: goal, approved architecture, completed work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment.
+Verify the integrated system after all target-specific Engineer/Reviewer checks have passed. Run the requested mission-level tests/checks (including explicit sample or behavior probes from the original request) here; do not delegate this lifecycle phase to an extra implementation target. Then report the acceptance packet: goal, approved architecture, completed implementation work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment.
 
 ${STRUCTURED}`;
 }
@@ -204,6 +225,8 @@ export function finalArchitectPrompt(input: {
   /** Present on the recheck: what the remediation cycle actually changed, so
    * the re-assessment is of the fixed system, not the pre-fix packet. */
   remediation?: { engineer: EngineerPacket; reviewer: ReviewerPacket };
+  targets?: FactoryTarget[];
+  targetOutcomes?: string[];
 }): string {
   const head = input.remediation
     ? "This is the recheck after the remediation cycle you required. Re-assess against your required changes."
@@ -228,6 +251,8 @@ ${list(input.remediation.reviewer.nonBlockingFindings)}`
   return `You are the Architect — a premium, temporary consultant. ${head} You are deciding whether this completed system is the RIGHT architectural/system solution and should be accepted.
 
 Original goal: ${input.task}
+Approved targets: ${JSON.stringify(input.targets ?? [])}
+Target acceptance and revalidation evidence: ${list(input.targetOutcomes)}
 
 Lead's acceptance packet:
 - Approved architecture: ${input.integration.approvedArchitecture}
@@ -248,7 +273,7 @@ ${list(input.integration.reviewerFindingsUnresolved)}
 ${list(input.integration.selectedFiles)}
 - Factual assessment: ${input.integration.factualAssessment}${remediationBlock}
 
-Respond with ACCEPT, or NEEDS_REMEDIATION (with blocking issues, required changes, do-not-change areas, and required evidence). You should not receive every child transcript — assess from this packet.
+Respond with ACCEPT, or NEEDS_REMEDIATION (with blocking issues, required changes, do-not-change areas, and required evidence). On a multi-target rejection identify exactly one affected target in affectedTargetIds, or set integrationOnly=true for a genuinely integration-only correction. Do not request ordinary dispatch of missing targets through remediation. You should not receive every child transcript — assess from this packet.
 
 ${STRUCTURED}`;
 }
@@ -341,17 +366,19 @@ export function architectEscalationPrompt(input: {
   reason: string;
   engineering?: EngineerPacket;
   review?: ReviewerPacket;
+  targetPlan?: FactoryTarget[];
 }): string {
   return `You are the Architect — a premium, temporary consultant. An exceptional structural problem arose during execution and has been escalated to you.
 
 Original goal: ${input.task}
 Current approved architecture: ${input.architecture}
+Current execution targets: ${JSON.stringify(input.targetPlan ?? [])}
 
 Escalation reason: ${input.reason}
 ${input.engineering ? `- Engineer packet: status=${input.engineering.status}, escalation=${input.engineering.architecturalEscalationRequired}\n${input.engineering.summary}` : ""}
 ${input.review ? `- Reviewer: verdict=${input.review.verdict}, architecturalIssue=${input.review.architecturalIssue}\n${input.review.blockingFindings.join("\n") || "(none)"}` : ""}
 
-Determine whether the architecture must change. Respond with APPROVE (architecture stands, with constraints) or CORRECT (a replacement/corrected architecture). One response; there will be no back-and-forth.
+Assess the material dependency or contract issue. Respond APPROVE if the current plan remains safe; CORRECT with approvedTargets only for a bounded, justified revision preserving target IDs and previously completed work; or CLARIFY with questions if safe continuation cannot be established. A changed dependency of a passed target is unsafe without revalidation. One response; there will be no back-and-forth.
 
 ${STRUCTURED}`;
 }

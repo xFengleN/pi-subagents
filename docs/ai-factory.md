@@ -12,10 +12,9 @@ The Factory automates a full coding task as a fixed pipeline:
 USER TASK
   → Lead reconnaissance + architecture proposal
   → mandatory INITIAL_ARCHITECT gate
-  → Engineer implements
-  → Reviewer assesses correctness
-  → bounded Engineer/Reviewer repair loop
-  → Lead integration + system verification
+  → approved targets: Engineer implements → Reviewer assesses correctness
+  → bounded per-target Engineer/Reviewer repair loop, then next eligible target
+  → Lead integration + system verification (only after all targets pass)
   → mandatory FINAL_ARCHITECT acceptance gate
   → (one bounded remediation cycle, one recheck)
   → mandatory FINAL_SYNTHESIS (final Lead report of the accepted state)
@@ -45,6 +44,7 @@ src/ai-factory/
   config.ts       role → model targets, agent types, limits; .pi/factory.json
   metrics.ts      per-role token/cost accounting + run summary
   store.ts        small atomic JSON persistence (.pi/factory/<runId>.json)
+  targets.ts      approved target graph, deterministic serial eligibility/blocking
   clock.ts        injectable clock (fake clock drives multi-hour waits in tests)
   panel.ts        visibility-mode vocabulary, target resolution, compact summary
   panel-widget.ts the compact orchestration widget (above the editor)
@@ -77,9 +77,9 @@ expected to produce; the controller has a lenient prose fallback.
 
 - The controller has **no model client**. It only calls `transport.spawn`,
   `transport.consume`, `transport.stop`, and reacts to lifecycle events.
-- A deterministic transition (Reviewer PASS → INTEGRATION, counter checks,
-  entering/leaving WAITING_CAPACITY, consuming a child result) causes **zero
-  model requests**.
+- A deterministic transition (Reviewer PASS → next eligible target, or to
+  INTEGRATION when all approved targets passed; counter checks; capacity
+  waiting; consuming a child result) causes **zero model requests**.
 - The only model-mediated dispatches are the role runs themselves; there is no
   "ask the Lead what to do next" consult, no message relay between Engineer and
   Reviewer (the controller mediates with only the concrete findings).
@@ -89,13 +89,13 @@ expected to produce; the controller has a lenient prose fallback.
 ```
 START → DISCOVERY ──Lead proposal──▶ INITIAL_ARCHITECT ──APPROVE/CORRECT──▶ EXECUTION
 EXECUTION ──Engineer packet──▶ REVIEW
-REVIEW ──PASS──▶ INTEGRATION
+REVIEW ──PASS──▶ next eligible target's EXECUTION; all passed ──▶ INTEGRATION
 REVIEW ──NEEDS_FIX, rounds left──▶ EXECUTION            (bounded local loop)
 REVIEW / EXECUTION ──architectural──▶ ARCHITECT_ESCALATION ──Architect──▶ EXECUTION
 INTEGRATION ──Lead acceptance packet──▶ FINAL_ARCHITECT
 FINAL_ARCHITECT ──ACCEPT──▶ FINAL_SYNTHESIS
 FINAL_ARCHITECT ──NEEDS_REMEDIATION, rounds left──▶ REMEDIATION
-REMEDIATION ──Engineer + Reviewer──▶ FINAL_ARCHITECT_RECHECK
+REMEDIATION ──Engineer + Reviewer PASS──▶ dependent revalidation (when needed) ──▶ FINAL_ARCHITECT_RECHECK
 FINAL_ARCHITECT_RECHECK ──ACCEPT──▶ FINAL_SYNTHESIS
 FINAL_ARCHITECT_RECHECK ──reject (budget spent)──▶ STOPPED
 FINAL_SYNTHESIS ──Lead report persisted──▶ DONE
@@ -114,6 +114,81 @@ remain preserved as audit history.
 Illegal transitions are rejected programmatically (`assertTransition`), so a
 run can never skip a mandatory checkpoint (e.g. Engineer before the initial
 Architect).
+
+### Approved target plan
+
+New runs persist version-3 `targetPlan` alongside the approved architecture.
+The Lead proposes structured targets (`id`, `description`, `dependsOn`,
+`acceptanceCriteria`, optional `requiresArchitectAcceptance`) and extracts
+explicit human requirements, constraints, and dependencies. Before Architect
+review, code assigns deterministic per-run IDs (`REQ-001`, …) to the Lead's
+requirement/constraint inventory and persists that catalog with the original
+task and proposal. The initial Architect receives those ID/text pairs, assesses
+the original request, maps each ID exactly once to approved target IDs, marks
+preserved constraint IDs, reports uncovered requirements, and returns the
+complete `approvedTargets` graph. Coverage identity is the ID, not requirement
+wording: Architect assessment text may paraphrase or split requirements and
+acceptance criteria may be refined, split, or rewritten. A missing, duplicate,
+unknown, or unmapped ID still rejects approval, as does an unpreserved explicit
+constraint, unresolved coverage, removal of a user-mandated dependency, or an
+invalid graph. Architect approval must contain exactly the Lead's proposed
+implementation target ID set: it may refine descriptions, criteria, inferred
+dependencies, and architectural constraints, but may not add, remove, or rename
+targets. Requested target-specific tests belong to those targets. Cross-target
+validation/integration, the final Architect acceptance gate, and evidence-based
+final reporting remain in the existing Factory lifecycle, not implementation
+targets. Requirements about those lifecycle activities remain in the REQ
+catalog and are attributed to the affected implementation targets for coverage;
+the lifecycle still executes the system-level checks and report. If a genuine
+implementation deliverable cannot be assigned to any existing target without
+weakening a requirement, Architect must return CLARIFY with the exact REQ IDs,
+missing deliverable, reason, and request for an owner-authorized revised Lead
+plan. This stops the run before engineering; it does not trigger an automatic
+retry or another Architect call. For multi-target runs the explicit graph and
+assessment are mandatory even for APPROVE; an unchanged Lead proposal is not
+implicitly Architect approval. `dependsOn` edges listed separately as
+`humanDependencies` are user-mandated; other proposed edges are
+technical/inferred and may be corrected without claiming the user required
+that ordering. CLARIFY or incomplete approval stops safely.
+
+The controller verifies graph structure, preserves explicit human dependency
+edges, and checks the Architect's identity mappings and constraint assertions.
+It cannot independently prove that the Lead extracted every original
+requirement or that a mapped target truly satisfies one: semantic mission
+coverage remains an Architect judgment and requires live-model/human
+assessment. Multiple plain-text work packages without explicit
+Architect-approved targets do **not** silently collapse into WP0. A legacy
+one-package request retains its economical fallback without extra role calls.
+Historical snapshots without the ID catalog retain their original
+validation/recovery semantics and are never rewritten; new multi-target plans
+require the identity-aware assessment.
+
+The scheduler considers targets in declaration order, choosing the first whose
+prerequisites have Reviewer PASS evidence. One Engineer/Reviewer pair runs at a
+time in the **same working tree**; there are no parallel worktrees or automatic
+integration merges. A target that exhausts its correction allowance fails,
+transitively blocks dependents, and does not prevent independent targets from
+running. Integration and mission-level acceptance require *every* target to
+pass; a partial result remains STOPPED. A per-target Architect check runs only
+when explicitly required or escalated; unsafe amendments of accepted target
+contracts are rejected rather than quietly replayed. Reviewer PASS is the
+normal per-target acceptance gate; the final Architect remains the mission gate.
+
+For multi-target final rejections the Architect must specify exactly one
+`affectedTargetIds` entry, or `integrationOnly: true`. Remediation is restricted
+to that scope; passed dependents of a corrected target receive fresh Reviewer
+revalidation in dependency order before final recheck, even if targets were
+declared out of order. An interrupted run labels unreviewed dependents as
+awaiting revalidation, not completed. A failed scoped remediation marks its
+target failed and passed dependents blocked instead of retaining stale PASS
+status. A failed dependent revalidation blocks only that target's actual
+descendants; independent affected siblings continue through revalidation
+before the mission stops without acceptance. If a correction affects a target
+that requires renewed Architect acceptance, the run stops rather than treating
+stale approval as valid. Scope that cannot be identified uniquely also stops;
+unresolved work needs a new explicitly scoped task. The pre-remediation
+integration packet remains historical, not an assertion that the corrected
+workspace was integrated.
 
 ## Configuration
 
@@ -255,11 +330,14 @@ difficulty.
 ## Persistence
 
 Run state lives at `<cwd>/.pi/factory/<runId>.json` (atomic write, versioned).
-It holds packets and references only — never child transcripts. On restart:
+It holds packets and references only — never child transcripts. Version-3
+snapshots also hold target order, dependencies, statuses, per-target Reviewer
+and Engineer evidence IDs, the active target and revalidation queue. On restart:
 
-- completed phases are never re-run (their packets are in the store);
-- an in-flight phase (whose in-process agent died with the process) is treated
-  as a failed attempt and re-attempted deterministically;
+- completed targets and phases are never re-run (their packets are in the store);
+- an interrupted Engineer with uncertain workspace effects requires the
+  existing explicit recovery approval before any new attempt; a clean accepted
+  target boundary safely selects its next eligible target;
 - a `WAITING_CAPACITY` run restores its `nextRetryAt` and wakes on the clock.
 
 `results.finalReport` is the final Lead synthesis for the actual accepted
@@ -310,6 +388,7 @@ normal rendered message at the bottom: the same single-source formatter
 through pi's custom-message renderer (the same mechanism pi-subagents uses for
 its completion notifications). `DONE` keeps its accepted final synthesis.
 `STOPPED` keeps its rejecting verdict and includes the failed gate, counters,
+per-target passed/failed/blocked/not-attempted/awaiting-revalidation status and packet-sourced artifacts,
 available partial/incomplete-work and validation evidence, a bounded recovery
 recommendation, and the artifact path; `FAILED` is explicitly labelled as a
 runtime/unrecoverable failure rather than a controlled rejection. Missing
@@ -373,8 +452,9 @@ them the roles fall back to `general-purpose` (still isolated).
 
 ## Known limitations
 
-- MVP runs **one Engineer** implementing the scope as one coherent work
-  package; multiple work packages run sequentially, not in parallel.
+- One Engineer runs at a time, even for multiple approved targets. Semantic
+  coverage and dependency intent remain Architect judgments; the controller
+  validates structure and order, not the truth of repository descriptions.
 - A repair "round" spawns a fresh Engineer with the concrete findings; true
   in-session resume/steer of the same child is not exposed over the RPC bus and
   is deferred.

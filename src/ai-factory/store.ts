@@ -18,7 +18,7 @@ import {
   createFactoryCheckpoint,
   parseFactoryRunState,
 } from "./recovery-model.js";
-import { FACTORY_STATE_VERSION, type FactoryRunState } from "./types.js";
+import { type FactoryRunState, LEGACY_FACTORY_STATE_VERSION } from "./types.js";
 
 export const FACTORY_DIR = ".pi/factory";
 
@@ -165,7 +165,7 @@ export class FactoryStore {
             `Cannot write run ${next.runId}: stale ownership token; the run is now owned by ${lease.owner.pid} on ${lease.owner.hostname}`,
           );
         }
-        if (existing?.version === FACTORY_STATE_VERSION && typeof existing.stateRevision === "number" && (next.stateRevision ?? 0) < existing.stateRevision) {
+        if (existing && existing.version !== LEGACY_FACTORY_STATE_VERSION && typeof existing.stateRevision === "number" && (next.stateRevision ?? 0) < existing.stateRevision) {
           throw new FactoryLeaseError(
             `Cannot write run ${next.runId}: stale state revision ${next.stateRevision ?? 0} is behind persisted revision ${existing.stateRevision}`,
           );
@@ -173,11 +173,11 @@ export class FactoryStore {
       }
     }
 
-    // Direct test/tools edits of a v2 snapshot are still serialized as a new
+    // Direct test/tools edits of a recovery snapshot are serialized as a new
     // checkpoint rather than silently reusing a revision. Controller commits
     // already advance the revision before calling save().
-    if (next.version === FACTORY_STATE_VERSION) {
-      if (existing?.version === FACTORY_STATE_VERSION && typeof existing.stateRevision === "number" && (next.stateRevision ?? 0) <= existing.stateRevision) {
+    if (next.version !== LEGACY_FACTORY_STATE_VERSION) {
+      if (existing && existing.version !== LEGACY_FACTORY_STATE_VERSION && typeof existing.stateRevision === "number" && (next.stateRevision ?? 0) <= existing.stateRevision) {
         next.stateRevision = existing.stateRevision + 1;
         next.checkpoint = createFactoryCheckpoint(next, next.stateRevision);
       }

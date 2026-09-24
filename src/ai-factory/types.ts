@@ -60,18 +60,59 @@ export interface LeadProposalPacket {
   proposedSolution: string;
   constraints: string[];
   workPackages: string[];
+  /** Executable decomposition for new runs; prose workPackages remains an audit summary. */
+  targets?: FactoryTarget[];
+  /** Human requirements extracted from the original task, kept distinct from inferred design choices. */
+  humanRequirements?: string[];
+  /** Deterministic identities assigned to original requirements and explicit constraints before Architect review. */
+  requirementCatalog?: FactoryMissionRequirement[];
+  /** Explicit task-level dependency edges, represented by the proposed target identities. */
+  humanDependencies?: FactoryDependency[];
   dependencies: string;
   risks: string[];
   acceptanceCriteria: string[];
   architecturalQuestions: string[];
 }
 
+/** An original Lead requirement/constraint with a run-stable identity. */
+export interface FactoryMissionRequirement {
+  id: string;
+  text: string;
+  source: "human_requirement" | "human_constraint";
+}
+
+/** An explicit human-stated dependency edge between proposed targets. */
+export interface FactoryDependency {
+  targetId: string;
+  dependsOn: string;
+}
+
+/** Architect's structured mission-coverage assessment for the approved plan. */
+export interface ArchitectPlanAssessment {
+  verdict: "complete" | "incomplete";
+  /** Requirements independently identified from the original user request. */
+  missionRequirements: string[];
+  /** Explicit dependency edges independently identified from the original request. */
+  missionDependencies: FactoryDependency[];
+  /** New plans map stable Lead requirement identities; string-keyed entries remain for historical snapshots only. */
+  requirementCoverage: Array<{ requirementId: string; targetIds: string[] } | { requirement: string; targetIds: string[] }>;
+  /** Constraint identities explicitly retained in Architect constraints; absent only in historical assessments. */
+  preservedConstraintIds?: string[];
+  uncoveredRequirements: string[];
+}
+
 /** Initial Architect checkpoint result. */
 export interface ArchitectInitialResult {
-  verdict: "APPROVE" | "CORRECT";
+  verdict: "APPROVE" | "CORRECT" | "CLARIFY";
   approvedArchitecture: string;
   constraints: string[];
   correctedWorkPackages: string[];
+  /** Complete executable plan explicitly approved by the Architect. */
+  approvedTargets?: FactoryTarget[];
+  /** Required for multi-target approval; semantic coverage remains model-judged. */
+  planAssessment?: ArchitectPlanAssessment;
+  /** Explicit unresolved questions: no execution may proceed on CLARIFY. */
+  clarificationQuestions?: string[];
   importantRisks: string[];
 }
 
@@ -118,6 +159,9 @@ export interface LeadIntegrationPacket {
 /** Final Architect acceptance-checkpoint result. */
 export interface ArchitectFinalResult {
   verdict: "ACCEPT" | "NEEDS_REMEDIATION";
+  /** Explicit correction ownership on multi-target missions. */
+  affectedTargetIds?: string[];
+  integrationOnly?: boolean;
   blockingIssues: string[];
   requiredChanges: string[];
   doNotChange: string[];
@@ -237,11 +281,13 @@ export interface RoleOutcome<T> {
 }
 
 export interface EngineerOutcome {
+  targetId?: string;
   round: number;
   outcome: RoleOutcome<EngineerPacket>;
 }
 
 export interface ReviewerOutcome {
+  targetId?: string;
   round: number;
   outcome: RoleOutcome<ReviewerPacket>;
 }
@@ -304,8 +350,41 @@ export interface FactoryError {
 }
 
 export const LEGACY_FACTORY_STATE_VERSION = 1 as const;
-export const FACTORY_STATE_VERSION = 2 as const;
-export type FactoryStateVersion = typeof LEGACY_FACTORY_STATE_VERSION | typeof FACTORY_STATE_VERSION;
+export const RECOVERY_FACTORY_STATE_VERSION = 2 as const;
+export const FACTORY_STATE_VERSION = 3 as const;
+export type FactoryStateVersion = typeof LEGACY_FACTORY_STATE_VERSION | typeof RECOVERY_FACTORY_STATE_VERSION | typeof FACTORY_STATE_VERSION;
+
+/** A coherent, independently reviewable deliverable in the approved plan. */
+export interface FactoryTarget {
+  id: string;
+  description: string;
+  dependsOn: string[];
+  acceptanceCriteria: string[];
+  requiresArchitectAcceptance?: boolean;
+}
+
+export interface FactoryTargetOutcome {
+  status: "pending" | "active" | "passed" | "failed" | "blocked";
+  reason?: string;
+  blockedBy?: string[];
+  engineerAgentId?: string;
+  reviewerAgentId?: string;
+  architectAgentId?: string;
+}
+
+/** Serial target progression; absent on version 1/2 runs (never inferred on restore). */
+export interface FactoryTargetPlan {
+  targets: FactoryTarget[];
+  outcomes: Record<string, FactoryTargetOutcome>;
+  currentTargetId?: string;
+  revision: number;
+  rationale: string[];
+  /** A mandatory per-target Architect gate after Reviewer PASS, when requested. */
+  awaitingArchitectAcceptance?: boolean;
+  /** Passed dependents needing Reviewer-only validation after a scoped correction. */
+  revalidationIds?: string[];
+}
+
 
 /** Durable provenance for one role invocation. */
 export type AttemptProvenance =
@@ -331,6 +410,8 @@ export interface FactoryAttempt {
   phase: string;
   round: number;
   target: string;
+  /** Approved work target, distinct from the model target above (v3). */
+  targetId?: string;
   provenance: AttemptProvenance;
   recoveryRisk: AttemptRecoveryRisk;
   preparedAt: number;
@@ -368,6 +449,7 @@ export interface FactoryCheckpoint {
   leadEscalations: number;
   attemptId?: string;
   agentId?: string;
+  targetId?: string;
 }
 
 export interface FactoryRunState {
@@ -405,14 +487,16 @@ export interface FactoryRunState {
   stoppedReason?: string;
   /** True when the run is parked waiting for capacity or a backoff retry. */
   parked: boolean;
-  /** Monotonically increasing persisted snapshot revision (required for v2). */
+  /** Monotonically increasing persisted snapshot revision (required for v2/v3). */
   stateRevision?: number;
-  /** Durable identity of this exact persisted recovery checkpoint (required for v2). */
+  /** Durable identity of this exact persisted recovery checkpoint (required for v2/v3). */
   checkpoint?: FactoryCheckpoint;
-  /** Append-only attempt provenance (required for v2). */
+  /** Append-only attempt provenance (required for v2/v3). */
   attempts?: FactoryAttempt[];
   /** Optional preset replacement for future children (original config kept). */
   presetReplacement?: PresetReplacement;
+  /** Version 3 only: the approved, durable execution contract. */
+  targetPlan?: FactoryTargetPlan;
 }
 
 /* -------------------------------------------------------------------------- */

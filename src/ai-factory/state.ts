@@ -7,7 +7,7 @@
  * mandatory checkpoint.
  */
 
-import { unresolvedSpawnAttempt } from "./recovery-model.js";
+import { hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedSpawnAttempt } from "./recovery-model.js";
 import { type FactoryRecoveryEligibility, type FactoryRunState, type FactoryState, TERMINAL_STATES } from "./types.js";
 
 export { createFactoryCheckpoint, planFactoryRecovery, unresolvedSpawnAttempt } from "./recovery-model.js";
@@ -44,12 +44,12 @@ export { createFactoryCheckpoint, planFactoryRecovery, unresolvedSpawnAttempt } 
 const TRANSITIONS: Record<FactoryState, readonly FactoryState[]> = {
   DISCOVERY: ["INITIAL_ARCHITECT", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   INITIAL_ARCHITECT: ["EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  EXECUTION: ["REVIEW", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  REVIEW: ["INTEGRATION", "EXECUTION", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  EXECUTION: ["REVIEW", "INTEGRATION", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  REVIEW: ["INTEGRATION", "EXECUTION", "ARCHITECT_ESCALATION", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   ARCHITECT_ESCALATION: ["EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   INTEGRATION: ["FINAL_ARCHITECT", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   FINAL_ARCHITECT: ["FINAL_SYNTHESIS", "REMEDIATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  REMEDIATION: ["FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  REMEDIATION: ["REVIEW", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   FINAL_ARCHITECT_RECHECK: ["FINAL_SYNTHESIS", "STOPPED", "WAITING_CAPACITY", "FAILED"],
   FINAL_SYNTHESIS: ["DONE", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   WAITING_CAPACITY: [
@@ -122,6 +122,8 @@ function computeCheckpointId(state: FactoryRunState): string {
   // durable Task-1 identity is exposed separately as `checkpoint` by the
   // recovery model and includes run id, progress, invocation, and revision.
   const s = state.state;
+  const scope = state.version === 3 && (state.targetPlan?.targets.length ?? 0) > 1
+    ? `:target=${state.targetPlan?.currentTargetId ?? state.results.finalArchitect?.packet.affectedTargetIds?.[0] ?? "none"}:revision=${state.stateRevision ?? 0}` : "";
 
   // Terminal states
   if (s === "DONE" || s === "STOPPED" || s === "FAILED") {
@@ -130,7 +132,7 @@ function computeCheckpointId(state: FactoryRunState): string {
 
   // WAITING_CAPACITY: park state
   if (s === "WAITING_CAPACITY") {
-    return `WAITING_CAPACITY:${state.waiting?.phase ?? "unknown"}`;
+    return `WAITING_CAPACITY:${state.waiting?.phase ?? "unknown"}${scope}`;
   }
 
   // Active states with an in-flight agent: interrupted mid-invocation.
@@ -138,16 +140,16 @@ function computeCheckpointId(state: FactoryRunState): string {
   // Engineer spawn in a later repair round gets a different agentId, making
   // a stale approval token invalid.
   if (state.inFlight !== undefined) {
-    return `${s}:${state.inFlight.phase}:${state.inFlight.agentId}`;
+    return `${s}:${state.inFlight.phase}:${state.inFlight.agentId}${scope}`;
   }
 
   // Active states parked on backoff: safe to resume
   if (state.parked) {
-    return `${s}:parked`;
+    return `${s}:parked${scope}`;
   }
 
   // Clean boundary: no in-flight, not parked
-  return `${s}:clean`;
+  return `${s}:clean${scope}`;
 }
 
 export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecoveryEligibility {
@@ -241,6 +243,20 @@ export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecove
   // dispatched whose outcome is unknown. Automatic replay is never allowed;
   // only explicit approval may authorize it. This is checked before the
   // in-flight and parked branches so it cannot be masked by either flag.
+  const currentPhase = state.inFlight?.phase ?? state.waiting?.phase ?? (s === "EXECUTION" ? "execution.engineer" : s === "REMEDIATION" ? "remediation.engineer" : undefined);
+  const currentAttempt = currentPhase === undefined ? undefined : latestAttemptForPhase(state, currentPhase);
+  if (currentAttempt?.provenance === "settled_validated_packet"
+    && (currentPhase === "execution.engineer" || currentPhase === "remediation.engineer")
+    && !hasPersistedAttemptPacket(state, currentAttempt)) {
+    return {
+      eligible: true,
+      reason: `Validated Engineer provenance for ${currentPhase} has no matching persisted packet`,
+      requiresApproval: true,
+      notes: ["The run will not replay this Engineer automatically.", "Explicit approval is required before retrying the uncertain workspace operation."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
   const unresolved = unresolvedSpawnAttempt(state);
   if (unresolved !== undefined) {
     return {
@@ -294,6 +310,16 @@ export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecove
   // However, if the current phase is one that modifies files (Engineer),
   // we flag it for user approval because the Engineer may have left partial
   // workspace changes before producing its result packet.
+  if (state.version === 3 && s === "EXECUTION" && state.targetPlan && !state.targetPlan.currentTargetId) {
+    return {
+      eligible: true,
+      reason: "Accepted target checkpoint; the next eligible target has not been dispatched",
+      requiresApproval: false,
+      notes: ["All completed targets have persisted Reviewer PASS evidence.", "No successor Engineer attempt has started."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
   const phaseRequiresApproval = s === "EXECUTION" || s === "REMEDIATION";
 
   return {

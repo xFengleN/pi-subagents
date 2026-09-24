@@ -157,7 +157,7 @@ an explicit approval may authorize the replay.
 - lease-backed store + no token while a lease exists → rejected;
 - token that does not match the current lease → rejected (stale owner);
 - no valid lease while a token is supplied → rejected (ownership lost);
-- a v2 state whose `stateRevision` is behind the persisted revision → rejected,
+- a v2/v3 state whose `stateRevision` is behind the persisted revision → rejected,
   so a stale snapshot can never silently overwrite newer state.
 
 A fenced commit that is rejected makes the controller **inert** (`hasOwnership()`
