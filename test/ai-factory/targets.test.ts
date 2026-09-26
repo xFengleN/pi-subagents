@@ -23,7 +23,7 @@ function make(targets: FactoryTarget[], overrides: Partial<FactoryConfig> = {}) 
 const target = (id: string, dependsOn: string[] = []): FactoryTarget => ({ id, description: `Deliver ${id}`, dependsOn, acceptanceCriteria: [`Test ${id}`] });
 function proposalFor(targets: FactoryTarget[], extra: Record<string, unknown> = {}) {
   const proposal = { ...packets.proposal, workPackages: targets.map((item) => item.id), targets, humanRequirements: ["Implement all requested targets"], ...extra };
-  return { ...proposal, requirementCatalog: createRequirementCatalog(proposal.humanRequirements, proposal.constraints) };
+  return { ...proposal, requirementCatalog: createRequirementCatalog(proposal.humanRequirements, proposal.constraints, proposal.missionRequirements ?? []) };
 }
 
 function architectApproval(proposal: ReturnType<typeof proposalFor>, targets: FactoryTarget[], extra: Record<string, unknown> = {}) {
@@ -67,6 +67,21 @@ async function review(m: ReturnType<typeof make>, id: string, verdict: unknown =
 }
 
 describe("AI Factory — persisted serial targets", () => {
+  it("does not require target coverage for explicitly classified mission/report metadata", () => {
+    const targets = [target("WP0")];
+    const proposal = proposalFor(targets, { missionRequirements: ["Include the Reviewer verdict in the final report"] });
+    const implementationIds = proposal.requirementCatalog.filter((item) => item.source !== "mission_requirement").map((item) => item.id);
+    const assessment = {
+      verdict: "complete" as const,
+      missionRequirements: ["Implement all requested targets", "Include the Reviewer verdict in the final report"],
+      missionDependencies: [],
+      requirementCoverage: implementationIds.map((requirementId) => ({ requirementId, targetIds: ["WP0"] })),
+      preservedConstraintIds: proposal.requirementCatalog.filter((item) => item.source === "human_constraint").map((item) => item.id),
+      uncoveredRequirements: [],
+    };
+    expect(validateArchitectTargetApproval(proposal, targets, assessment, proposal.constraints)).toEqual([]);
+    expect(proposal.requirementCatalog.find((item) => item.source === "mission_requirement")?.id).toBe("REQ-003");
+  });
   it("executes three dependent targets and gates mission integration until all pass", async () => {
     const m = make([target("WP0"), target("WP1", ["WP0"]), target("WP2", ["WP1"])]);
     await approve(m);

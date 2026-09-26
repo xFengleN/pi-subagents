@@ -42,6 +42,15 @@ describe("AI Factory — packets", () => {
     expect(parsePacket("reviewer", JSON.stringify({ verdict: "MAYBE" }), undefined)).toBeUndefined();
   });
 
+  it("requires structured warning dispositions in new final reports", () => {
+    const packet = parsePacket("final_report", JSON.stringify({
+      result: "PASS", summary: "Complete",
+      warningDecisions: [{ findingId: "WARN-001", disposition: "superseded", supersededBy: "Target T2 implements the component" }],
+    }), undefined);
+    expect(packet).toMatchObject({ warningDecisions: [{ findingId: "WARN-001", disposition: "superseded" }] });
+    expect(parsePacket("final_report", JSON.stringify({ result: "PASS", summary: "Complete" }), undefined)).toBeUndefined();
+  });
+
   it("normalizes engineer packets including the escalation flag", () => {
     const packet = parsePacket("engineer", JSON.stringify({
       status: "completed",

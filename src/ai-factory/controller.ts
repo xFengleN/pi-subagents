@@ -18,23 +18,29 @@ import { appendCallMetric, emptyFactoryMetrics, recordSettleMetrics } from "./me
 import { type PacketKind, packetSchema, parsePacketTyped } from "./packets.js";
 import {
   architectEscalationPrompt,
+  conformanceArchitectPrompt,
   engineerPrompt,
+  executionContractPrompt,
   finalArchitectPrompt,
   finalReportPrompt,
   initialArchitectPrompt,
+  integratedReviewPrompt,
   leadEscalationPrompt,
   leadIntegrationPrompt,
   leadProposalPrompt,
+  leanFinalReportPrompt,
   reviewerPrompt,
   roleDescription,
 } from "./prompts.js";
 import { createFactoryCheckpoint, hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
+import { applyReportWarningDecisions, collectReportWarningEvidence } from "./report-warnings.js";
 import { assertTransition, assessRecoveryEligibility, isTerminal } from "./state.js";
 import type { FactoryStore } from "./store.js";
 import { blockFailedDependencies, createTargetPlan, dependentsInOrder, nextEligibleTarget, TARGET_ID, validateArchitectTargetApproval, validateTargets } from "./targets.js";
 import { type AgentSettleInfo, classifyError, type FactoryTransport, type SpawnRequest } from "./transport.js";
 import {
   type ArchitectInitialResult,
+  type ExecutionContractPacket,
   FACTORY_STATE_VERSION,
   type FactoryAttempt,
   type FactoryConfig,
@@ -42,6 +48,8 @@ import {
   type FactoryResumeResult,
   type FactoryRunState,
   type FactoryTarget,
+  type FinalReportPacket,
+  type IntegratedReviewPacket,
   type LeadEscalationPacket,
   type LeadIntegrationPacket,
   type ReviewerOutcome,
@@ -49,12 +57,15 @@ import {
   ROLE_NAMES,
   type RoleName,
 } from "./types.js";
+import { verifyFactoryTarget } from "./verifier.js";
+import { type FactoryWorkflowMode, workflowMode, workflowPolicy } from "./workflow-policy.js";
 
 export interface FactoryControllerDeps {
   transport: FactoryTransport;
   clock: Clock;
   store: FactoryStore;
   config: FactoryConfig;
+  verifyTarget?: (cwd: string, targetId: string, instruction: { command?: string; evidence: string; ownerPending?: boolean }) => Promise<{ status: "passed" | "failed" | "owner_pending" | "unavailable"; evidence: string; command?: string }>;
 }
 
 /** One spawn phase: which role, which packet schema, and the exact prompt. */
@@ -94,6 +105,9 @@ export class FactoryController {
   private config: FactoryConfig;
   private readonly runId: string;
   private readonly cwd: string;
+  private readonly verifyTarget: NonNullable<FactoryControllerDeps["verifyTarget"]>;
+  private readonly workflow: FactoryWorkflowMode;
+  private verificationPending = false;
   /** Task 2 fencing token binding every commit to exclusive ownership. */
   private leaseToken: string | undefined;
   /** True once a fenced commit was rejected: the controller no longer owns the
@@ -129,6 +143,8 @@ export class FactoryController {
     this.config = state.presetReplacement?.snapshot ?? state.config ?? deps.config;
     this.runId = state.runId;
     this.cwd = state.cwd;
+    this.verifyTarget = deps.verifyTarget ?? verifyFactoryTarget;
+    this.workflow = workflowMode(state);
     this.state = state;
     this.unsubs.push(
       this.transport.onStarted((id) => this.onStarted(id)),
@@ -138,7 +154,7 @@ export class FactoryController {
   }
 
   /** Create a brand-new run and persist its initial state. */
-  static create(deps: FactoryControllerDeps, runId: string, task: string, cwd: string): FactoryController {
+  static create(deps: FactoryControllerDeps, runId: string, task: string, cwd: string, mode: FactoryWorkflowMode = "full"): FactoryController {
     // Exclusive ownership first: a lease-backed store throws FactoryLeaseError
     // when another live owner holds the run, so no state is created or written
     // by a losing contender.
@@ -152,6 +168,7 @@ export class FactoryController {
       task,
       cwd,
       config: deps.config,
+      workflow: { mode },
       state: "DISCOVERY",
       repairRound: 0,
       repairExhausted: false,
@@ -555,7 +572,53 @@ export class FactoryController {
     }
     // Packet and validated provenance become durable in one atomic snapshot.
     this.commit();
+    if (this.workflow !== "full" && (phase === "execution.engineer" || phase === "remediation.engineer")) {
+      if ((packet as { architecturalEscalationRequired: boolean }).architecturalEscalationRequired) {
+        this.stop("Engineer requested architectural escalation. Execution workflows stop for an owner decision; no Architect redesign is automatic.");
+        return;
+      }
+      if ((packet as { status: string }).status !== "completed") {
+        this.stop(`Engineer did not complete ${this.state.targetPlan?.currentTargetId ?? "the target"}`);
+        return;
+      }
+      if (phase === "remediation.engineer" && this.state.results.finalArchitect?.packet.integrationOnly) void this.drive();
+      else void this.verifyCompletedTarget();
+      return;
+    }
     void this.drive();
+  }
+
+  private async verifyCompletedTarget(): Promise<void> {
+    if (this.disposed || this.ownershipLost) return;
+    const plan = this.state.targetPlan;
+    const id = plan?.currentTargetId
+      ?? this.state.results.remediation?.engineer?.packet.workPackageId
+      ?? this.state.results.finalArchitect?.packet.affectedTargetIds?.[0];
+    const contract = this.state.results.executionProposal?.packet;
+    if (!plan || !id || !contract) return;
+    if (!plan.currentTargetId && plan.outcomes[id]) plan.currentTargetId = id;
+    const instruction = contract.verification[id];
+    if (!instruction) {
+      plan.outcomes[id].verification = { status: "unavailable", evidence: "No verification instruction supplied for target" };
+      this.commit();
+      void this.drive();
+      return;
+    }
+    this.verificationPending = true;
+    try {
+      const result = await this.verifyTarget(this.cwd, id, instruction);
+      if (this.disposed || this.ownershipLost) return;
+      plan.outcomes[id].verification = result;
+      this.commit();
+    } catch (error) {
+      if (!this.disposed && !this.ownershipLost) {
+        plan.outcomes[id].verification = { status: "failed", evidence: `Verification failed: ${error instanceof Error ? error.message : String(error)}` };
+        this.commit();
+      }
+    } finally {
+      this.verificationPending = false;
+    }
+    if (!this.disposed && !this.ownershipLost) void this.drive();
   }
 
   /* ------------------------------------------------------------------ */
@@ -578,6 +641,7 @@ export class FactoryController {
     if (engineerSpawnBlocked(s) && !this.resumeApproved) return undefined;
     if (isTerminal(s.state) || s.inFlight) return undefined;
     if (s.parked) return this.parkedAction();
+    if (this.workflow !== "full") return this.nextExecutionWorkflowAction();
 
     switch (s.state) {
       case "DISCOVERY":
@@ -611,7 +675,8 @@ export class FactoryController {
           return this.failTargetOrStop("repair loop exhausted after the Lead escalation budget");
         }
         const lastEngineer = lastExecutionEngineer(s);
-        if (!lastEngineer || lastEngineer.round !== s.repairRound) return { kind: "spawn", phase: "execution.engineer" };
+        const activeOutcome = s.targetPlan?.currentTargetId ? s.targetPlan.outcomes[s.targetPlan.currentTargetId] : undefined;
+        if (!lastEngineer || lastEngineer.round !== s.repairRound || (activeOutcome !== undefined && lastEngineer.outcome.agentId !== activeOutcome.engineerAgentId)) return { kind: "spawn", phase: "execution.engineer" };
         return { kind: "transition", to: "REVIEW" };
       }
       case "REVIEW": {
@@ -733,6 +798,150 @@ export class FactoryController {
     }
   }
 
+  /** Lifecycle for the execution-focused policies. FULL remains below unchanged. */
+  private nextExecutionWorkflowAction(): Action | undefined {
+    const s = this.state;
+    const policy = workflowPolicy(this.workflow);
+    switch (s.state) {
+      case "DISCOVERY":
+        return s.results.executionProposal ? { kind: "transition", to: "EXECUTION" } : { kind: "spawn", phase: "execution.proposal" };
+      case "EXECUTION": {
+        const plan = s.targetPlan;
+        if (!plan) return { kind: "transition", to: "STOPPED", note: "Execution contract did not produce a target plan" };
+        blockFailedDependencies(plan);
+        if (this.verificationPending) return undefined;
+        if (!plan.currentTargetId) {
+          const queuedId = plan.revalidationIds?.shift();
+          const next = queuedId ? plan.targets.find((target) => target.id === queuedId) : nextEligibleTarget(plan);
+          if (!next) {
+            if (!plan.targets.every((target) => plan.outcomes[target.id].status === "passed")) return { kind: "transition", to: "STOPPED", note: "Execution ended with failed, blocked or unresolved targets" };
+            return policy.perTargetReviewer ? { kind: "transition", to: "INTEGRATION" } : { kind: "transition", to: "INTEGRATED_REVIEW" };
+          }
+          plan.currentTargetId = next.id;
+          // Invalidate evidence for a reactivated target: the previous command
+          // result predates the repair and must never be reused as proof.
+          plan.outcomes[next.id] = { status: "active" };
+          // A reactivated target must receive a fresh Engineer invocation; do
+          // not reset the global repair budget while consuming a repair queue.
+          if (!queuedId) s.repairRound = 0;
+        }
+        const engineer = lastExecutionEngineer(s);
+        const outcome = plan.outcomes[plan.currentTargetId];
+        if (!engineer || engineer.round !== s.repairRound || engineer.outcome.agentId !== outcome.engineerAgentId) return { kind: "spawn", phase: "execution.engineer" };
+        if (engineer.outcome.packet.status !== "completed") return { kind: "transition", to: "STOPPED", note: `Engineer did not complete target ${plan.currentTargetId}` };
+        const verification = plan.outcomes[plan.currentTargetId].verification;
+        if (!verification && !this.verificationPending) {
+          void this.verifyCompletedTarget();
+          return undefined;
+        }
+        if (!verification) return undefined;
+        if (verification.status !== "passed") return { kind: "transition", to: "STOPPED", note: `Target ${plan.currentTargetId} verification ${verification.status}; owner approval is not automatic` };
+        plan.outcomes[plan.currentTargetId].status = "passed";
+        plan.currentTargetId = undefined;
+        return { kind: "transition", to: "EXECUTION" };
+      }
+      case "INTEGRATED_REVIEW": {
+        const review = s.results.integratedReview;
+        if (!review || s.results.integratedReviews?.at(-1)?.agentId !== review.agentId) return { kind: "spawn", phase: "integrated.review" };
+        if (review.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer found an architecture contradiction" };
+        if (review.packet.verdict === "PASS") {
+          const declared = review.packet.affectedTargetIds;
+          if (declared.length > 0 && (declared.length !== s.targetPlan?.targets.length || s.targetPlan.targets.some((target) => !declared.includes(target.id)))) return { kind: "transition", to: "STOPPED", note: "Integrated PASS declared only a partial target scope" };
+          const incomplete = s.targetPlan?.targets.find((target) => {
+            const engineer = [...s.results.engineers].reverse().find((item) => item.targetId === target.id);
+            return engineer?.outcome.packet.status !== "completed";
+          });
+          if (incomplete) return { kind: "transition", to: "STOPPED", note: `Integrated review cannot accept incomplete Engineer target ${incomplete.id}` };
+          if (s.targetPlan) for (const target of s.targetPlan.targets) s.targetPlan.outcomes[target.id].reviewerAgentId = review.agentId;
+        }
+        if (review.packet.verdict === "REPAIR_REQUIRED") {
+          if (s.repairRound >= this.config.maxRepairRounds) return { kind: "transition", to: "STOPPED", note: "Integrated repair budget exhausted" };
+          const ids = review.packet.affectedTargetIds;
+          const plan = s.targetPlan;
+          if (!plan || ids.length === 0 || new Set(ids).size !== ids.length || ids.some((id) => plan.outcomes[id]?.status !== "passed")) return { kind: "transition", to: "STOPPED", note: "Integrated repair scope is invalid" };
+          const unscopedDependents = ids.flatMap((id) => dependentsInOrder(plan, id)).filter((target) => plan.outcomes[target.id].status === "passed" && !ids.includes(target.id));
+          if (unscopedDependents.length) return { kind: "transition", to: "STOPPED", note: `Integrated repair needs explicit dependent revalidation scope: ${[...new Set(unscopedDependents.map((target) => target.id))].join(", ")}` };
+          s.repairRound++;
+          const ordered = orderedAffectedTargets(plan, ids);
+          for (const id of ordered) plan.outcomes[id] = { status: "pending" };
+          plan.revalidationIds = ordered.slice(1);
+          plan.currentTargetId = ordered[0];
+          plan.outcomes[ordered[0]].status = "active";
+          s.results.integratedReview = undefined;
+          return { kind: "transition", to: "EXECUTION", note: `Scoped integrated repair: ${ids.join(", ")}` };
+        }
+        return { kind: "transition", to: "INTEGRATION" };
+      }
+      case "INTEGRATION":
+        if (!s.results.integration) return { kind: "spawn", phase: "integration.lead" };
+        if (s.results.integration.packet.reviewerFindingsUnresolved.length > 0) return { kind: "transition", to: "STOPPED", note: "Integration left unresolved Reviewer findings" };
+        return { kind: "transition", to: policy.finalArchitect ? "FINAL_ARCHITECT" : "FINAL_SYNTHESIS" };
+      case "FINAL_ARCHITECT_RECHECK":
+        if (!s.results.finalRecheck) return { kind: "spawn", phase: "conformance.recheck" };
+        if (s.results.finalRecheck.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Conformance recheck found an architecture contradiction" };
+        return s.results.finalRecheck.packet.verdict === "ACCEPT" ? { kind: "transition", to: "FINAL_SYNTHESIS" } : { kind: "transition", to: "STOPPED", note: "Conformance recheck rejected the repaired state" };
+      case "FINAL_ARCHITECT": {
+        if (!s.results.finalArchitect) return { kind: "spawn", phase: "conformance.architect" };
+        if (s.results.finalArchitect.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Conformance Architect found an architecture contradiction" };
+        if (s.results.finalArchitect.packet.verdict === "ACCEPT") return { kind: "transition", to: "FINAL_SYNTHESIS" };
+        if (s.remediationRounds >= this.config.maxArchitectRemediationRounds) return { kind: "transition", to: "STOPPED", note: "conformance remediation budget exhausted" };
+        s.remediationRounds++;
+        s.results.integratedReview = undefined;
+        if (s.targetPlan) for (const target of s.targetPlan.targets) s.targetPlan.outcomes[target.id].reviewerAgentId = undefined;
+        const affected = s.results.finalArchitect.packet.affectedTargetIds ?? [];
+        if (s.targetPlan && !s.results.finalArchitect.packet.integrationOnly && affected.length === 0) return { kind: "transition", to: "STOPPED", note: "Conformance rejection did not identify a safe remediation scope" };
+        if (affected.length > 0 && s.targetPlan) {
+          if (new Set(affected).size !== affected.length || affected.some((id) => s.targetPlan?.outcomes[id]?.status !== "passed")) return { kind: "transition", to: "STOPPED", note: "Conformance remediation scope is invalid" };
+          const unscopedDependents = affected.flatMap((id) => dependentsInOrder(s.targetPlan!, id)).filter((target) => s.targetPlan!.outcomes[target.id].status === "passed" && !affected.includes(target.id));
+          if (unscopedDependents.length) return { kind: "transition", to: "STOPPED", note: `Conformance remediation needs explicit dependent revalidation scope: ${[...new Set(unscopedDependents.map((target) => target.id))].join(", ")}` };
+          const ordered = orderedAffectedTargets(s.targetPlan, affected);
+          for (const id of ordered) s.targetPlan.outcomes[id] = { status: "pending" };
+          s.targetPlan.revalidationIds = ordered.slice(1);
+          s.targetPlan.currentTargetId = ordered[0];
+          s.targetPlan.outcomes[ordered[0]].status = "active";
+        }
+        return { kind: "transition", to: "REMEDIATION" };
+      }
+      case "REMEDIATION": {
+        if (!s.results.remediation?.engineer) return { kind: "spawn", phase: "remediation.engineer" };
+        if (s.results.remediation.engineer.packet.status !== "completed") return { kind: "transition", to: "STOPPED", note: "Remediation Engineer did not complete the target" };
+        const remediationId = s.targetPlan?.currentTargetId;
+        const remediationVerification = remediationId ? s.targetPlan?.outcomes[remediationId].verification : undefined;
+        if (remediationId && !remediationVerification && !this.verificationPending) {
+          void this.verifyCompletedTarget();
+          return undefined;
+        }
+        if (remediationId && !remediationVerification) return undefined;
+        if (s.targetPlan?.revalidationIds?.length) {
+          s.targetPlan.currentTargetId = s.targetPlan.revalidationIds.shift();
+          s.results.remediation.engineer = undefined;
+          return { kind: "spawn", phase: "remediation.engineer" };
+        }
+        if (!s.results.integratedReview) {
+          const invalid = s.targetPlan?.targets.find((target) => {
+            const status = s.targetPlan!.outcomes[target.id].verification?.status;
+            return status !== "passed";
+          });
+          if (invalid) return { kind: "transition", to: "STOPPED", note: `Target ${invalid.id} lacks acceptable post-repair verification` };
+          return { kind: "spawn", phase: "integrated.review" };
+        }
+        if (s.results.integratedReview.packet.verdict !== "PASS") return { kind: "transition", to: "STOPPED", note: "Post-remediation integrated review did not PASS" };
+        if (s.targetPlan) {
+          for (const target of s.targetPlan.targets) {
+            s.targetPlan.outcomes[target.id].status = "passed";
+            s.targetPlan.outcomes[target.id].reviewerAgentId = s.results.integratedReview.agentId;
+          }
+          s.targetPlan.currentTargetId = undefined;
+        }
+        return { kind: "transition", to: "FINAL_ARCHITECT_RECHECK" };
+      }
+      case "FINAL_SYNTHESIS":
+        return s.results.finalReport ? { kind: "transition", to: "DONE" } : { kind: "spawn", phase: "final_synthesis.lead" };
+      default:
+        return undefined;
+    }
+  }
+
   /** Mark a single exhausted target without discarding independent work. */
   private failTargetOrStop(reason: string): { kind: "transition"; to: FactoryRunState["state"]; note: string } {
     const plan = this.state.targetPlan;
@@ -840,6 +1049,28 @@ export class FactoryController {
   private phaseSpec(phase: string, resumeNote?: string): PhaseSpec {
     const s = this.state;
     switch (phase) {
+      case "execution.proposal":
+        return { role: "lead", kind: "execution_proposal", prompt: executionContractPrompt(s.task) };
+      case "integrated.review": {
+        const packet = s.results.executionProposal?.packet;
+        return {
+          role: "reviewer",
+          kind: "integrated_review",
+          prompt: integratedReviewPrompt({ task: s.task, architecture: s.effectiveArchitecture, contract: packet!, targetPlan: s.targetPlan?.targets ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), reviewers: s.results.reviewers.map((item) => item.outcome.packet), latestGlobalDiff: "Inspect the current workspace and git diff directly.", verificationOutput: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [], pendingOwnerVerification: s.targetPlan?.targets.filter((target) => s.targetPlan!.outcomes[target.id].verification?.status === "owner_pending").map((target) => target.id) ?? [] }),
+        };
+      }
+      case "conformance.recheck":
+        return {
+          role: "architect",
+          kind: "conformance_final",
+          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], repairs: s.results.finalArchitect?.packet.requiredChanges ?? [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet, earlierRejection: s.results.finalArchitect?.packet }),
+        };
+      case "conformance.architect":
+        return {
+          role: "architect",
+          kind: "conformance_final",
+          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], repairs: [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet }),
+        };
       case "discovery.lead":
         return { role: "lead", kind: "proposal", prompt: leadProposalPrompt(s.task) };
       case "initial.architect":
@@ -856,7 +1087,7 @@ export class FactoryController {
             task: s.task,
             architecture: s.effectiveArchitecture,
             engineers: s.results.engineers.map((e) => e.outcome.packet),
-            reviewers: s.results.reviewers.map((r) => r.outcome.packet),
+            reviewers: reviewerOutcomesForIntegration(s).map((item) => item.outcome.packet),
             ...(s.targetPlan ? { targetSummary: s.targetPlan.targets.map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].status}`) } : {}),
           }),
         };
@@ -892,6 +1123,17 @@ export class FactoryController {
         };
       }
       case "final_synthesis.lead": {
+        if (this.workflow === "lean") {
+          return { role: "lead", kind: "final_report", prompt: leanFinalReportPrompt({
+            task: s.task,
+            contract: s.results.executionProposal!.packet,
+            integration: s.results.integration!.packet,
+            review: s.results.integratedReview!.packet,
+            engineers: s.results.engineers.map((item) => item.outcome.packet),
+            verification: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [],
+            warningEvidence: collectReportWarningEvidence(s),
+          }) };
+        }
         // The accepted packet is whichever Architect gate accepted the run. The
         // synthesis is told the post-remediation state when one exists, so its
         // report describes the ACTUAL accepted state, not the pre-fix packet.
@@ -907,7 +1149,7 @@ export class FactoryController {
             integration: enforceReviewerFindingDispositions(s.results.integration!.packet, s.results.reviewers),
             finalAcceptance: accepted!.packet,
             engineers: s.results.engineers.map((e) => e.outcome.packet),
-            reviewers: s.results.reviewers.map((r) => r.outcome.packet),
+            reviewers: reviewerOutcomesForIntegration(s).map((item) => item.outcome.packet),
             ...(rem?.engineer && rem.reviewer
               ? { remediation: { engineer: rem.engineer.packet, reviewer: rem.reviewer.packet } }
               : {}),
@@ -918,6 +1160,8 @@ export class FactoryController {
             repairRounds: s.repairRound,
             remediationRounds: s.remediationRounds,
             roleTargets: ROLE_NAMES.map((role) => `${role}: ${s.metrics.roles[role].targetUsed ?? this.config.roles[role]?.targets?.primary ?? "unknown"}`),
+            missionRequirements: s.results.executionProposal?.packet.missionRequirements,
+            warningEvidence: collectReportWarningEvidence(s),
           }),
         };
       }
@@ -972,11 +1216,15 @@ export class FactoryController {
   private engineerSpec(kind: "execution" | "remediation", resumeNote?: string): PhaseSpec {
     const s = this.state;
     const target = s.targetPlan?.targets.find((item) => item.id === s.targetPlan?.currentTargetId);
-    const remediatedId = kind === "remediation" && s.targetPlan && s.targetPlan.targets.length > 1
-      ? s.results.finalArchitect?.packet.affectedTargetIds?.[0] ?? "integration" : undefined;
+    const remediatedId = kind === "remediation"
+      ? (s.results.finalArchitect?.packet.integrationOnly ? "integration" : s.targetPlan?.currentTargetId ?? s.results.finalArchitect?.packet.affectedTargetIds?.[0])
+      : undefined;
     const scopedTarget = remediatedId ? s.targetPlan?.targets.find((item) => item.id === remediatedId) : target;
     const wpId = remediatedId ?? target?.id ?? s.results.proposal?.packet.workPackages[0] ?? FIRST_WORK_PACKAGE;
-    const repair = s.repairRound > 0 ? lastReviewer(s)?.outcome.packet : undefined;
+    const integratedFinding = s.results.integratedReviews?.at(-1)?.packet;
+    const repair = this.workflow !== "full" && kind === "execution" && integratedFinding?.verdict === "REPAIR_REQUIRED"
+      ? integratedAsReviewer(integratedFinding)
+      : s.repairRound > 0 ? lastReviewer(s)?.outcome.packet : undefined;
     const leadEsc = s.results.leadEscalation;
     const remediation = s.results.finalArchitect?.packet;
     return {
@@ -988,9 +1236,9 @@ export class FactoryController {
         dependencies: scopedTarget?.dependsOn,
         architecture: s.effectiveArchitecture,
         task: s.task,
-        acceptanceCriteria: s.results.proposal?.packet.acceptanceCriteria ?? [],
+        acceptanceCriteria: s.results.executionProposal?.packet.acceptanceCriteria ?? s.results.proposal?.packet.acceptanceCriteria ?? [],
         constraints: [...new Set([
-          ...(s.results.proposal?.packet.constraints ?? []),
+          ...(s.results.executionProposal?.packet.constraints ?? s.results.proposal?.packet.constraints ?? []),
           ...(s.results.initialArchitect?.packet.constraints ?? []),
           ...(s.results.escalationArchitect?.packet.constraints ?? []),
         ])],
@@ -1315,6 +1563,34 @@ export class FactoryController {
       case "discovery.lead":
         s.results.proposal = outcome;
         break;
+      case "execution.proposal": {
+        const contract = packet as ExecutionContractPacket;
+        s.results.executionProposal = outcome;
+        const targets = contract.targets ?? [];
+        const errors = validateTargets(targets);
+        const ids = new Set(targets.map((target) => target.id));
+        if (targets.length === 0) errors.push("Execution contract must contain a structured target graph");
+        if (!contract.requirementCatalog?.length || !contract.humanRequirements?.length) errors.push("Execution contract must preserve stable user requirement identities");
+        for (const dependency of contract.humanDependencies ?? []) {
+          if (!targets.find((target) => target.id === dependency.targetId)?.dependsOn.includes(dependency.dependsOn)) errors.push(`Execution contract omitted user dependency ${dependency.dependsOn} -> ${dependency.targetId}`);
+        }
+        if (Object.keys(contract.verification).length !== targets.length || targets.some((target) => !contract.verification[target.id])) errors.push("Execution contract must define verification for every target");
+        if (Object.keys(contract.verification).some((id) => !ids.has(id))) errors.push("Execution contract contains verification for an unknown target");
+        if (contract.architectureContradiction) {
+          s.architectureContradiction = contract.architectureContradiction;
+          s.stoppedReason = "Execution contract reported an architecture contradiction";
+          this.applyTransition("STOPPED");
+          return;
+        }
+        if (errors.length > 0) {
+          s.stoppedReason = `Invalid execution contract: ${[...new Set(errors)].join("; ")}`;
+          this.applyTransition("STOPPED");
+          return;
+        }
+        s.effectiveArchitecture = contract.proposedSolution;
+        s.targetPlan = createTargetPlan(targets);
+        break;
+      }
       case "initial.architect": {
         const arch = packet as ArchitectInitialResult;
         s.results.initialArchitect = outcome;
@@ -1349,17 +1625,27 @@ export class FactoryController {
           return;
         }
         s.results.engineers.push({ ...(s.targetPlan ? { targetId: s.targetPlan.currentTargetId } : {}), round: s.repairRound, outcome });
+        if (s.targetPlan?.currentTargetId) {
+          s.targetPlan.outcomes[s.targetPlan.currentTargetId].engineerAgentId = info.agentId;
+        }
         break;
       case "review.reviewer":
         s.results.reviewers.push({ ...(s.targetPlan ? { targetId: s.targetPlan.currentTargetId } : {}), round: s.repairRound, outcome });
         break;
+      case "integrated.review": {
+        const review = outcome as { packet: IntegratedReviewPacket; agentId: string; target?: string };
+        s.results.integratedReview = review;
+        s.results.integratedReviews = [...(s.results.integratedReviews ?? []), review];
+        if (review.packet.architectureContradiction) s.architectureContradiction = review.packet.architectureContradiction;
+        break;
+      }
       case "integration.lead": {
         // Deterministic fidelity guard: the Lead may summarize, but it may not
         // erase. Every Reviewer finding that the acceptance packet does not
         // explicitly disposition is preserved under `reviewerFindingsUnresolved`.
         const integration = enforceReviewerFindingDispositions(
           packet as LeadIntegrationPacket,
-          s.results.reviewers,
+          reviewerOutcomesForIntegration(s),
         );
         s.results.integration = {
           packet: integration,
@@ -1371,17 +1657,38 @@ export class FactoryController {
       case "final.architect":
         s.results.finalArchitect = outcome;
         break;
+      case "conformance.architect":
+        s.results.finalArchitect = outcome;
+        if ((packet as { architectureContradiction?: unknown }).architectureContradiction) s.architectureContradiction = (packet as { architectureContradiction: typeof s.architectureContradiction }).architectureContradiction;
+        break;
+      case "conformance.recheck":
+        s.results.finalRecheck = outcome;
+        if ((packet as { architectureContradiction?: unknown }).architectureContradiction) s.architectureContradiction = (packet as { architectureContradiction: typeof s.architectureContradiction }).architectureContradiction;
+        break;
       case "final_recheck.architect":
         s.results.finalRecheck = outcome;
         break;
-      case "final_synthesis.lead":
+      case "final_synthesis.lead": {
+        const reportOutcome = outcome as { packet: FinalReportPacket; agentId: string; target?: string };
+        const report = reportOutcome.packet;
+        const normalized = applyReportWarningDecisions(report, collectReportWarningEvidence(s), report.warningDecisions);
+        if (!normalized) {
+          this.failRun("Final report warning dispositions were invalid, duplicated, or referenced unknown evidence");
+          return;
+        }
         // Preserved separately from integration/finalArchitect/finalRecheck so
         // the rejected integration packet and both Architect gates remain as
         // audit history for the run.
-        s.results.finalReport = outcome;
+        s.results.finalReport = { ...reportOutcome, packet: normalized };
         break;
+      }
       case "remediation.engineer":
         s.results.remediation = { ...(s.results.remediation ?? {}), engineer: outcome };
+        if (this.workflow !== "full") {
+          const remediationPacket = packet as { workPackageId: string };
+          s.results.engineers.push({ targetId: remediationPacket.workPackageId, round: s.repairRound, outcome: outcome as never });
+          if (s.targetPlan?.outcomes[remediationPacket.workPackageId]) s.targetPlan.outcomes[remediationPacket.workPackageId].engineerAgentId = info.agentId;
+        }
         break;
       case "remediation.reviewer":
         s.results.remediation = { ...(s.results.remediation ?? {}), reviewer: outcome };
@@ -1486,7 +1793,7 @@ export class FactoryController {
 
   private applyTransition(to: FactoryRunState["state"], note?: string): void {
     const from = this.state.state;
-    assertTransition(from, to);
+    assertTransition(from, to, this.workflow);
     if (to === "ARCHITECT_ESCALATION") this.state.results.escalationArchitect = undefined;
     if (to === "STOPPED" && note?.trim()) this.state.stoppedReason = note.trim();
     if (from === "WAITING_CAPACITY") {
@@ -1648,7 +1955,37 @@ function lastReviewer(s: FactoryRunState) {
   return [...s.results.reviewers].reverse().find((item) => !s.targetPlan || item.targetId === s.targetPlan.currentTargetId);
 }
 
+function orderedAffectedTargets(plan: NonNullable<FactoryRunState["targetPlan"]>, ids: string[]): string[] {
+  const remaining = new Set(ids);
+  const ordered: string[] = [];
+  while (remaining.size) {
+    const next = plan.targets.find((target) => remaining.has(target.id) && target.dependsOn.every((dependency) => !remaining.has(dependency)));
+    if (!next) throw new Error("Invalid affected target dependency graph");
+    ordered.push(next.id);
+    remaining.delete(next.id);
+  }
+  return ordered;
+}
+
+function reviewerOutcomesForIntegration(s: FactoryRunState): ReviewerOutcome[] {
+  const review = s.results.integratedReview;
+  return review
+    ? [...s.results.reviewers, { round: s.repairRound, outcome: { agentId: review.agentId, packet: integratedAsReviewer(review.packet) } }]
+    : s.results.reviewers;
+}
+
 /** Every finding any Reviewer raised, across every round, in a stable order. */
+function integratedAsReviewer(packet: IntegratedReviewPacket): ReviewerPacket {
+  return {
+    verdict: packet.verdict === "PASS" ? "PASS" : packet.verdict === "ARCHITECTURE_CONTRADICTION" ? "ARCHITECTURAL_ESCALATION" : "NEEDS_FIX",
+    blockingFindings: packet.blockingFindings,
+    nonBlockingFindings: packet.nonBlockingFindings,
+    requiredRepairs: packet.requiredRepairs,
+    testConcerns: packet.testConcerns,
+    architecturalIssue: packet.verdict === "ARCHITECTURE_CONTRADICTION" || packet.architecturalIssue,
+  };
+}
+
 function reviewerFindings(reviewers: ReviewerOutcome[]): string[] {
   const findings: string[] = [];
   for (const reviewer of reviewers) {

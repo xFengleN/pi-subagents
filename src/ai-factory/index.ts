@@ -31,6 +31,7 @@ import { markdownMessage, textMessage, type WidgetTheme } from "./render.js";
 import { assessRecoveryEligibility, isTerminal, planFactoryRecovery } from "./state.js";
 import { FactoryStore } from "./store.js";
 import { BusFactoryTransport, globalManagerRegistry } from "./transport.js";
+import type { FactoryWorkflowMode } from "./workflow-policy.js";
 
 /** Minimal tool result helper — matches the pi tool-result content shape. */
 function textResult(text: string): { content: Array<{ type: "text"; text: string }>; details: Record<string, never> } {
@@ -47,6 +48,14 @@ export default function (pi: ExtensionAPI): void {
   const controllers = new Map<string, FactoryController>();
   let store: FactoryStore | undefined;
   let sessionBound = false;
+  // Workflow selection is deliberately session-scoped: presets and project
+  // config remain independent, while every new run uses this selection.
+  let sessionWorkflowMode: FactoryWorkflowMode = "full";
+  const workflowSession = {
+    get: () => sessionWorkflowMode,
+    set: (mode: FactoryWorkflowMode) => { sessionWorkflowMode = mode; },
+    resetPending: () => undefined,
+  };
 
   // Session-scoped Factory run panel state (the compact above-editor widget).
   let runPanel: FactoryRunPanel | undefined;
@@ -95,6 +104,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     store = new FactoryStore(ctx.cwd);
+    sessionWorkflowMode = "full";
     sessionBound = true;
     runPanel = new FactoryRunPanel({
       getRunState: () => (activeRunId !== undefined ? controllers.get(activeRunId)?.getState() : undefined),
@@ -120,6 +130,8 @@ export default function (pi: ExtensionAPI): void {
   };
 
   pi.on("session_before_switch", () => {
+    workflowSession.resetPending();
+    sessionWorkflowMode = "full";
     // Runs persist to disk on every transition; detach in-process controllers
     // so a session switch does not keep stale subscriptions alive. Any run is
     // resumed on demand via factory_status.
@@ -140,10 +152,10 @@ export default function (pi: ExtensionAPI): void {
     name: "Factory",
     label: "AI Factory",
     description:
-      "Start a deterministic AI Factory run for a task. The run orchestrates four roles — Lead, Architect, " +
-      "Engineer, Reviewer — as sub-agents, with mandatory initial and final Architect checkpoints, a bounded " +
-      "Engineer/Reviewer repair loop, and one bounded remediation cycle. Returns the run id; poll factory_status.",
-    promptSnippet: "Orchestrate a full AI Factory run",
+      "Start a deterministic AI Factory run for a task using the selected Factory workflow. The run coordinates " +
+      "Lead, Architect, Engineer, and Reviewer sub-agents according to that workflow's gates and bounded repair " +
+      "budgets. Returns the run id; poll factory_status.",
+    promptSnippet: "Orchestrate an AI Factory run using the selected workflow",
     parameters: Type.Object({
       task: Type.String({ description: "The user goal the Factory run should accomplish." }),
       config: Type.Optional(Type.Record(Type.String(), Type.Any(), {
@@ -158,12 +170,13 @@ export default function (pi: ExtensionAPI): void {
       if (!transport.isAvailable() && !(await transport.ping(1_000))) {
         return textResult("pi-subagents is not available in this session; Factory cannot run without it.");
       }
+      workflowSession.resetPending();
       const id = runId();
       activeStore(ctx.cwd).prepareReportDelivery(id);
       const deps = depsFor(ctx.cwd);
       // Apply per-call config overrides on top of the project file.
       deps.config = loadFactoryConfig(ctx.cwd, params.config as Record<string, unknown> | undefined);
-      const controller = FactoryController.create(deps, id, params.task, ctx.cwd);
+      const controller = FactoryController.create(deps, id, params.task, ctx.cwd, sessionWorkflowMode);
       controllers.set(id, controller);
       controller.start();
       watchController(controller);
@@ -216,7 +229,7 @@ export default function (pi: ExtensionAPI): void {
     launch: (cwd, task) => {
       const id = runId();
       activeStore(cwd).prepareReportDelivery(id);
-      const controller = FactoryController.create(depsFor(cwd), id, task, cwd);
+      const controller = FactoryController.create(depsFor(cwd), id, task, cwd, sessionWorkflowMode);
       controllers.set(id, controller);
       controller.start();
       watchController(controller);
@@ -329,7 +342,7 @@ export default function (pi: ExtensionAPI): void {
     },
     reportCompletion: deliverCompletion,
   };
-  registerFactoryCommands(pi, runtime);
+  registerFactoryCommands(pi, runtime, workflowSession);
 
   /** The id of the most recently created in-process controller, if any. */
   function newestControllerId(): string | undefined {

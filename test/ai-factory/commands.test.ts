@@ -134,6 +134,60 @@ function commandCtx(cwd: string, models: string[] = []) {
 }
 
 describe("AI Factory — slash commands", () => {
+  it("workflow selection is session-sticky and /factory shows the configured start screen", async () => {
+    const cwd = workdir();
+    savePreset("ux-preset", mergeFactoryConfig(defaultFactoryConfig(), {
+      roles: { lead: { targets: { primary: "provider/preset-lead" } } },
+    }));
+    loadPresetAsWorkingConfig(cwd, "ux-preset");
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd, ["provider/preset-lead", "provider/architect"]);
+
+    await b.commands.get("factory-workflow").handler("lean", ctx);
+    expect(notifications.at(-1)?.message).toContain("LEAN");
+    await b.commands.get("factory").handler("", ctx);
+
+    const screen = notifications.at(-1)?.message ?? "";
+    expect(screen).toContain("Workflow: LEAN");
+    expect(screen).toContain("Preset: ux-preset");
+    expect(screen).toContain("Lead: provider/preset-lead");
+    expect(screen).toContain("Initial Architect: disabled");
+    expect(screen).toContain("Reviewer: integrated — provider/reviewer-model");
+    expect(screen).toContain("Final Architect: disabled");
+    expect(screen).toContain("Factory task — describe the goal.");
+    expect(factoryBaseState(cwd).preset).toBe("ux-preset");
+
+    await b.commands.get("factory-workflow").handler("verified", ctx);
+    await b.commands.get("factory").handler("", ctx);
+    const verifiedScreen = notifications.at(-1)?.message ?? "";
+    expect(verifiedScreen).toContain("Workflow: VERIFIED EXECUTION");
+    expect(verifiedScreen).toContain("Preset: ux-preset");
+    expect(verifiedScreen).toContain("Initial Architect: disabled");
+    expect(verifiedScreen).toContain("Reviewer: integrated — provider/reviewer-model");
+    expect(verifiedScreen).toContain("Final Architect: enabled — provider/architect-model (conformance audit)");
+    expect(verifiedScreen).toContain("Final verification: Architect conformance audit");
+    expect(verifiedScreen).toContain("Factory task — describe the goal.");
+    expect(factoryBaseState(cwd).preset).toBe("ux-preset");
+
+    await b.commands.get("factory").handler("", ctx);
+    expect(notifications.at(-1)?.message).toContain("Workflow: VERIFIED EXECUTION");
+
+    // The workflow is session state, not preset state: a new Pi session resets it
+    // to FULL while preserving the independent project preset.
+    b.lifecycle.get("session_before_switch")();
+    await b.lifecycle.get("session_start")({}, baseCtx({ cwd }));
+    const switched = commandCtx(cwd, ["provider/preset-lead", "provider/architect"]);
+    await b.commands.get("factory").handler("", switched.ctx);
+    const fullScreen = switched.notifications.at(-1)?.message ?? "";
+    expect(fullScreen).toContain("Workflow: FULL");
+    expect(fullScreen).toContain("Preset: ux-preset");
+    expect(fullScreen).toContain("Initial Architect: enabled — provider/architect-model");
+    expect(fullScreen).toContain("Reviewer: per target — provider/reviewer-model");
+    expect(fullScreen).toContain("Final Architect: enabled — provider/architect-model");
+    expect(fullScreen).toContain("Factory task — describe the goal.");
+    expect(factoryBaseState(cwd).preset).toBe("ux-preset");
+  });
+
   it("A. /factory dispatches directly and starts a run (no model-mediated tool decision)", async () => {
     const cwd = workdir();
     const b = await boot(cwd);
@@ -152,18 +206,28 @@ describe("AI Factory — slash commands", () => {
     expect(readdirSync(dir).some((f) => f.endsWith(".json"))).toBe(true);
   });
 
-  it("A2. /factory with no arguments opens the task editor", async () => {
+  it("A2. /factory shows the start screen, then starts from the next plain task message", async () => {
     const cwd = workdir();
     const b = await boot(cwd);
-    const { ctx, ui } = commandCtx(cwd, ["p/model"]);
-    ui.editor.mockResolvedValue("task from the editor");
+    const { ctx, ui, notifications } = commandCtx(cwd, ["p/model"]);
 
     await b.commands.get("factory").handler("", ctx);
+    expect(ui.editor).not.toHaveBeenCalled();
+    expect(notifications.at(-1)?.message).toContain("Workflow: FULL");
+    expect(notifications.at(-1)?.message).toContain("Preset: (defaults; no preset)");
+    expect(notifications.at(-1)?.message).toContain("Factory task — describe the goal.");
+    expect(b.spawns).toHaveLength(0);
+    expect(notifications.some((n) => n.message.includes("Factory run started"))).toBe(false);
+    expect(existsSync(join(cwd, ".pi", "factory"))).toBe(false);
+
+    const input = b.pi.on.mock.calls.find((call) => call[0] === "input")?.[1];
+    expect(input).toBeDefined();
+    await input({ text: "task from the next message", source: "user" }, ctx);
     await flush();
 
-    expect(ui.editor).toHaveBeenCalledOnce();
+    expect(ui.editor).not.toHaveBeenCalled();
     expect(b.spawns).toHaveLength(1);
-    expect(b.spawns[0].prompt).toContain("task from the editor");
+    expect(b.spawns[0].prompt).toContain("task from the next message");
   });
 
   it("A3. /factory refuses cleanly when pi-subagents is unavailable (no run, no spawn)", async () => {

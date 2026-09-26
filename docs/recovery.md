@@ -10,6 +10,7 @@ New Factory snapshots use state version 3 (version 2 remains readable) and conta
 - `checkpoint`: a durable identity containing the run id, exact phase, progress counters, revision, and the current attempt/agent identity where applicable;
 - `attempts`: append-only invocation provenance and recovery risk;
 - the existing validated packets, metrics, configuration, and state-machine fields;
+- an immutable canonical `workflow.mode` for new version-3 runs (`full`, `verified_execution`, `lean`); snapshots without it retain historical FULL semantics, and version-1/2 runs cannot claim an execution workflow; execution profiles also retain their contract, per-target verification evidence, integrated review, and any architecture contradiction;
 - a version-3 approved `targetPlan` with order, dependency graph, target outcomes,
   active target, and Reviewer/Engineer evidence identities after initial approval.
   Attempts and checkpoints carry target identity where relevant.
@@ -40,7 +41,7 @@ Engineer and remediation attempts carry `workspace_may_have_changed` risk from p
 
 `FactoryStore` validates ids before calling `path.join`, validates snapshots before saving, rejects corrupt snapshots on normal load, and exposes `loadStrict` when callers need the validation error. Version 1 snapshots remain readable as legacy snapshots, but their ambiguous Engineer recovery is never automatic.
 
-Validation covers configuration keys and values, packet shapes and enum values, attempt provenance, metrics totals, state/park consistency, in-flight role/phase consistency, terminal invariants, checkpoint identity, and the canonical workspace path. Version-3 validation additionally rejects malformed target graphs, inconsistent outcomes, and claims of a passed target without matching Reviewer PASS evidence.
+Validation covers configuration keys and values, packet shapes and enum values, attempt provenance, metrics totals, state/park consistency, in-flight role/phase consistency, terminal invariants, checkpoint identity, and the canonical workspace path. Version-3 validation additionally rejects malformed target graphs and inconsistent outcomes. FULL passed targets require matching per-target Reviewer PASS. Execution-profile target verification is distinct from integrated review: a completed target can have deterministic or owner-pending evidence without falsely claiming independent per-target review, and integrated PASS is recorded separately.
 
 ## Pure planner
 
@@ -58,5 +59,5 @@ The older `assessRecoveryEligibility` API remains available for the existing con
 
 - Version 1 run files are accepted conservatively for inspection and reporting. They have no durable attempt provenance, so ambiguous Engineer and remediation states require approval.
 - Version 2 remains readable and keeps its original single-work-package semantics. Version 3 is the write format for newly created controller runs.
-- The pure planner does not reconcile workspace changes, acquire ownership leases, drive a controller, execute approvals, or apply presets; those are handled outside this module.
-- Atomic JSON persistence is not cross-process ownership protection.
+- The pure planner does not reconcile workspace changes, acquire ownership leases, drive a controller, execute approvals, or apply presets; those are handled outside this module. STOPPED and FAILED remain terminal: this change does not add terminal-run resume or automatic Architect redesign.
+- Atomic JSON persistence is not cross-process ownership protection. Lease validation and state rename are separate filesystem operations: a concurrent cross-process takeover can race a save already past its lease check. The workflow profiles do not close this existing ownership window.

@@ -1,12 +1,14 @@
 # AI Factory
 
-A lean, deterministic orchestration layer on top of pi-subagents. It runs one
-"factory" — a Lead, an Architect, an Engineer and a Reviewer — through a
-persisted state machine, with fresh bounded contexts and no hidden model calls.
+A deterministic orchestration layer on top of pi-subagents. One Factory
+controller runs Lead, Architect, Engineer, and Reviewer roles under one of three
+persisted workflow policies. Model presets configure role models independently
+of the selected workflow. Children use fresh bounded contexts; there are no
+hidden model calls.
 
 ## Purpose
 
-The Factory automates a full coding task as a fixed pipeline:
+The default FULL profile automates a full coding task as a fixed pipeline:
 
 ```
 USER TASK
@@ -31,6 +33,38 @@ Two kinds of decisions:
   implementation, correctness assessment, integration, final acceptance. These
   happen *inside* role agents, never in the controller.
 
+## Workflow profiles
+
+| Workflow (persisted ID) | Initial Architect | Target review | Final gate |
+|---|---|---|---|
+| FULL (`full`) | Required | Reviewer per target | Architect acceptance and bounded remediation |
+| VERIFIED EXECUTION (`verified_execution`) | Not invoked | Integrated Reviewer with bounded targeted repair and whole-system re-review | Architect contract-conformance audit and bounded targeted remediation/recheck |
+| LEAN (`lean`) | Not invoked | Integrated Reviewer with bounded targeted repair and whole-system re-review | Integration Lead; no final Architect verdict |
+
+FULL retains the historical lifecycle. LEAN and VERIFIED EXECUTION share an
+Execution Contract Lead: the owner's supplied architecture is authoritative
+unless repository evidence proves a material assumption false. The Lead returns
+separate implementation `humanRequirements`, hard `constraints`, and
+Factory lifecycle/reporting `missionRequirements`; only implementation
+requirements and constraints can shape targets, dependencies, and verification.
+Factory assigns the shared deterministic `REQ-NNN` catalog from these arrays,
+with mission/report metadata classified separately. The model does not invent
+IDs or supply a second catalog. Any legacy/sanitized catalog references must
+cover exactly those IDs and preserve source classification; ordering and
+explanatory wording are not identity. Missing, duplicate, unknown, or
+misclassified identities fail closed. Conditional requests to report manual or
+owner-pending checks "if any" do not create such a check; only explicit or
+inherently human verification becomes owner-pending. A structured
+architecture contradiction records the contradicted assumption, repository
+evidence, affected targets, reason work cannot safely proceed and smallest
+owner decision required; V1 stops rather than auto-redesigning the contract.
+Each target needs non-LLM verification (command output or explicitly recorded
+owner/manual verification); owner-pending verification stops the run for owner action (a fresh run is needed after manual verification) rather than counting as PASS, and unavailable evidence is not fabricated as PASS. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted.
+A verified implementation is not independently reviewed until integrated review
+PASS on the latest integrated state. VERIFIED EXECUTION's final Architect audits
+conformance with the owner's contract, not architectural taste. Model presets
+remain unchanged, including role models for stages a workflow does not invoke.
+
 ## Architecture
 
 ```
@@ -45,6 +79,8 @@ src/ai-factory/
   metrics.ts      per-role token/cost accounting + run summary
   store.ts        small atomic JSON persistence (.pi/factory/<runId>.json)
   targets.ts      approved target graph, deterministic serial eligibility/blocking
+  workflow-policy.ts stable persisted workflow modes, separate from model presets
+  verifier.ts     bounded non-LLM target verification
   clock.ts        injectable clock (fake clock drives multi-hour waits in tests)
   panel.ts        visibility-mode vocabulary, target resolution, compact summary
   panel-widget.ts the compact orchestration widget (above the editor)
@@ -219,7 +255,8 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 
 | Command | What it does |
 |---|---|
-| `/factory [task]` | Starts a run deterministically. Uses the text after the command as the task; with no text it opens the task editor. Prints the runId and initial state. A compact run panel appears above the editor showing orchestration state (run id, state, active role/phase/model, counters) — it deliberately does not duplicate the pi-subagents agent tree. Every terminal outcome (`DONE`, controlled `STOPPED`, or `FAILED`) appends an evidence-based final report automatically as a normal rendered (Markdown) message at the bottom of the conversation. Reporting is observational: it never changes the terminal state or verdict. |
+| `/factory` | Shows the selected workflow, preset and effective role models; send the task as the next message to start a run. Prints the runId and initial state. A compact run panel appears above the editor showing orchestration state (run id, state, active role/phase/model, counters) — it deliberately does not duplicate the pi-subagents agent tree. Every terminal outcome (`DONE`, controlled `STOPPED`, or `FAILED`) appends an evidence-based final report automatically as a normal rendered (Markdown) message at the bottom of the conversation. Reporting is observational: it never changes the terminal state or verdict. |
+| `/factory-workflow [full\|verified\|lean]` | Selects the sticky next-run workflow for this Pi session. Defaults to FULL; separate from the model preset. |
 | `/factory-verbose [mode]` | Selects what the Factory's focused live view shows (read-only; no model call). With no argument it reports the current mode and usage. Modes: `on` (follow the active agent, then the last finished one — the default), `off` (compact progress only, no live view), `active` (only the running agent, following phase changes), a role (`lead`/`architect`/`engineer`/`reviewer`, the latest agent of that role), or an exact phase (e.g. `execution.engineer`, that phase's agent). For every mode except `off` the command opens a scrollable, live-updating transcript overlay (Esc closes it) that reuses pi-subagents' own conversation viewer; `/agents` remains the full history. The mode is a session-scoped UI preference, independent of Factory configuration and persisted run data, and never affects execution. Invalid arguments show usage and never invoke a model. |
 | `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
 | `/factory-report [runId]` | Prints the human-readable final report again for the latest terminal run, or for an explicit run id. Reads persisted state only — no model call — and is not suppressed by the automatic-delivery marker. Legacy runs without a final Lead synthesis use the latest authoritative Architect outcome first, then the integration fallback where valid, all clearly labelled. |
@@ -334,6 +371,7 @@ It holds packets and references only — never child transcripts. Version-3
 snapshots also hold target order, dependencies, statuses, per-target Reviewer
 and Engineer evidence IDs, the active target and revalidation queue. On restart:
 
+- the canonical `workflow.mode` is snapshotted for each new run; historical runs without workflow metadata use FULL, and changing the next-run selector never changes a persisted run;
 - completed targets and phases are never re-run (their packets are in the store);
 - an interrupted Engineer with uncertain workspace effects requires the
   existing explicit recovery approval before any new attempt; a clean accepted
@@ -394,6 +432,19 @@ recommendation, and the artifact path; `FAILED` is explicitly labelled as a
 runtime/unrecoverable failure rather than a controlled rejection. Missing
 optional evidence is omitted or labelled unavailable rather than inferred.
 
+Final synthesis keeps warning provenance: Engineer and target Reviewer findings
+remain target-local and display with their target IDs; Integrated Reviewer,
+Integration Lead and final Architect evidence remains mission-scoped. The Lead
+disposes each controller-identified finding as active, superseded or historical.
+Only active mission-scoped findings populate the mission `Warnings / limitations`
+section; target-local limitations stay attributed, and superseded observations
+are clearly separated. Duplicate or unknown finding IDs are rejected; omitted
+dispositions default to active within their controller-assigned scope, so missing
+classification cannot promote a target finding into a mission warning. Execution reports without structured
+provenance label legacy warnings as unscoped instead of promoting them to mission
+findings. FULL's historical report format remains unchanged for older reports
+without provenance.
+
 Automatic delivery uses a durable sidecar marker beside the run artifact, so
 repeated terminal callbacks, status refreshes, and ordinary session rehydration
 do not print the report twice. The message is sent before the marker is written:
@@ -432,8 +483,10 @@ pi install /path/to/pi-subagents
 #    inside a pi session:
 /factory-config
 
-# 3. start a run directly — no model has to decide to call Factory
-/factory add a widgets package with tests
+# 3. select a workflow if desired, then start without a model-mediated decision
+/factory-workflow verified
+/factory
+# Send "add a widgets package with tests" as the next message.
 
 # 4. choose what the live view shows (default: on), then inspect / stop
 /factory-verbose active   # opens a live transcript overlay following the run; off/<role>/<exact-phase> also work
@@ -458,6 +511,14 @@ them the roles fall back to `general-purpose` (still isolated).
 - A repair "round" spawns a fresh Engineer with the concrete findings; true
   in-session resume/steer of the same child is not exposed over the RPC bus and
   is deferred.
+- In execution profiles, a proposed repair of a prerequisite whose accepted
+  dependents are absent from the Reviewer/Architect's correction scope stops
+  for a new explicitly scoped owner decision. V1 does not automatically rerun
+  dependent implementation targets or pretend their prior verification remains
+  current. A deterministic verification command runs in the project workspace
+  with a two-minute limit; only the exit status establishes automated PASS.
+- A stopped or failed run remains terminal; resume does not reopen it. A lost
+  in-flight Engineer still requires explicit workspace approval before replay.
 - `modelRequests` in the summary counts role-agent runs spawned, not
   per-turn provider requests (pi does not expose per-agent turn counts).
 - Fallback is configuration, not inference: no difficulty classification, no

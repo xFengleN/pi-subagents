@@ -20,6 +20,7 @@ import {
   type RoleMetrics,
   type RoleName,
 } from "./types.js";
+import { workflowMode, workflowPolicy } from "./workflow-policy.js";
 
 /** A fresh per-role metrics record. */
 export function emptyRoleMetrics(role: RoleName): RoleMetrics {
@@ -384,8 +385,11 @@ export function buildRunMetrics(state: FactoryRunState): RunMetricsSummary {
   };
   const finalReport = state.results.finalReport?.packet;
   const architectOutcome = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+  const mode = workflowMode(state);
   const currentFinalReport = state.state === "DONE" && architectOutcome?.verdict !== "NEEDS_REMEDIATION" ? finalReport : undefined;
-  report.completion.finalResult = architectOutcome?.verdict ?? currentFinalReport?.result;
+  report.completion.finalResult = mode === "lean"
+    ? state.state === "DONE" ? state.results.integratedReview?.packet.verdict : undefined
+    : architectOutcome?.verdict ?? currentFinalReport?.result;
   if (currentFinalReport) {
     report.completion.validation = currentFinalReport.validation[0];
     report.completion.commits = currentFinalReport.commits.length;
@@ -413,6 +417,7 @@ export function formatDuration(ms: number): string {
 export function formatRunMetrics(state: FactoryRunState): string {
   const m = buildRunMetrics(state);
   const lines: string[] = ["Factory metrics", `Run: ${m.runId}`, `State: ${m.state}`];
+  if (workflowMode(state) !== "full") lines.push(`Workflow: ${workflowPolicy(workflowMode(state)).displayName}`);
   if (m.legacyTelemetry) {
     // Make the degraded mode impossible to miss: these figures are the last
     // reported call per role, not totals.
@@ -534,6 +539,7 @@ export function buildRunSummary(state: FactoryRunState): FactoryRunSummary {
   }
   return {
     runId: state.runId,
+    workflow: workflowMode(state),
     state: state.state,
     task: state.task,
     ...(state.stoppedReason !== undefined ? { stoppedReason: state.stoppedReason } : {}),

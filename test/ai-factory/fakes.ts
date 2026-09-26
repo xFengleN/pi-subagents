@@ -143,11 +143,17 @@ export class FakeTransport implements FactoryTransport {
   completeLastPacket(packet: unknown, extra: Partial<AgentSettleInfo> = {}): string {
     const agentId = this.lastAgentId;
     if (agentId === undefined) throw new Error("no agent has been spawned");
+    let settledPacket = packet;
+    const lastSpawn = this.spawned.at(-1);
+    if (lastSpawn?.phase === "final_synthesis.lead" && packet && typeof packet === "object" && !Array.isArray(packet)) {
+      const report = packet as Record<string, unknown>;
+      if (!Array.isArray(report.warningDecisions)) settledPacket = { ...report, warningDecisions: [] };
+    }
     this.fireCompleted({
       agentId,
       ok: true,
       status: "completed",
-      structuredJson: JSON.stringify(packet),
+      structuredJson: JSON.stringify(settledPacket),
       ...extra,
     });
     return agentId;

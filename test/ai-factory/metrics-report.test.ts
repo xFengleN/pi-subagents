@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { defaultFactoryConfig, mergeFactoryConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
-import { buildRunMetrics, formatRunMetrics } from "../../src/ai-factory/metrics.js";
+import { buildRunMetrics, buildRunSummary, formatRunMetrics } from "../../src/ai-factory/metrics.js";
 import type { FactoryConfig } from "../../src/ai-factory/types.js";
 import { FakeClock, FakeTransport, flush, packets, tempStore } from "./fakes.js";
 
@@ -74,11 +74,27 @@ async function driveFullRun(m: M): Promise<void> {
   await flush();
   settle(m, packets.accept, usage(600, 60, 6000, 60, 0.06), 60);
   await flush();
-  settle(m, packets.finalReport, usage(700, 70, 7000, 70, 0.07), 70);
+  settle(m, {
+    ...packets.finalReport,
+    warningDecisions: [],
+  }, usage(700, 70, 7000, 70, 0.07), 70);
   await flush();
 }
 
 describe("AI Factory — /factory-metrics", () => {
+  it("uses persisted workflow identity in metrics and machine-readable history", () => {
+    const m = make();
+    const historical = m.controller.getSnapshot();
+    historical.workflow = undefined;
+    expect(buildRunSummary(historical).workflow).toBe("full");
+    expect(formatRunMetrics(historical)).not.toContain("Workflow:");
+    historical.workflow = { mode: "lean" };
+    expect(buildRunSummary(historical).workflow).toBe("lean");
+    expect(formatRunMetrics(historical)).toContain("Workflow: LEAN");
+    historical.results.integratedReview = { agentId: "reviewer", packet: { verdict: "PASS", affectedTargetIds: [], blockingFindings: [], nonBlockingFindings: [], requiredRepairs: [], testConcerns: [], architecturalIssue: false } };
+    historical.state = "DONE";
+    expect(buildRunMetrics(historical).completion.finalResult).toBe("PASS");
+  });
   it("J. aggregates call counts, tokens, cost, context and performance correctly", async () => {
     const m = make();
     await driveFullRun(m);

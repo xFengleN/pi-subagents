@@ -16,22 +16,26 @@ import {
   getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, getKeybindings, Input, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
-import { configRevision, loadFactoryConfig, validateFactoryConfig } from "./config.js";
+import { configRevision, loadFactoryConfig, projectPresetName, validateFactoryConfig } from "./config.js";
 import { type ConfigUI, filterModels, type MenuRow, type ModelOption, showFactoryConfigUI } from "./config-ui.js";
 import type { FactoryController } from "./controller.js";
 import { formatDuration, formatRunMetrics } from "./metrics.js";
 import { parseVisibilityArg, type VisibilityMode } from "./panel.js";
 import type { RecoveryPlan } from "./recovery-model.js";
+import { collectReportWarningEvidence } from "./report-warnings.js";
 import { assessRecoveryEligibility, isTerminal } from "./state.js";
 import { FACTORY_DIR } from "./store.js";
 import {
   type ArchitectFinalResult,
   type FactoryRunState,
   type FactoryTargetPlan,
+  type FinalReportPacket,
   type LeadIntegrationPacket,
+  type ReportWarningFinding,
   ROLE_NAMES,
   type RoleName,
 } from "./types.js";
+import { type FactoryWorkflowMode, parseWorkflowSelection, workflowMode, workflowPolicy } from "./workflow-policy.js";
 
 function targetDisplayStatus(plan: FactoryTargetPlan, id: string): string {
   if (!plan.revalidationIds?.includes(id)) return plan.outcomes[id].status;
@@ -353,7 +357,7 @@ function legacyReportView(state: FactoryRunState): LegacyReportView {
  * it, falls back (clearly labelled) to the accepted Architect/integration
  * artifacts.
  */
-export function formatFactoryReport(state: FactoryRunState): string {
+function formatFactoryReportFull(state: FactoryRunState): string {
   const finalReport = state.results.finalReport?.packet;
   const authoritative = authoritativeArchitectOutcome(state);
   const finalReportIsCurrent = finalReport !== undefined
@@ -406,7 +410,7 @@ export function formatFactoryReport(state: FactoryRunState): string {
     if (finalReport.endingHead) lines.push(`Ending HEAD: ${finalReport.endingHead}`);
     if (finalReport.pushed) lines.push(`Pushed: ${finalReport.pushed}`);
     section(lines, "Human verification (pending)", finalReport.humanVerification);
-    section(lines, "Warnings / limitations", finalReport.warnings);
+    renderFinalReportWarnings(lines, finalReport);
   } else {
     lines.push("");
     lines.push(...legacy!.body);
@@ -516,6 +520,181 @@ function renderTerminalEvidence(lines: string[], state: FactoryRunState, superse
   section(lines, "Recorded runtime errors", state.errors.map((error) => `${error.phase}: ${error.message}`));
 }
 
+function formatWarningFinding(finding: ReportWarningFinding): string {
+  const target = finding.targetIds.length > 0 ? ` [${finding.targetIds.join(", ")}]` : "";
+  const supersededBy = finding.supersededBy ? ` — superseded by: ${finding.supersededBy}` : "";
+  return `${finding.source}${target} (${finding.category}): ${finding.text}${supersededBy}`;
+}
+
+function formatWarningEvidence(finding: ReturnType<typeof collectReportWarningEvidence>[number]): string {
+  const target = finding.targetIds.length > 0 ? ` [${finding.targetIds.join(", ")}]` : "";
+  return `${finding.source}${target} (${finding.category}): ${finding.text}`;
+}
+
+/** Render canonical warnings by source and scope; legacy reports keep their old shape. */
+function renderFinalReportWarnings(lines: string[], report: FinalReportPacket): void {
+  if (!report.warningFindings) {
+    section(lines, "Warnings / limitations", report.warnings);
+    return;
+  }
+  section(lines, "Target-local limitations", report.warningFindings
+    .filter((finding) => finding.scope === "target_local" && finding.disposition === "active")
+    .map(formatWarningFinding));
+  section(lines, "Warnings / limitations", report.warningFindings
+    .filter((finding) => finding.scope === "mission" && finding.disposition === "active")
+    .map(formatWarningFinding));
+  section(lines, "Superseded / historical findings", report.warningFindings
+    .filter((finding) => finding.disposition !== "active")
+    .map(formatWarningFinding));
+}
+
+/** A deliberately small report for workflows without the full gate chain. */
+function formatWorkflowReport(state: FactoryRunState): string {
+  const mode = workflowMode(state);
+  const policy = workflowPolicy(mode);
+  const lines = ["Factory final report", `Run: ${state.runId}`, `Terminal state: ${state.state}`, `Workflow: ${policy.displayName}`];
+  const finalArchitect = authoritativeArchitectOutcome(state);
+  const integratedReview = state.results.integratedReview?.packet;
+  const targetPlan = state.targetPlan;
+  const contradiction = state.architectureContradiction
+    ?? state.results.executionProposal?.packet.architectureContradiction
+    ?? integratedReview?.architectureContradiction
+    ?? finalArchitect?.packet.architectureContradiction;
+
+  lines.push("", "Workflow gates");
+  lines.push(`- Initial Architect: ${policy.initialArchitect ? (state.results.initialArchitect?.packet.verdict ?? "not recorded") : "Not part of this workflow."}`);
+  lines.push(`- Per-target Reviewer: ${policy.perTargetReviewer ? "required" : "Not part of this workflow."}`);
+  lines.push(`- Final Architect: ${policy.finalArchitect ? (finalArchitect?.packet.verdict ?? "not recorded") : "Not part of this workflow."}`);
+
+  const reviewerVerdict = integratedReview?.verdict;
+  if (reviewerVerdict) lines.push(`- Integrated Reviewer verdict: ${reviewerVerdict}`);
+  else if (state.results.reviewers.length > 0) {
+    lines.push(`- Latest target Reviewer verdict: ${state.results.reviewers[state.results.reviewers.length - 1].outcome.packet.verdict}`);
+  } else {
+    lines.push("- Reviewer verdict: not recorded");
+  }
+
+  const finalReport = state.results.finalReport?.packet;
+  const integration = state.results.integration?.packet;
+  const integrationComplete = integration === undefined
+    || (integration.systemVerification.trim() !== "" && integration.reviewerFindingsUnresolved.length === 0);
+  const acceptedSynthesis = state.state === "DONE"
+    && (policy.finalArchitect ? finalArchitect?.packet.verdict === "ACCEPT" : integratedReview?.verdict === "PASS")
+    ? finalReport : undefined;
+  const result = policy.finalArchitect
+    ? (state.state === "DONE" ? finalArchitect?.packet.verdict ?? "final Architect not recorded" : finalArchitect?.packet.verdict === "ACCEPT" ? "not accepted (stopped after Architect ACCEPT)" : finalArchitect?.packet.verdict ?? "not accepted")
+    : state.state !== "DONE"
+      ? (contradiction ? "ARCHITECTURE_CONTRADICTION" : "not accepted")
+      : integratedReview?.verdict === "PASS" && integrationComplete
+        ? "PASS"
+        : contradiction
+          ? "ARCHITECTURE_CONTRADICTION"
+          : "completed";
+  lines.push(`Result: ${result}`);
+
+  if (acceptedSynthesis?.summary.trim()) {
+    lines.push("", acceptedSynthesis.summary.trim());
+  }
+
+  if (targetPlan) {
+    lines.push("", "Target evidence");
+    for (const target of targetPlan.targets) {
+      const outcome = targetPlan.outcomes[target.id];
+      const verification = outcome.verification;
+      lines.push(`- ${target.id}: ${outcome.status}; verification: ${verification ? `${verification.status}: ${verification.evidence}` : "not recorded"}`);
+    }
+  }
+  if (contradiction !== undefined) {
+    lines.push("", "Architecture contradiction");
+    lines.push(`- Assumption: ${contradiction.assumption}`);
+    lines.push(`- Repository evidence: ${contradiction.repositoryEvidence}`);
+    lines.push(`- Affected targets: ${contradiction.affectedTargetIds.join(", ") || "none recorded"}`);
+    lines.push(`- Cannot continue because: ${contradiction.cannotContinueBecause}`);
+    lines.push(`- Owner decision needed: ${contradiction.ownerDecisionNeeded}`);
+  }
+
+  const targetReviewerFindings = state.results.reviewers.flatMap((review) => {
+    const targetId = review.targetId ?? "unknown target";
+    const authoritativeReviewer = state.targetPlan?.outcomes[targetId]?.reviewerAgentId;
+    if (authoritativeReviewer !== undefined && authoritativeReviewer !== review.outcome.agentId) return [];
+    const packet = review.outcome.packet;
+    return [
+      ...packet.blockingFindings.map((finding) => `target_reviewer [${targetId}] blocking: ${finding}`),
+      ...packet.nonBlockingFindings.map((finding) => `target_reviewer [${targetId}] non-blocking: ${finding}`),
+      ...packet.requiredRepairs.map((finding) => `target_reviewer [${targetId}] required repair: ${finding}`),
+      ...packet.testConcerns.map((finding) => `target_reviewer [${targetId}] test concern: ${finding}`),
+    ];
+  });
+  const remediationReviewerFindings = state.results.remediation?.reviewer?.packet;
+  const remediationTarget = state.results.remediation?.engineer?.packet.workPackageId;
+  const repairs = [
+    ...(integratedReview?.requiredRepairs.map((finding) => `integrated_reviewer [${integratedReview.affectedTargetIds.join(", ") || "mission"}] required repair: ${finding}`) ?? []),
+    ...targetReviewerFindings,
+    ...(remediationReviewerFindings?.blockingFindings.map((finding) => `target_reviewer [${remediationTarget ?? "unknown target"}] blocking: ${finding}`) ?? []),
+    ...(remediationReviewerFindings?.nonBlockingFindings.map((finding) => `target_reviewer [${remediationTarget ?? "unknown target"}] non-blocking: ${finding}`) ?? []),
+    ...(remediationReviewerFindings?.requiredRepairs.map((finding) => `target_reviewer [${remediationTarget ?? "unknown target"}] required repair: ${finding}`) ?? []),
+    ...(remediationReviewerFindings?.testConcerns.map((finding) => `target_reviewer [${remediationTarget ?? "unknown target"}] test concern: ${finding}`) ?? []),
+  ];
+  if (repairs.length > 0) section(lines, "Repairs and reviewer findings", repairs);
+
+  if (integratedReview) {
+    section(lines, "Integrated review", [
+      `Verdict: ${integratedReview.verdict}`,
+      ...integratedReview.blockingFindings.map((finding) => `Blocking finding: ${finding}`),
+      ...integratedReview.nonBlockingFindings.map((finding) => `Non-blocking finding: ${finding}`),
+      ...integratedReview.testConcerns.map((concern) => `Test concern: ${concern}`),
+    ]);
+  }
+  if (integration) {
+    const historicalIntegration = state.results.remediation !== undefined;
+    section(lines, historicalIntegration ? "Pre-remediation integration evidence (historical)" : "Integration evidence", [
+      `System verification${historicalIntegration ? " at the earlier checkpoint" : ""}: ${integration.systemVerification}`,
+      `Factual assessment${historicalIntegration ? " at the earlier checkpoint" : ""}: ${integration.factualAssessment}`,
+      ...integration.reviewerFindingsUnresolved.map((finding) => `${historicalIntegration ? "Then-unresolved" : "Unresolved"} reviewer finding: ${finding}`),
+    ]);
+  }
+
+  const ownerPending = [
+    ...Object.values(state.results.executionProposal?.packet.verification ?? {}).filter((item) => item.ownerPending).map((item) => item.evidence),
+    ...(targetPlan?.targets.flatMap((target) => {
+      const verification = targetPlan.outcomes[target.id].verification;
+      return verification?.status === "owner_pending" ? [`${target.id}: ${verification.evidence}`] : [];
+    }) ?? []),
+  ];
+  if (ownerPending.length > 0) section(lines, "Owner-pending verification", ownerPending);
+
+  if (acceptedSynthesis?.warningFindings) {
+    renderFinalReportWarnings(lines, acceptedSynthesis);
+  } else if (acceptedSynthesis) {
+    section(lines, "Legacy unscoped report warnings (scope not recorded)", acceptedSynthesis.warnings);
+    const local = collectReportWarningEvidence(state).filter((item) => item.scope === "target_local");
+    section(lines, "Target-local findings (source packets)", local.map(formatWarningEvidence));
+  } else {
+    const local = collectReportWarningEvidence(state).filter((item) => item.scope === "target_local");
+    section(lines, "Target-local findings (source packets)", local.map(formatWarningEvidence));
+  }
+  if (acceptedSynthesis?.validation.length) section(lines, "Validation", acceptedSynthesis.validation);
+
+  const artifacts = [
+    ...state.results.engineers.flatMap((engineer) => engineer.outcome.packet.changedFiles),
+    ...(state.results.remediation?.engineer?.packet.changedFiles ?? []),
+  ];
+  const artifactEvidence = [
+    ...(artifacts.length > 0 ? [`Changed artifacts: ${[...new Set(artifacts)].join(", ")}`] : []),
+    ...(finalReport?.commits.length ? [`Commits: ${finalReport.commits.join(", ")}`] : []),
+    ...(finalReport?.endingHead ? [`Ending HEAD: ${finalReport.endingHead}`] : []),
+  ];
+  if (artifactEvidence.length > 0) section(lines, "Artifacts and git evidence", artifactEvidence);
+
+  lines.push("", `Full report persisted: ${FACTORY_DIR}/${state.runId}.json`);
+  return lines.join("\n");
+}
+
+/** The workflow-aware report preserves the historical FULL format byte-for-byte. */
+export function formatFactoryReport(state: FactoryRunState): string {
+  return workflowMode(state) === "full" ? formatFactoryReportFull(state) : formatWorkflowReport(state);
+}
+
 /** Automatic post-run rendering uses the same report for every terminal state. */
 export function formatFactoryCompletion(state: FactoryRunState): string {
   return isTerminal(state.state) ? formatFactoryReport(state) : `Factory run ${state.runId} is not terminal (${state.state}).`;
@@ -524,6 +703,15 @@ export function formatFactoryCompletion(state: FactoryRunState): string {
 /** Section titles promoted to `##` headings in the Markdown report message. */
 const REPORT_HEADINGS = new Set([
   "Factory final report",
+  "Workflow gates",
+  "Target evidence",
+  "Architecture contradiction",
+  "Repairs and reviewer findings",
+  "Integrated review",
+  "Integration evidence",
+  "Pre-remediation integration evidence (historical)",
+  "Owner-pending verification",
+  "Artifacts and git evidence",
   "Delivered",
   "Architecture / decisions",
   "Reviewer findings",
@@ -531,6 +719,10 @@ const REPORT_HEADINGS = new Set([
   "Commits",
   "Human verification (pending)",
   "Warnings / limitations",
+  "Target-local limitations",
+  "Superseded / historical findings",
+  "Legacy unscoped report warnings (scope not recorded)",
+  "Target-local findings (source packets)",
   "Remediation history",
   "Final accepted evidence",
   "Historical integration (before remediation; not current workspace evidence)",
@@ -617,36 +809,100 @@ function latestStateFor(cwd: string, runtime: FactoryCommandRuntime): FactoryRun
   return runs.length > 0 ? runtime.peekState(runs[0].runId, cwd) : undefined;
 }
 
-export function registerFactoryCommands(pi: ExtensionAPI, runtime: FactoryCommandRuntime): void {
+export interface FactoryWorkflowSession {
+  get(): FactoryWorkflowMode;
+  set(mode: FactoryWorkflowMode): void;
+  resetPending(): void;
+}
+
+function workflowStartScreen(ctx: ExtensionCommandContext, mode: FactoryWorkflowMode): void {
+  const policy = workflowPolicy(mode);
+  const config = loadFactoryConfig(ctx.cwd);
+  const preset = projectPresetName(ctx.cwd) ?? "(defaults; no preset)";
+  const model = (role: RoleName): string => config.roles[role]?.targets.primary ?? "not configured";
+  const architect = model("architect");
+  const reviewer = model("reviewer");
+  const lead = model("lead");
+  const reviewerStage = policy.perTargetReviewer
+    ? `Reviewer: per target — ${reviewer}`
+    : `Reviewer: integrated — ${reviewer}`;
+  ctx.ui.notify(
+    `AI Factory\n\nWorkflow: ${policy.displayName}\n`
+    + `Preset: ${preset}\n`
+    + `Lead: ${lead}\n`
+    + `Initial Architect: ${policy.initialArchitect ? `enabled — ${architect}` : `disabled (configured: ${architect})`}\n`
+    + `${reviewerStage}\n`
+    + `Final Architect: ${policy.finalArchitect ? `enabled — ${architect}${policy.initialArchitect ? "" : " (conformance audit)"}` : `disabled (configured: ${architect})`}\n`
+    + `Final verification: ${policy.finalArchitect ? (policy.initialArchitect ? "Architect acceptance" : "Architect conformance audit") : "Integrated Reviewer"}\n`
+    + (policy.initialArchitect ? "" : "Architecture contradiction: STOP\n")
+    + "Factory task — describe the goal.",
+    "info",
+  );
+}
+
+export function registerFactoryCommands(
+  pi: ExtensionAPI,
+  runtime: FactoryCommandRuntime,
+  workflow: FactoryWorkflowSession = { get: () => "full", set: () => undefined, resetPending: () => undefined },
+): void {
+  let awaitingTask = false;
+  workflow.resetPending = () => { awaitingTask = false; };
+
+  const startFactory = async (task: string, ctx: ExtensionCommandContext): Promise<void> => {
+    awaitingTask = false;
+    if (!(await runtime.isAvailable())) {
+      ctx.ui.notify("pi-subagents is not available in this session; Factory cannot run without it.", "error");
+      return;
+    }
+    const warnings = validateFactoryConfig(loadFactoryConfig(ctx.cwd), availableModels(ctx));
+    if (warnings.length > 0) ctx.ui.notify(`Factory config warnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`, "warning");
+    const { id, controller } = runtime.launch(ctx.cwd, task);
+    ctx.ui.notify(`Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}`, "info");
+    runtime.showRunPanel(ctx, id);
+    if (ctx.hasUI) void controller.waitForTerminal().then((final) => runtime.reportCompletion(final));
+  };
+
+  pi.on("input", async (event, ctx) => {
+    if (!awaitingTask || event.source === "extension") return { action: "continue" as const };
+    awaitingTask = false;
+    const task = event.text.trim();
+    if (task === "") {
+      ctx.ui.notify("Factory cancelled: no task provided.", "info");
+      return { action: "handled" as const };
+    }
+    await startFactory(task, ctx as ExtensionCommandContext);
+    return { action: "handled" as const };
+  });
+
+  pi.registerCommand("factory-workflow", {
+    description: "Set the Factory workflow for this Pi session: full|verified|lean.",
+    handler: async (args, ctx) => {
+      const label = args.trim();
+      if (label === "") {
+        const mode = workflow.get();
+        ctx.ui.notify(`Factory workflow: ${workflowPolicy(mode).displayName} (${mode}).\nUsage: /factory-workflow full|verified|lean`, "info");
+        return;
+      }
+      const mode = parseWorkflowSelection(label);
+      if (mode === undefined) {
+        ctx.ui.notify("Usage: /factory-workflow full|verified|lean", "error");
+        return;
+      }
+      workflow.set(mode);
+      ctx.ui.notify(`Factory workflow set to ${workflowPolicy(mode).displayName} (${mode}) for this Pi session.`, "info");
+    },
+  });
+
   pi.registerCommand("factory", {
     description: "Start an AI Factory run for a task (deterministic; no model decides to invoke it).",
     handler: async (args, ctx) => {
-      if (!(await runtime.isAvailable())) {
-        ctx.ui.notify("pi-subagents is not available in this session; Factory cannot run without it.", "error");
+      const task = args.trim();
+      if (task === "") {
+        awaitingTask = true;
+        workflowStartScreen(ctx, workflow.get());
         return;
       }
-      let task = args.trim();
-      if (task === "") {
-        if (!ctx.hasUI) {
-          ctx.ui.notify("Usage: /factory <task>", "error");
-          return;
-        }
-        task = ((await ctx.ui.editor("Factory task — describe the goal")) ?? "").trim();
-      }
-      if (task === "") {
-        ctx.ui.notify("Factory cancelled: no task provided.", "info");
-        return;
-      }
-      const warnings = validateFactoryConfig(loadFactoryConfig(ctx.cwd), availableModels(ctx));
-      if (warnings.length > 0) {
-        ctx.ui.notify(`Factory config warnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`, "warning");
-      }
-      const { id, controller } = runtime.launch(ctx.cwd, task);
-      ctx.ui.notify(`Factory run started.\nrunId: ${id}\nstate: ${controller.getState().state}`, "info");
-      runtime.showRunPanel(ctx, id);
-      // Auto-append the same evidence-based report for every terminal outcome.
-      // The runtime deduplicates repeated completion callbacks durably.
-      if (ctx.hasUI) void controller.waitForTerminal().then((final) => runtime.reportCompletion(final));
+      await startFactory(task, ctx);
     },
   });
 

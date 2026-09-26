@@ -9,6 +9,7 @@
 
 import { hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedSpawnAttempt } from "./recovery-model.js";
 import { type FactoryRecoveryEligibility, type FactoryRunState, type FactoryState, TERMINAL_STATES } from "./types.js";
+import type { FactoryWorkflowMode } from "./workflow-policy.js";
 
 export { createFactoryCheckpoint, planFactoryRecovery, unresolvedSpawnAttempt } from "./recovery-model.js";
 
@@ -42,21 +43,22 @@ export { createFactoryCheckpoint, planFactoryRecovery, unresolvedSpawnAttempt } 
  * state to resume into), so it is intentionally open.
  */
 const TRANSITIONS: Record<FactoryState, readonly FactoryState[]> = {
-  DISCOVERY: ["INITIAL_ARCHITECT", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  DISCOVERY: ["INITIAL_ARCHITECT", "EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   INITIAL_ARCHITECT: ["EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  EXECUTION: ["REVIEW", "INTEGRATION", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  EXECUTION: ["REVIEW", "INTEGRATED_REVIEW", "INTEGRATION", "ARCHITECT_ESCALATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  INTEGRATED_REVIEW: ["EXECUTION", "INTEGRATION", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   REVIEW: ["INTEGRATION", "EXECUTION", "ARCHITECT_ESCALATION", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   ARCHITECT_ESCALATION: ["EXECUTION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  INTEGRATION: ["FINAL_ARCHITECT", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  INTEGRATION: ["FINAL_ARCHITECT", "FINAL_SYNTHESIS", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   FINAL_ARCHITECT: ["FINAL_SYNTHESIS", "REMEDIATION", "WAITING_CAPACITY", "FAILED", "STOPPED"],
-  REMEDIATION: ["REVIEW", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
+  REMEDIATION: ["REVIEW", "INTEGRATED_REVIEW", "FINAL_ARCHITECT_RECHECK", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   FINAL_ARCHITECT_RECHECK: ["FINAL_SYNTHESIS", "STOPPED", "WAITING_CAPACITY", "FAILED"],
   FINAL_SYNTHESIS: ["DONE", "WAITING_CAPACITY", "FAILED", "STOPPED"],
   WAITING_CAPACITY: [
     // Resume targets; the run records which one it came from and may return to
     // any active state. Terminal states are also reachable if a wake discovers
     // the situation has become unrecoverable.
-    "DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "ARCHITECT_ESCALATION",
+    "DISCOVERY", "INITIAL_ARCHITECT", "EXECUTION", "REVIEW", "INTEGRATED_REVIEW", "ARCHITECT_ESCALATION",
     "INTEGRATION", "FINAL_ARCHITECT", "REMEDIATION", "FINAL_ARCHITECT_RECHECK",
     "FINAL_SYNTHESIS", "FAILED", "STOPPED",
   ],
@@ -66,7 +68,10 @@ const TRANSITIONS: Record<FactoryState, readonly FactoryState[]> = {
 };
 
 /** True when a transition from `from` to `to` is legal. */
-export function isLegalTransition(from: FactoryState, to: FactoryState): boolean {
+export function isLegalTransition(from: FactoryState, to: FactoryState, mode: FactoryWorkflowMode = "full"): boolean {
+  if (mode === "full" && (to === "INTEGRATED_REVIEW" || from === "INTEGRATED_REVIEW"
+    || (from === "DISCOVERY" && to === "EXECUTION")
+    || (from === "INTEGRATION" && to === "FINAL_SYNTHESIS"))) return false;
   return TRANSITIONS[from].includes(to);
 }
 
@@ -77,11 +82,11 @@ export function isLegalTransition(from: FactoryState, to: FactoryState): boolean
  * tests and logs instead of producing a run that skipped a mandatory
  * checkpoint (e.g. Engineer running before the initial Architect approved).
  */
-export function assertTransition(from: FactoryState, to: FactoryState): void {
+export function assertTransition(from: FactoryState, to: FactoryState, mode: FactoryWorkflowMode = "full"): void {
   if (from === to) return;
-  if (!isLegalTransition(from, to)) {
+  if (!isLegalTransition(from, to, mode)) {
     throw new Error(
-      `Illegal Factory transition: ${from} -> ${to}. Legal: ${TRANSITIONS[from].join(", ") || "(terminal)"}`,
+      `Illegal Factory transition: ${from} -> ${to}. Legal: ${TRANSITIONS[from].filter((target) => isLegalTransition(from, target, mode)).join(", ") || "(terminal)"}`,
     );
   }
 }
@@ -211,6 +216,7 @@ export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecove
     "INITIAL_ARCHITECT",
     "EXECUTION",
     "REVIEW",
+    "INTEGRATED_REVIEW",
     "ARCHITECT_ESCALATION",
     "INTEGRATION",
     "FINAL_ARCHITECT",
@@ -350,6 +356,8 @@ function nextPhaseLabel(state: FactoryState): string {
       return "spawn Engineer for EXECUTION";
     case "REVIEW":
       return "spawn Reviewer for REVIEW";
+    case "INTEGRATED_REVIEW":
+      return "spawn Reviewer for INTEGRATED_REVIEW";
     case "ARCHITECT_ESCALATION":
       return "spawn Architect for ARCHITECT_ESCALATION";
     case "INTEGRATION":

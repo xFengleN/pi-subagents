@@ -3,11 +3,19 @@ import type { ArchitectPlanAssessment, FactoryMissionRequirement, FactoryTarget,
 export const TARGET_ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const REQUIREMENT_ID = /^REQ-\d{3,}$/;
 
-/** Assign immutable-in-run IDs to the Lead's original requirements and constraints. */
-export function createRequirementCatalog(humanRequirements: string[], constraints: string[]): FactoryMissionRequirement[] {
+/** Assign immutable-in-run IDs to implementation requirements, constraints, and mission metadata. */
+export function createRequirementCatalog(
+  humanRequirements: string[],
+  constraints: string[],
+  missionRequirements: string[] = [],
+): FactoryMissionRequirement[] {
   const catalog: FactoryMissionRequirement[] = [];
   const seen = new Set<string>();
-  for (const [source, entries] of [["human_requirement", humanRequirements], ["human_constraint", constraints]] as const) {
+  for (const [source, entries] of [
+    ["human_requirement", humanRequirements],
+    ["human_constraint", constraints],
+    ["mission_requirement", missionRequirements],
+  ] as const) {
     for (const text of entries) {
       const key = `${source}:${text.trim().toLowerCase().replace(/\s+/g, " ")}`;
       if (seen.has(key)) continue;
@@ -16,6 +24,27 @@ export function createRequirementCatalog(humanRequirements: string[], constraint
     }
   }
   return catalog;
+}
+
+/**
+ * Check model-supplied identity references against Factory-assigned IDs.
+ * Catalog order and explanatory wording are not identity; IDs and requirement
+ * versus constraint classification are. The returned canonical catalog should
+ * be the one persisted by Factory.
+ */
+export function hasMatchingRequirementIdentities(
+  expected: FactoryMissionRequirement[],
+  supplied: FactoryMissionRequirement[],
+): boolean {
+  if (supplied.length !== expected.length) return false;
+  const expectedById = new Map(expected.map((item) => [item.id, item]));
+  const seen = new Set<string>();
+  for (const item of supplied) {
+    const canonical = expectedById.get(item.id);
+    if (!canonical || seen.has(item.id) || canonical.source !== item.source || !item.text.trim()) return false;
+    seen.add(item.id);
+  }
+  return seen.size === expected.length;
 }
 
 /** Fail closed on incomplete or ambiguous executable plans, before any Engineer runs. */
@@ -109,10 +138,11 @@ export function validateArchitectTargetApproval(
   if (requirements.size !== assessment.missionRequirements.length) issues.push("Architect mission requirements contain duplicates");
   const coverage = new Map<string, string[]>();
   if (proposal.requirementCatalog !== undefined) {
-    const expectedCatalog = createRequirementCatalog(proposal.humanRequirements ?? [], proposal.constraints);
+    const expectedCatalog = createRequirementCatalog(proposal.humanRequirements ?? [], proposal.constraints, proposal.missionRequirements ?? []);
     if (JSON.stringify(proposal.requirementCatalog) !== JSON.stringify(expectedCatalog)) issues.push("Lead requirement identities do not match the original requirement inventory");
     if (expectedCatalog.length === 0) issues.push("Multi-target approval has no original mission requirement identities");
-    const knownRequirements = new Set(expectedCatalog.map((requirement) => requirement.id));
+    const targetMappedRequirements = expectedCatalog.filter((requirement) => requirement.source !== "mission_requirement");
+    const knownRequirements = new Set(targetMappedRequirements.map((requirement) => requirement.id));
     for (const item of assessment.requirementCoverage) {
       if (!("requirementId" in item)) {
         issues.push(`Coverage mapping for ${item.requirement} must use a stable Lead requirement identity`);
@@ -126,7 +156,7 @@ export function validateArchitectTargetApproval(
       if (item.targetIds.length === 0 || new Set(item.targetIds).size !== item.targetIds.length) issues.push(`Requirement identity needs unique target coverage: ${id}`);
       for (const targetId of item.targetIds) if (!approvedIds.has(targetId)) issues.push(`Requirement ${id} maps to unknown target ${targetId}`);
     }
-    for (const requirement of expectedCatalog) {
+    for (const requirement of targetMappedRequirements) {
       if (!coverage.has(requirement.id)) issues.push(`Mandatory requirement identity has no target coverage: ${requirement.id}`);
     }
     const mandatoryConstraints = new Set(expectedCatalog.filter((item) => item.source === "human_constraint").map((item) => item.id));

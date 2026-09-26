@@ -78,6 +78,7 @@ const PACKETS = {
     pushed: "unknown",
     humanVerification: ["run the widgets package by hand"],
     warnings: [],
+    warningDecisions: [],
   },
 } as const;
 

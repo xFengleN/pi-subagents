@@ -14,6 +14,8 @@
 
 /** The four Factory roles. `RoleName` is the identity; a role's backend model
  * is configuration, never part of the role definition. */
+import type { FactoryWorkflowMode } from "./workflow-policy.js";
+
 export type RoleName = "lead" | "architect" | "engineer" | "reviewer";
 
 export const ROLE_NAMES: readonly RoleName[] = ["lead", "architect", "engineer", "reviewer"];
@@ -30,6 +32,7 @@ export const FACTORY_STATES = [
   "INITIAL_ARCHITECT",    // mandatory initial architecture checkpoint
   "EXECUTION",            // Engineer works a work package
   "REVIEW",               // Reviewer assesses implementation correctness
+  "INTEGRATED_REVIEW",    // Execution workflows: one whole-system review
   "ARCHITECT_ESCALATION", // exceptional structural escalation mid-run
   "INTEGRATION",          // Lead integrates + verifies the whole system
   "FINAL_ARCHITECT",      // mandatory final architecture/acceptance checkpoint
@@ -62,8 +65,10 @@ export interface LeadProposalPacket {
   workPackages: string[];
   /** Executable decomposition for new runs; prose workPackages remains an audit summary. */
   targets?: FactoryTarget[];
-  /** Human requirements extracted from the original task, kept distinct from inferred design choices. */
+  /** Human implementation requirements extracted from the original task. */
   humanRequirements?: string[];
+  /** Execution-profile mission/report metadata that is not an implementation target obligation. */
+  missionRequirements?: string[];
   /** Deterministic identities assigned to original requirements and explicit constraints before Architect review. */
   requirementCatalog?: FactoryMissionRequirement[];
   /** Explicit task-level dependency edges, represented by the proposed target identities. */
@@ -78,7 +83,7 @@ export interface LeadProposalPacket {
 export interface FactoryMissionRequirement {
   id: string;
   text: string;
-  source: "human_requirement" | "human_constraint";
+  source: "human_requirement" | "human_constraint" | "mission_requirement";
 }
 
 /** An explicit human-stated dependency edge between proposed targets. */
@@ -117,6 +122,31 @@ export interface ArchitectInitialResult {
 }
 
 /** Engineer completion packet. */
+export interface FactoryArchitectureContradiction {
+  assumption: string;
+  repositoryEvidence: string;
+  affectedTargetIds: string[];
+  cannotContinueBecause: string;
+  ownerDecisionNeeded: string;
+}
+
+/** Execution workflow's authoritative contract and verification plan. */
+export interface ExecutionContractPacket extends LeadProposalPacket {
+  /** Implementation requirements, distinct from lifecycle/report metadata. */
+  humanRequirements: string[];
+  /** Factory lifecycle/report obligations; never target, dependency, or verification requirements. */
+  missionRequirements: string[];
+  requirementCatalog: FactoryMissionRequirement[];
+  verification: Record<string, { command?: string; evidence: string; ownerPending?: boolean }>;
+  architectureContradiction?: FactoryArchitectureContradiction;
+}
+
+export interface FactoryVerificationResult {
+  status: "passed" | "failed" | "owner_pending" | "unavailable";
+  evidence: string;
+  command?: string;
+}
+
 export interface EngineerPacket {
   status: "completed" | "partially_completed" | "failed";
   workPackageId: string;
@@ -142,6 +172,12 @@ export interface ReviewerPacket {
 }
 
 /** Lead integration/acceptance packet (INTEGRATION). */
+export interface IntegratedReviewPacket extends Omit<ReviewerPacket, "verdict"> {
+  verdict: "PASS" | "REPAIR_REQUIRED" | "ARCHITECTURE_CONTRADICTION";
+  affectedTargetIds: string[];
+  architectureContradiction?: FactoryArchitectureContradiction;
+}
+
 export interface LeadIntegrationPacket {
   goal: string;
   approvedArchitecture: string;
@@ -158,7 +194,8 @@ export interface LeadIntegrationPacket {
 
 /** Final Architect acceptance-checkpoint result. */
 export interface ArchitectFinalResult {
-  verdict: "ACCEPT" | "NEEDS_REMEDIATION";
+  verdict: "ACCEPT" | "NEEDS_REMEDIATION" | "ARCHITECTURE_CONTRADICTION";
+  architectureContradiction?: FactoryArchitectureContradiction;
   /** Explicit correction ownership on multi-target missions. */
   affectedTargetIds?: string[];
   integrationOnly?: boolean;
@@ -176,6 +213,30 @@ export interface ArchitectFinalResult {
  * state, assembled from persisted evidence only. It never reopens remediation
  * and never triggers repo changes or further agents.
  */
+export type ReportWarningSource = "engineer" | "target_reviewer" | "integrated_reviewer" | "integration_lead" | "final_architect";
+export type ReportWarningScope = "target_local" | "mission";
+export type ReportWarningDisposition = "active" | "superseded" | "historical";
+
+/** Canonical warning evidence with provenance retained through synthesis. */
+export interface ReportWarningFinding {
+  findingId: string;
+  source: ReportWarningSource;
+  scope: ReportWarningScope;
+  targetIds: string[];
+  category: string;
+  text: string;
+  disposition: ReportWarningDisposition;
+  /** Accepted evidence that supersedes an obsolete observation, when known. */
+  supersededBy?: string;
+}
+
+/** Lead-authored status for one controller-assigned warning evidence ID. */
+export interface ReportWarningDecision {
+  findingId: string;
+  disposition: ReportWarningDisposition;
+  supersededBy?: string;
+}
+
 export interface FinalReportPacket {
   /** Final result/verdict, e.g. "ACCEPT". */
   result: string;
@@ -197,8 +258,12 @@ export interface FinalReportPacket {
   pushed: string;
   /** Human verification still pending. */
   humanVerification: string[];
-  /** Warnings, limitations, or contradictory evidence. */
+  /** Active mission-level warnings only; derived from warningFindings. */
   warnings: string[];
+  /** Optional on older persisted reports; canonical source/scope/disposition on new reports. */
+  warningFindings?: ReportWarningFinding[];
+  /** Temporary model output, normalized against controller-owned evidence before persistence. */
+  warningDecisions?: ReportWarningDecision[];
 }
 
 /** Lead disposition after a bounded repair loop is exhausted. */
@@ -210,6 +275,8 @@ export interface LeadEscalationPacket {
 /** Every packet a role may produce, keyed by role, for the packet parsers. */
 export type Packet =
   | LeadProposalPacket
+  | ExecutionContractPacket
+  | IntegratedReviewPacket
   | ArchitectInitialResult
   | EngineerPacket
   | ReviewerPacket
@@ -296,6 +363,9 @@ export interface ReviewerOutcome {
  * transcripts, no full child conversations. */
 export interface PhaseResults {
   proposal?: RoleOutcome<LeadProposalPacket>;
+  executionProposal?: RoleOutcome<ExecutionContractPacket>;
+  integratedReview?: RoleOutcome<IntegratedReviewPacket>;
+  integratedReviews?: RoleOutcome<IntegratedReviewPacket>[];
   initialArchitect?: RoleOutcome<ArchitectInitialResult>;
   engineers: EngineerOutcome[];
   reviewers: ReviewerOutcome[];
@@ -370,6 +440,8 @@ export interface FactoryTargetOutcome {
   engineerAgentId?: string;
   reviewerAgentId?: string;
   architectAgentId?: string;
+  /** Execution paths distinguish verified implementation from independent review. */
+  verification?: FactoryVerificationResult;
 }
 
 /** Serial target progression; absent on version 1/2 runs (never inferred on restore). */
@@ -463,6 +535,9 @@ export interface FactoryRunState {
    * with identical role/model targets even if the project file or an inline
    * override has since changed. */
   config: FactoryConfig;
+  /** Immutable per-run policy identity. Missing in historical snapshots = FULL. */
+  workflow?: { mode: FactoryWorkflowMode };
+  architectureContradiction?: FactoryArchitectureContradiction;
   state: FactoryState;
   /** Engineer/Reviewer repair loop counter (EXECUTION/REVIEW alternation). */
   repairRound: number;
@@ -657,6 +732,7 @@ export interface FactoryMetrics {
  */
 export interface FactoryRunSummary {
   runId: string;
+  workflow: FactoryWorkflowMode;
   state: FactoryState;
   task: string;
   stoppedReason?: string;

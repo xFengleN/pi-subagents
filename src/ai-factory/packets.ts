@@ -13,24 +13,32 @@
  */
 
 import { type CompiledSchema, compileJsonSchema } from "../workflow/json-schema.js";
-import { createRequirementCatalog } from "./targets.js";
+import { createRequirementCatalog, hasMatchingRequirementIdentities } from "./targets.js";
 import type {
   ArchitectFinalResult,
   ArchitectInitialResult,
   ArchitectPlanAssessment,
   EngineerPacket,
+  ExecutionContractPacket,
+  FactoryArchitectureContradiction,
   FactoryDependency,
+  FactoryMissionRequirement,
   FactoryTarget,
   FinalReportPacket,
+  IntegratedReviewPacket,
   LeadEscalationPacket,
   LeadIntegrationPacket,
   LeadProposalPacket,
   Packet,
+  ReportWarningDecision,
   ReviewerPacket,
 } from "./types.js";
 
 export type PacketKind =
   | "proposal"
+  | "execution_proposal"
+  | "integrated_review"
+  | "conformance_final"
   | "architect_initial"
   | "engineer"
   | "reviewer"
@@ -40,6 +48,28 @@ export type PacketKind =
   | "lead_escalation";
 
 const strArr = { type: "array", items: { type: "string" } } as const;
+const architectureContradictionSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["assumption", "repositoryEvidence", "affectedTargetIds", "cannotContinueBecause", "ownerDecisionNeeded"],
+  properties: {
+    assumption: { type: "string" },
+    repositoryEvidence: { type: "string" },
+    affectedTargetIds: { type: "array", minItems: 1, items: { type: "string" } },
+    cannotContinueBecause: { type: "string" },
+    ownerDecisionNeeded: { type: "string" },
+  },
+} as const;
+const verificationSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["evidence"],
+  properties: {
+    command: { type: "string" },
+    evidence: { type: "string" },
+    ownerPending: { type: "boolean" },
+  },
+} as const;
 const targetArr = {
   type: "array",
   items: {
@@ -111,6 +141,60 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       architecturalQuestions: strArr,
     },
   },
+  execution_proposal: {
+    type: "object",
+    additionalProperties: false,
+    required: ["goal", "proposedSolution", "workPackages", "acceptanceCriteria", "verification", "humanRequirements", "constraints", "missionRequirements"],
+    properties: {
+      goal: { type: "string" },
+      repositoryFindings: { type: "string" },
+      currentArchitecture: { type: "string" },
+      assumptions: strArr,
+      proposedSolution: { type: "string" },
+      constraints: strArr,
+      workPackages: strArr,
+      targets: targetArr,
+      humanRequirements: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      missionRequirements: strArr,
+      humanDependencies: dependencyArr,
+      dependencies: { type: "string" },
+      risks: strArr,
+      acceptanceCriteria: strArr,
+      architecturalQuestions: strArr,
+      verification: { type: "object", additionalProperties: verificationSchema },
+      architectureContradiction: architectureContradictionSchema,
+    },
+  },
+  integrated_review: {
+    type: "object",
+    additionalProperties: false,
+    required: ["verdict", "affectedTargetIds"],
+    properties: {
+      verdict: { type: "string", enum: ["PASS", "REPAIR_REQUIRED", "ARCHITECTURE_CONTRADICTION"] },
+      affectedTargetIds: strArr,
+      blockingFindings: strArr,
+      nonBlockingFindings: strArr,
+      requiredRepairs: strArr,
+      testConcerns: strArr,
+      architecturalIssue: { type: "boolean" },
+      architectureContradiction: architectureContradictionSchema,
+    },
+  },
+  conformance_final: {
+    type: "object",
+    additionalProperties: false,
+    required: ["verdict"],
+    properties: {
+      verdict: { type: "string", enum: ["ACCEPT", "NEEDS_REMEDIATION", "ARCHITECTURE_CONTRADICTION"] },
+      affectedTargetIds: strArr,
+      architectureContradiction: architectureContradictionSchema,
+      integrationOnly: { type: "boolean" },
+      blockingIssues: strArr,
+      requiredChanges: strArr,
+      doNotChange: strArr,
+      requiredEvidence: strArr,
+    },
+  },
   architect_initial: {
     type: "object",
     additionalProperties: false,
@@ -180,8 +264,9 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
     additionalProperties: false,
     required: ["verdict"],
     properties: {
-      verdict: { type: "string", enum: ["ACCEPT", "NEEDS_REMEDIATION"] },
+      verdict: { type: "string", enum: ["ACCEPT", "NEEDS_REMEDIATION", "ARCHITECTURE_CONTRADICTION"] },
       affectedTargetIds: strArr,
+      architectureContradiction: architectureContradictionSchema,
       integrationOnly: { type: "boolean" },
       blockingIssues: strArr,
       requiredChanges: strArr,
@@ -192,7 +277,7 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
   final_report: {
     type: "object",
     additionalProperties: false,
-    required: ["result", "summary"],
+    required: ["result", "summary", "warningDecisions"],
     properties: {
       result: { type: "string" },
       summary: { type: "string" },
@@ -205,6 +290,19 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       pushed: { type: "string" },
       humanVerification: strArr,
       warnings: strArr,
+      warningDecisions: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["findingId", "disposition"],
+          properties: {
+            findingId: { type: "string" },
+            disposition: { type: "string", enum: ["active", "superseded", "historical"] },
+            supersededBy: { type: "string" },
+          },
+        },
+      },
     },
   },
   lead_escalation: {
@@ -234,8 +332,66 @@ export function packetSchema(kind: PacketKind): CompiledSchema {
 }
 
 const strList = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+const warningDecisions = (value: unknown): ReportWarningDecision[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const decisions: ReportWarningDecision[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.findingId !== "string"
+      || (raw.disposition !== "active" && raw.disposition !== "superseded" && raw.disposition !== "historical")
+      || (raw.supersededBy !== undefined && typeof raw.supersededBy !== "string")) return undefined;
+    decisions.push({ findingId: raw.findingId, disposition: raw.disposition, ...(raw.supersededBy === undefined ? {} : { supersededBy: raw.supersededBy }) });
+  }
+  return decisions;
+};
 const str = (v: unknown, d = ""): string => typeof v === "string" ? v : d;
 const bool = (v: unknown, d = false): boolean => typeof v === "boolean" ? v : d;
+const architectureContradiction = (value: unknown): FactoryArchitectureContradiction | undefined => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (typeof item.assumption !== "string" || typeof item.repositoryEvidence !== "string"
+    || !Array.isArray(item.affectedTargetIds) || item.affectedTargetIds.length === 0 || !item.affectedTargetIds.every((id) => typeof id === "string")
+    || typeof item.cannotContinueBecause !== "string" || typeof item.ownerDecisionNeeded !== "string") return undefined;
+  return {
+    assumption: item.assumption,
+    repositoryEvidence: item.repositoryEvidence,
+    affectedTargetIds: item.affectedTargetIds as string[],
+    cannotContinueBecause: item.cannotContinueBecause,
+    ownerDecisionNeeded: item.ownerDecisionNeeded,
+  };
+};
+
+const verification = (value: unknown): ExecutionContractPacket["verification"] | undefined => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result: ExecutionContractPacket["verification"] = {};
+  for (const [targetId, raw] of Object.entries(value)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.evidence !== "string" || (item.command !== undefined && typeof item.command !== "string")
+      || (item.ownerPending !== undefined && typeof item.ownerPending !== "boolean")) return undefined;
+    result[targetId] = {
+      evidence: item.evidence,
+      ...(item.command === undefined ? {} : { command: item.command }),
+      ...(item.ownerPending === undefined ? {} : { ownerPending: item.ownerPending }),
+    };
+  }
+  return result;
+};
+
+const requirementCatalog = (value: unknown): FactoryMissionRequirement[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const result: FactoryMissionRequirement[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+    const requirement = item as Record<string, unknown>;
+    if (typeof requirement.id !== "string" || typeof requirement.text !== "string"
+      || (requirement.source !== "human_requirement" && requirement.source !== "human_constraint" && requirement.source !== "mission_requirement")) return undefined;
+    result.push({ id: requirement.id, text: requirement.text, source: requirement.source });
+  }
+  return result;
+};
+
 const dependencies = (value: unknown): FactoryDependency[] | undefined => {
   if (!Array.isArray(value)) return undefined;
   const result: FactoryDependency[] = [];
@@ -329,6 +485,52 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       };
       return p;
     }
+    case "execution_proposal": {
+      if (typeof raw.goal !== "string" || typeof raw.proposedSolution !== "string"
+        || !Array.isArray(raw.workPackages) || !Array.isArray(raw.acceptanceCriteria)
+        || !Array.isArray(raw.humanRequirements) || raw.humanRequirements.length === 0
+        || !raw.humanRequirements.every((item) => typeof item === "string" && item.trim() !== "")
+        || !Array.isArray(raw.constraints) || !raw.constraints.every((item) => typeof item === "string" && item.trim() !== "")
+        || !Array.isArray(raw.missionRequirements) || !raw.missionRequirements.every((item) => typeof item === "string" && item.trim() !== "")) return undefined;
+      const proposedTargets = raw.targets === undefined ? undefined : targets(raw.targets);
+      const contractVerification = verification(raw.verification);
+      if ((raw.targets !== undefined && proposedTargets === undefined) || contractVerification === undefined) return undefined;
+      const contradiction = raw.architectureContradiction === undefined ? undefined : architectureContradiction(raw.architectureContradiction);
+      if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
+      const humanDependencies = raw.humanDependencies === undefined ? undefined : dependencies(raw.humanDependencies);
+      if (raw.humanDependencies !== undefined && humanDependencies === undefined) return undefined;
+      const suppliedCatalog = raw.requirementCatalog === undefined ? undefined : requirementCatalog(raw.requirementCatalog);
+      if (raw.requirementCatalog !== undefined && suppliedCatalog === undefined) return undefined;
+      const humanRequirements = strList(raw.humanRequirements);
+      const constraints = strList(raw.constraints);
+      const missionRequirements = strList(raw.missionRequirements);
+      const canonicalCatalog = createRequirementCatalog(humanRequirements, constraints, missionRequirements);
+      if (suppliedCatalog !== undefined && !hasMatchingRequirementIdentities(canonicalCatalog, suppliedCatalog)) return undefined;
+      return {
+        goal: raw.goal, repositoryFindings: str(raw.repositoryFindings), currentArchitecture: str(raw.currentArchitecture),
+        assumptions: strList(raw.assumptions), proposedSolution: raw.proposedSolution, constraints,
+        workPackages: raw.workPackages.map(String), ...(proposedTargets === undefined ? {} : { targets: proposedTargets }),
+        humanRequirements, missionRequirements,
+        requirementCatalog: canonicalCatalog,
+        ...(humanDependencies === undefined ? {} : { humanDependencies }), dependencies: str(raw.dependencies),
+        risks: strList(raw.risks), acceptanceCriteria: raw.acceptanceCriteria.map(String), architecturalQuestions: strList(raw.architecturalQuestions),
+        verification: contractVerification, ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
+      } satisfies ExecutionContractPacket;
+    }
+    case "integrated_review": {
+      const verdict = raw.verdict;
+      if (verdict !== "PASS" && verdict !== "REPAIR_REQUIRED" && verdict !== "ARCHITECTURE_CONTRADICTION") return undefined;
+      if (!Array.isArray(raw.affectedTargetIds) || !raw.affectedTargetIds.every((id) => typeof id === "string")) return undefined;
+      const contradiction = raw.architectureContradiction === undefined ? undefined : architectureContradiction(raw.architectureContradiction);
+      if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
+      if (verdict === "ARCHITECTURE_CONTRADICTION" && contradiction === undefined) return undefined;
+      return {
+        verdict, affectedTargetIds: raw.affectedTargetIds as string[], blockingFindings: strList(raw.blockingFindings),
+        nonBlockingFindings: strList(raw.nonBlockingFindings), requiredRepairs: strList(raw.requiredRepairs),
+        testConcerns: strList(raw.testConcerns), architecturalIssue: bool(raw.architecturalIssue),
+        ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
+      } satisfies IntegratedReviewPacket;
+    }
     case "architect_initial": {
       const verdict = raw.verdict;
       if (verdict !== "APPROVE" && verdict !== "CORRECT" && verdict !== "CLARIFY") return undefined;
@@ -374,18 +576,24 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       };
       return p;
     }
-    case "architect_final": {
+    case "architect_final":
+    case "conformance_final": {
       const verdict = raw.verdict;
-      if (verdict !== "ACCEPT" && verdict !== "NEEDS_REMEDIATION") return undefined;
+      if (verdict !== "ACCEPT" && verdict !== "NEEDS_REMEDIATION" && verdict !== "ARCHITECTURE_CONTRADICTION") return undefined;
+      const contradiction = raw.architectureContradiction === undefined ? undefined : architectureContradiction(raw.architectureContradiction);
+      if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
+      if (verdict === "ARCHITECTURE_CONTRADICTION" && contradiction === undefined) return undefined;
       return {
         verdict, blockingIssues: strList(raw.blockingIssues), requiredChanges: strList(raw.requiredChanges),
         doNotChange: strList(raw.doNotChange), requiredEvidence: strList(raw.requiredEvidence),
         ...(raw.affectedTargetIds === undefined ? {} : { affectedTargetIds: strList(raw.affectedTargetIds) }),
         ...(raw.integrationOnly === undefined ? {} : { integrationOnly: bool(raw.integrationOnly) }),
+        ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
       } satisfies ArchitectFinalResult;
     }
     case "final_report": {
-      if (typeof raw.result !== "string" || typeof raw.summary !== "string") return undefined;
+      const decisions = warningDecisions(raw.warningDecisions);
+      if (typeof raw.result !== "string" || typeof raw.summary !== "string" || decisions === undefined) return undefined;
       return {
         result: raw.result,
         summary: raw.summary,
@@ -398,6 +606,7 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
         pushed: str(raw.pushed, "unknown"),
         humanVerification: strList(raw.humanVerification),
         warnings: strList(raw.warnings),
+        warningDecisions: decisions,
       } satisfies FinalReportPacket;
     }
     case "lead_escalation": {

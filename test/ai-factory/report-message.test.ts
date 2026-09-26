@@ -186,6 +186,118 @@ describe("AI Factory — final report as a normal message", () => {
     expect(report).not.toContain(packets.finalReport.summary);
   });
 
+  it("LEAN reports absent gates honestly and includes integrated reviewer evidence", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_lean_report"),
+      workflow: { mode: "lean" },
+      results: {
+        engineers: [],
+        reviewers: [],
+        integratedReview: {
+          agentId: "integrated-review",
+          packet: {
+            verdict: "REPAIR_REQUIRED",
+            affectedTargetIds: ["target-a"],
+            blockingFindings: ["The check fails"],
+            nonBlockingFindings: [],
+            requiredRepairs: ["Fix the check"],
+            testConcerns: ["No passing run recorded"],
+            architecturalIssue: false,
+          },
+        },
+      },
+      targetPlan: {
+        targets: [{ id: "target-a", description: "A", dependsOn: [], acceptanceCriteria: [] }],
+        outcomes: { "target-a": { status: "failed", verification: { status: "failed", evidence: "check failed" } } },
+        revision: 1,
+        rationale: [],
+      },
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Workflow: LEAN");
+    expect(report).toContain("Initial Architect: Not part of this workflow.");
+    expect(report).toContain("Final Architect: Not part of this workflow.");
+    expect(report).toContain("Integrated Reviewer verdict: REPAIR_REQUIRED");
+    expect(report).toContain("target-a: failed; verification: failed: check failed");
+    expect(report).not.toContain("Authoritative final verdict: ACCEPT");
+  });
+
+  it("VERIFIED reports the final Architect gate and architecture contradictions", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_verified_report"),
+      workflow: { mode: "verified_execution" },
+      results: {
+        engineers: [],
+        reviewers: [],
+        finalArchitect: {
+          agentId: "final-architect",
+          packet: {
+            verdict: "ARCHITECTURE_CONTRADICTION",
+            blockingIssues: [],
+            requiredChanges: [],
+            doNotChange: [],
+            requiredEvidence: [],
+            architectureContradiction: {
+              assumption: "The repository has the expected entrypoint",
+              repositoryEvidence: "The entrypoint is absent",
+              affectedTargetIds: ["target-a"],
+              cannotContinueBecause: "The target cannot be verified",
+              ownerDecisionNeeded: "Choose an entrypoint",
+            },
+          },
+        },
+      },
+      architectureContradiction: {
+        assumption: "The repository has the expected entrypoint",
+        repositoryEvidence: "The entrypoint is absent",
+        affectedTargetIds: ["target-a"],
+        cannotContinueBecause: "The target cannot be verified",
+        ownerDecisionNeeded: "Choose an entrypoint",
+      },
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Workflow: VERIFIED EXECUTION");
+    expect(report).toContain("Final Architect: ARCHITECTURE_CONTRADICTION");
+    expect(report).toContain("Result: ARCHITECTURE_CONTRADICTION");
+    expect(report).toContain("Architecture contradiction");
+    expect(report).toContain("Owner decision needed: Choose an entrypoint");
+  });
+
+  it("VERIFIED never reports PASS when stopped at a rejecting final Architect gate", () => {
+    const state: FactoryRunState = {
+      ...makeDoneState("factory_verified_rejected"),
+      state: "STOPPED",
+      workflow: { mode: "verified_execution" },
+      results: {
+        engineers: [],
+        reviewers: [],
+        integratedReview: {
+          agentId: "integrated-review",
+          packet: {
+            verdict: "PASS",
+            affectedTargetIds: [],
+            blockingFindings: [],
+            nonBlockingFindings: [],
+            requiredRepairs: [],
+            testConcerns: [],
+            architecturalIssue: false,
+          },
+        },
+        finalArchitect: { agentId: "final-architect", packet: packets.remediate },
+        integration: { agentId: "lead", packet: packets.integration },
+      },
+    };
+
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Final Architect: NEEDS_REMEDIATION");
+    expect(report).toContain("Result: NEEDS_REMEDIATION");
+    expect(report).not.toContain("Result: PASS");
+    expect(report).toContain("Integrated review");
+    expect(report).toContain("Integration evidence");
+  });
+
   it("message renderers are registered and return components (normal pi path)", () => {
     const { pi } = makePi();
     factoryExtension(pi);

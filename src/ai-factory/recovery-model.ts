@@ -2,7 +2,7 @@
 
 import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { createRequirementCatalog, TARGET_ID, validateArchitectTargetApproval, validateTargets } from "./targets.js";
+import { createRequirementCatalog, hasMatchingRequirementIdentities, TARGET_ID, validateArchitectTargetApproval, validateTargets } from "./targets.js";
 import {
   type ArchitectPlanAssessment,
   type AttemptProvenance,
@@ -11,6 +11,7 @@ import {
   type FactoryAttempt,
   type FactoryCheckpoint,
   type FactoryConfig,
+  type FactoryMissionRequirement,
   type FactoryRunState,
   type FactoryState,
   type FactoryTarget,
@@ -25,6 +26,10 @@ import {
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PHASE_ROLES: Record<string, RoleName> = {
   "discovery.lead": "lead",
+  "execution.proposal": "lead",
+  "integrated.review": "reviewer",
+  "conformance.architect": "architect",
+  "conformance.recheck": "architect",
   "initial.architect": "architect",
   "execution.engineer": "engineer",
   "review.reviewer": "reviewer",
@@ -42,7 +47,17 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   "discovery.lead": {
     required: ["goal", "repositoryFindings", "currentArchitecture", "assumptions", "proposedSolution", "constraints", "workPackages", "dependencies", "risks", "acceptanceCriteria", "architecturalQuestions"],
     optional: ["targets", "humanRequirements", "requirementCatalog", "humanDependencies"],
-    kinds: ["proposal"],
+    kinds: ["proposal", "execution_proposal"],
+  },
+  "execution.proposal": {
+    required: ["goal", "repositoryFindings", "currentArchitecture", "assumptions", "proposedSolution", "constraints", "workPackages", "dependencies", "risks", "acceptanceCriteria", "architecturalQuestions", "verification", "humanRequirements", "missionRequirements", "requirementCatalog"],
+    optional: ["targets", "humanDependencies", "architectureContradiction"],
+    kinds: ["execution_proposal"],
+  },
+  "integrated.review": {
+    required: ["verdict", "blockingFindings", "nonBlockingFindings", "requiredRepairs", "testConcerns", "architecturalIssue", "affectedTargetIds"],
+    optional: ["architectureContradiction"],
+    kinds: ["integrated_review"],
   },
   "initial.architect": {
     required: ["verdict", "approvedArchitecture", "constraints", "correctedWorkPackages", "importantRisks"],
@@ -66,17 +81,27 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "final.architect": {
     required: ["verdict", "blockingIssues", "requiredChanges", "doNotChange", "requiredEvidence"],
-    optional: ["affectedTargetIds", "integrationOnly"],
-    kinds: ["architect_final"],
+    optional: ["affectedTargetIds", "integrationOnly", "architectureContradiction"],
+    kinds: ["architect_final", "conformance_final"],
   },
   "final_recheck.architect": {
     required: ["verdict", "blockingIssues", "requiredChanges", "doNotChange", "requiredEvidence"],
-    optional: ["affectedTargetIds", "integrationOnly"],
+    optional: ["affectedTargetIds", "integrationOnly", "architectureContradiction"],
     kinds: ["architect_final"],
+  },
+  "conformance.architect": {
+    required: ["verdict", "blockingIssues", "requiredChanges", "doNotChange", "requiredEvidence"],
+    optional: ["affectedTargetIds", "integrationOnly", "architectureContradiction"],
+    kinds: ["conformance_final"],
+  },
+  "conformance.recheck": {
+    required: ["verdict", "blockingIssues", "requiredChanges", "doNotChange", "requiredEvidence"],
+    optional: ["affectedTargetIds", "integrationOnly", "architectureContradiction"],
+    kinds: ["conformance_final"],
   },
   "final_synthesis.lead": {
     required: ["result", "summary", "delivered", "architecture", "reviewerFindings", "validation", "commits", "endingHead", "pushed", "humanVerification", "warnings"],
-    optional: [],
+    optional: ["warningFindings"],
     kinds: ["final_report"],
   },
   "remediation.engineer": {
@@ -105,6 +130,52 @@ const integer = (value: unknown): value is number => typeof value === "number" &
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
+
+function validateReportWarningFindings(value: unknown, path: string, issues: string[]): void {
+  if (!Array.isArray(value)) { issues.push(`${path} must be an array`); return; }
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    if (!record(item)) { issues.push(`${path}[${index}] must be an object`); continue; }
+    exactKeys(item, ["findingId", "source", "scope", "targetIds", "category", "text", "disposition"], ["supersededBy"], `${path}[${index}]`, issues);
+    if (typeof item.findingId !== "string" || !/^WARN-\d{3,}$/.test(item.findingId)) issues.push(`${path}[${index}].findingId is invalid`);
+    else if (seen.has(item.findingId)) issues.push(`${path}[${index}].findingId is duplicated`);
+    else seen.add(item.findingId);
+    if (!(["engineer", "target_reviewer", "integrated_reviewer", "integration_lead", "final_architect"] as unknown[]).includes(item.source)) issues.push(`${path}[${index}].source is invalid`);
+    if (item.scope !== "target_local" && item.scope !== "mission") issues.push(`${path}[${index}].scope is invalid`);
+    if ((item.source === "engineer" || item.source === "target_reviewer") && item.scope !== "target_local") issues.push(`${path}[${index}] target evidence cannot be mission-scoped`);
+    if ((item.source === "integrated_reviewer" || item.source === "integration_lead") && item.scope !== "mission") issues.push(`${path}[${index}] integration evidence must be mission-scoped`);
+    if (!strings(item.targetIds)) issues.push(`${path}[${index}].targetIds must be an array of strings`);
+    else if (item.scope === "target_local" && item.targetIds.length === 0) issues.push(`${path}[${index}].targetIds must identify target-local evidence`);
+    if (typeof item.category !== "string" || item.category.trim() === "") issues.push(`${path}[${index}].category must be non-empty`);
+    if (typeof item.text !== "string" || item.text.trim() === "") issues.push(`${path}[${index}].text must be non-empty`);
+    if (!(["active", "superseded", "historical"] as unknown[]).includes(item.disposition)) issues.push(`${path}[${index}].disposition is invalid`);
+    if (item.supersededBy !== undefined && typeof item.supersededBy !== "string") issues.push(`${path}[${index}].supersededBy must be a string`);
+    if (item.disposition === "superseded" && (typeof item.supersededBy !== "string" || item.supersededBy.trim() === "")) issues.push(`${path}[${index}].supersededBy must explain the superseding evidence`);
+  }
+}
+
+function validateVerification(value: unknown, path: string, issues: string[]): void {
+  if (!record(value)) { issues.push(`${path} must be an object`); return; }
+  for (const [targetId, item] of Object.entries(value)) {
+    if (!TARGET_ID.test(targetId)) issues.push(`${path}.${targetId} is not a canonical target identifier`);
+    if (!record(item)) { issues.push(`${path}.${targetId} must be an object`); continue; }
+    exactKeys(item, ["evidence"], ["command", "ownerPending"], `${path}.${targetId}`, issues);
+    if (typeof item.evidence !== "string" || item.evidence === "") issues.push(`${path}.${targetId}.evidence must be a non-empty string`);
+    if (item.command !== undefined && typeof item.command !== "string") issues.push(`${path}.${targetId}.command must be a string`);
+    if (item.ownerPending !== undefined && typeof item.ownerPending !== "boolean") issues.push(`${path}.${targetId}.ownerPending must be boolean`);
+  }
+}
+
+function validateContradiction(value: unknown, path: string, targetIds: Set<string> | undefined, issues: string[]): void {
+  if (!record(value)) { issues.push(`${path} must be an object`); return; }
+  exactKeys(value, ["assumption", "repositoryEvidence", "affectedTargetIds", "cannotContinueBecause", "ownerDecisionNeeded"], [], path, issues);
+  for (const key of ["assumption", "repositoryEvidence", "cannotContinueBecause", "ownerDecisionNeeded"]) if (typeof value[key] !== "string" || value[key] === "") issues.push(`${path}.${key} must be a non-empty string`);
+  if (!strings(value.affectedTargetIds) || value.affectedTargetIds.length === 0) issues.push(`${path}.affectedTargetIds must be a non-empty array of strings`);
+  else for (const id of value.affectedTargetIds) {
+    if (!TARGET_ID.test(id)) issues.push(`${path}.affectedTargetIds contains a non-canonical target identifier`);
+    if (targetIds && !targetIds.has(id)) issues.push(`${path}.affectedTargetIds contains unknown target ${id}`);
+  }
+}
 
 function validateDependencyArray(value: unknown, path: string, issues: string[]): void {
   if (!Array.isArray(value)) { issues.push(`${path} must be an array`); return; }
@@ -142,13 +213,23 @@ function validateRequirementCatalog(value: unknown, proposal: Record<string, unk
     if (!record(item)) { issues.push(`${path}[${index}] must be an object`); continue; }
     exactKeys(item, ["id", "text", "source"], [], `${path}[${index}]`, issues);
     if (typeof item.id !== "string" || typeof item.text !== "string"
-      || (item.source !== "human_requirement" && item.source !== "human_constraint")) issues.push(`${path}[${index}] has invalid fields`);
+      || (item.source !== "human_requirement" && item.source !== "human_constraint" && item.source !== "mission_requirement")) issues.push(`${path}[${index}] has invalid fields`);
   }
-  if (!strings(proposal.humanRequirements ?? []) || !strings(proposal.constraints ?? [])) return;
+  if (!strings(proposal.humanRequirements ?? []) || !strings(proposal.constraints ?? []) || !strings(proposal.missionRequirements ?? [])) return;
   const humanRequirements = strings(proposal.humanRequirements) ? proposal.humanRequirements : [];
   const constraints = strings(proposal.constraints) ? proposal.constraints : [];
-  const expected = createRequirementCatalog(humanRequirements, constraints);
-  if (JSON.stringify(value) !== JSON.stringify(expected)) issues.push(`${path} does not match the deterministic Lead requirement inventory`);
+  const missionRequirements = strings(proposal.missionRequirements) ? proposal.missionRequirements : [];
+  const expected = createRequirementCatalog(humanRequirements, constraints, missionRequirements);
+  const supplied: FactoryMissionRequirement[] = [];
+  for (const item of value) {
+    if (record(item) && typeof item.id === "string" && typeof item.text === "string"
+      && (item.source === "human_requirement" || item.source === "human_constraint" || item.source === "mission_requirement")) {
+      supplied.push({ id: item.id, text: item.text, source: item.source });
+    }
+  }
+  if (supplied.length !== value.length || !hasMatchingRequirementIdentities(expected, supplied)) {
+    issues.push(`${path} identities do not match the deterministic Factory requirement inventory`);
+  }
 }
 
 function validateTargetArray(value: unknown, path: string, issues: string[]): value is FactoryTarget[] {
@@ -181,11 +262,21 @@ function validateTargetPlan(value: unknown, state: Record<string, unknown>, issu
     if (typeof id !== "string") continue;
     const outcome = value.outcomes[id];
     if (!record(outcome)) { issues.push(`targetPlan.outcomes.${id} is missing`); continue; }
-    exactKeys(outcome, ["status"], ["reason", "blockedBy", "engineerAgentId", "reviewerAgentId", "architectAgentId"], `targetPlan.outcomes.${id}`, issues);
+    exactKeys(outcome, ["status"], ["reason", "blockedBy", "engineerAgentId", "reviewerAgentId", "architectAgentId", "verification"], `targetPlan.outcomes.${id}`, issues);
+    if (outcome.verification !== undefined) {
+      if (!record(outcome.verification)) issues.push(`targetPlan.outcomes.${id}.verification must be an object`);
+      else {
+        exactKeys(outcome.verification, ["status", "evidence"], ["command"], `targetPlan.outcomes.${id}.verification`, issues);
+        if (!("passed" === outcome.verification.status || "failed" === outcome.verification.status || "owner_pending" === outcome.verification.status || "unavailable" === outcome.verification.status)) issues.push(`targetPlan.outcomes.${id}.verification.status is invalid`);
+        if (typeof outcome.verification.evidence !== "string" || outcome.verification.evidence === "") issues.push(`targetPlan.outcomes.${id}.verification.evidence must be a non-empty string`);
+        if (outcome.verification.command !== undefined && typeof outcome.verification.command !== "string") issues.push(`targetPlan.outcomes.${id}.verification.command must be a string`);
+      }
+    }
     if (!["pending", "active", "passed", "failed", "blocked"].includes(String(outcome.status))) issues.push(`targetPlan.outcomes.${id}.status is invalid`);
     if (outcome.blockedBy !== undefined && (!strings(outcome.blockedBy) || outcome.blockedBy.some((dep) => !ids.has(dep)))) issues.push(`targetPlan.outcomes.${id}.blockedBy is invalid`);
     for (const key of ["reason", "engineerAgentId", "reviewerAgentId", "architectAgentId"]) if (outcome[key] !== undefined && typeof outcome[key] !== "string") issues.push(`targetPlan.outcomes.${id}.${key} must be a string`);
     if (outcome.status === "passed") {
+      const execution = record(state.workflow) && state.workflow.mode !== "full";
       const reviewed = record(state.results) && Array.isArray(state.results.reviewers)
         && state.results.reviewers.some((item: unknown) => record(item) && item.targetId === id && record(item.outcome)
           && item.outcome.agentId === outcome.reviewerAgentId && record(item.outcome.packet) && item.outcome.packet.verdict === "PASS");
@@ -194,7 +285,14 @@ function validateTargetPlan(value: unknown, state: Record<string, unknown>, issu
         && record(state.results.remediation.reviewer.packet) && state.results.remediation.reviewer.packet.verdict === "PASS"
         && record(state.results.remediation.engineer) && record(state.results.remediation.engineer.packet)
         && state.results.remediation.engineer.packet.workPackageId === id;
-      if (typeof outcome.reviewerAgentId !== "string" || (!reviewed && !remediation)) issues.push(`targetPlan.outcomes.${id} passed without matching Reviewer PASS evidence`);
+      const integratedResult = record(state.results) && record(state.results.integratedReview) ? state.results.integratedReview : undefined;
+      const integrated = record(integratedResult) && record(integratedResult.packet)
+        && integratedResult.packet.verdict === "PASS"
+        && integratedResult.agentId === outcome.reviewerAgentId;
+      if (!execution && (typeof outcome.reviewerAgentId !== "string" || (!reviewed && !remediation))) issues.push(`targetPlan.outcomes.${id} passed without matching Reviewer PASS evidence`);
+      if (execution && outcome.reviewerAgentId !== undefined && (!integrated || !record(integratedResult?.packet) || !strings(integratedResult.packet.affectedTargetIds) || (integratedResult.packet.affectedTargetIds.length > 0 && !integratedResult.packet.affectedTargetIds.includes(id)))) issues.push(`targetPlan.outcomes.${id} claims review without matching integrated Reviewer PASS evidence`);
+      const verified = record(outcome.verification) && outcome.verification.status === "passed";
+      if (execution && !verified) issues.push(`targetPlan.outcomes.${id} passed without matching verification evidence`);
       const engineered = record(state.results) && Array.isArray(state.results.engineers)
         && state.results.engineers.some((item: unknown) => record(item) && item.targetId === id && record(item.outcome)
           && item.outcome.agentId === outcome.engineerAgentId && record(item.outcome.packet)
@@ -221,7 +319,7 @@ function validateTargetPlan(value: unknown, state: Record<string, unknown>, issu
       || !record(active) || !["active", "passed"].includes(String(active.status))) issues.push("targetPlan.currentTargetId must identify the active target");
     if (record(active) && active.status === "passed" && value.awaitingArchitectAcceptance !== true) issues.push("passed current target must be awaiting Architect acceptance");
   }
-  if (["INTEGRATION", "FINAL_ARCHITECT", "FINAL_ARCHITECT_RECHECK", "FINAL_SYNTHESIS", "DONE"].includes(String(state.state))
+  if (!(record(state.workflow) && state.workflow.mode !== "full") && ["INTEGRATION", "FINAL_ARCHITECT", "FINAL_ARCHITECT_RECHECK", "FINAL_SYNTHESIS", "DONE"].includes(String(state.state))
     && (Object.values(value.outcomes).some((outcome) => !record(outcome) || outcome.status !== "passed") || value.revalidationIds !== undefined)) issues.push(`${state.state} requires every target to be Reviewer-approved`);
 }
 
@@ -372,8 +470,22 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
   exactKeys(value, spec.required, spec.optional, path, issues);
   for (const key of ["targets", "approvedTargets"]) if (value[key] !== undefined) validateTargetArray(value[key], `${path}.${key}`, issues);
   if (value.humanRequirements !== undefined && !strings(value.humanRequirements)) issues.push(`${path}.humanRequirements must be an array of strings`);
-  if (value.requirementCatalog !== undefined) validateRequirementCatalog(value.requirementCatalog, value, `${path}.requirementCatalog`, issues);
+  if (phase === "execution.proposal" && (!strings(value.humanRequirements) || value.humanRequirements.length === 0 || value.humanRequirements.some((item) => item.trim() === ""))) {
+    issues.push(`${path}.humanRequirements must contain non-empty implementation requirements`);
+  }
+  if (phase === "execution.proposal" && (!strings(value.missionRequirements) || value.missionRequirements.some((item) => item.trim() === ""))) {
+    issues.push(`${path}.missionRequirements must be an array of non-empty lifecycle/report instructions`);
+  }
+  if (value.constraints !== undefined && (!strings(value.constraints) || value.constraints.some((item) => item.trim() === ""))) issues.push(`${path}.constraints must be an array of non-empty strings`);
+  if (value.requirementCatalog !== undefined && !spec.required.includes("requirementCatalog")) validateRequirementCatalog(value.requirementCatalog, value, `${path}.requirementCatalog`, issues);
+  if (value.warningFindings !== undefined) validateReportWarningFindings(value.warningFindings, `${path}.warningFindings`, issues);
+  if (value.warningFindings !== undefined && Array.isArray(value.warningFindings) && strings(value.warnings)) {
+    const expectedWarnings = value.warningFindings.filter(record).filter((item) => item.scope === "mission" && item.disposition === "active").map((item) => item.text);
+    if (JSON.stringify(value.warnings) !== JSON.stringify(expectedWarnings)) issues.push(`${path}.warnings must contain only active mission-scoped warning findings`);
+  }
   if (value.humanDependencies !== undefined) validateDependencyArray(value.humanDependencies, `${path}.humanDependencies`, issues);
+  if (value.verification !== undefined) validateVerification(value.verification, `${path}.verification`, issues);
+  if (value.architectureContradiction !== undefined) validateContradiction(value.architectureContradiction, `${path}.architectureContradiction`, undefined, issues);
   if (value.planAssessment !== undefined) validatePlanAssessment(value.planAssessment, `${path}.planAssessment`, issues);
   if (value.clarificationQuestions !== undefined && !strings(value.clarificationQuestions)) issues.push(`${path}.clarificationQuestions must be an array of strings`);
   if (value.affectedTargetIds !== undefined && !strings(value.affectedTargetIds)) issues.push(`${path}.affectedTargetIds must be an array of strings`);
@@ -382,6 +494,10 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
     const field = value[key];
     if (key === "verdict" || key === "status" || key === "goal" || key === "approvedArchitecture" || key === "proposedSolution" || key === "repositoryFindings" || key === "currentArchitecture" || key === "dependencies" || key === "summary" || key === "workPackageId" || key === "testResults" || key === "systemVerification" || key === "factualAssessment" || key === "result" || key === "endingHead" || key === "pushed" || key === "guidance") {
       if (typeof field !== "string") issues.push(`${path}.${key} must be a string`);
+    } else if (key === "verification") {
+      validateVerification(field, `${path}.verification`, issues);
+    } else if (key === "requirementCatalog") {
+      validateRequirementCatalog(field, value, `${path}.requirementCatalog`, issues);
     } else if (key === "architecturalEscalationRequired" || key === "architecturalIssue") {
       if (typeof field !== "boolean") issues.push(`${path}.${key} must be a boolean`);
     } else if (!strings(field)) {
@@ -389,7 +505,7 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
     }
   }
   const enumValues: Record<string, string[]> = {
-    verdict: phase.includes("review") ? ["PASS", "NEEDS_FIX", "ARCHITECTURAL_ESCALATION"] : phase.includes("architect") ? (phase.includes("final") ? ["ACCEPT", "NEEDS_REMEDIATION"] : ["APPROVE", "CORRECT", "CLARIFY"]) : ["continue", "stop"],
+    verdict: phase.includes("integrated") ? ["PASS", "REPAIR_REQUIRED", "ARCHITECTURE_CONTRADICTION"] : phase.includes("review") ? ["PASS", "NEEDS_FIX", "ARCHITECTURAL_ESCALATION"] : phase.includes("architect") ? (phase.includes("final") ? ["ACCEPT", "NEEDS_REMEDIATION", "ARCHITECTURE_CONTRADICTION"] : ["APPROVE", "CORRECT", "CLARIFY"]) : ["continue", "stop"],
     status: ["completed", "partially_completed", "failed"],
   };
   for (const [key, allowed] of Object.entries(enumValues)) if (key in value && !allowed.includes(String(value[key]))) issues.push(`${path}.${key} has an invalid value`);
@@ -406,12 +522,31 @@ function validateOutcome(value: unknown, phase: string, path: string, issues: st
   validatePacket(value.packet, phase, `${path}.packet`, issues);
 }
 
+function validateExecutionResults(state: Record<string, unknown>, issues: string[]): void {
+  if (!record(state.workflow) || state.workflow.mode === "full") return;
+  const plan = record(state.targetPlan) && Array.isArray(state.targetPlan.targets) ? state.targetPlan.targets : undefined;
+  const ids = plan ? new Set(plan.filter(record).map((target) => String(target.id))) : undefined;
+  const proposal = record(state.results) && record(state.results.executionProposal) ? state.results.executionProposal : undefined;
+  if (proposal?.packet && record(proposal.packet)) {
+    const verification = proposal.packet.verification;
+    if (ids && record(verification) && (Object.keys(verification).length !== ids.size || [...ids].some((id) => !(id in verification)))) issues.push("executionProposal.verification must contain exactly one entry for every canonical target");
+    if (proposal.packet.architectureContradiction !== undefined) validateContradiction(proposal.packet.architectureContradiction, "results.executionProposal.packet.architectureContradiction", ids, issues);
+  }
+  const integrated = record(state.results) && record(state.results.integratedReview) ? state.results.integratedReview : undefined;
+  if (integrated?.packet && record(integrated.packet)) {
+    if (strings(integrated.packet.affectedTargetIds)) for (const id of integrated.packet.affectedTargetIds) {
+      if (!TARGET_ID.test(id) || (ids && !ids.has(id))) issues.push("results.integratedReview.packet.affectedTargetIds contains an invalid or unknown target identifier");
+    }
+    if (integrated.packet.architectureContradiction !== undefined) validateContradiction(integrated.packet.architectureContradiction, "results.integratedReview.packet.architectureContradiction", ids, issues);
+  }
+}
+
 function validateResults(value: unknown, issues: string[]): void {
   if (!record(value)) {
     issues.push("results must be an object");
     return;
   }
-  exactKeys(value, ["engineers", "reviewers"], ["proposal", "initialArchitect", "integration", "finalArchitect", "finalRecheck", "finalReport", "escalationArchitect", "leadEscalation", "remediation"], "results", issues);
+  exactKeys(value, ["engineers", "reviewers"], ["proposal", "executionProposal", "integratedReview", "integratedReviews", "initialArchitect", "integration", "finalArchitect", "finalRecheck", "finalReport", "escalationArchitect", "leadEscalation", "remediation"], "results", issues);
   if (!Array.isArray(value.engineers)) issues.push("results.engineers must be an array");
   else for (const [index, item] of value.engineers.entries()) {
     if (!record(item) || !integer(item.round)) issues.push(`results.engineers[${index}] has an invalid round`);
@@ -428,8 +563,12 @@ function validateResults(value: unknown, issues: string[]): void {
       validateOutcome(item.outcome, "review.reviewer", `results.reviewers[${index}].outcome`, issues);
     }
   }
-  const single: Array<[string, string]> = [["proposal", "discovery.lead"], ["initialArchitect", "initial.architect"], ["integration", "integration.lead"], ["finalArchitect", "final.architect"], ["finalRecheck", "final_recheck.architect"], ["finalReport", "final_synthesis.lead"], ["escalationArchitect", "escalation.architect"], ["leadEscalation", "escalation.lead"]];
+  const single: Array<[string, string]> = [["proposal", "discovery.lead"], ["executionProposal", "execution.proposal"], ["integratedReview", "integrated.review"], ["initialArchitect", "initial.architect"], ["integration", "integration.lead"], ["finalArchitect", "final.architect"], ["finalRecheck", "final_recheck.architect"], ["finalReport", "final_synthesis.lead"], ["escalationArchitect", "escalation.architect"], ["leadEscalation", "escalation.lead"]];
   for (const [key, phase] of single) if (value[key] !== undefined) validateOutcome(value[key], phase, `results.${key}`, issues);
+  if (value.integratedReviews !== undefined) {
+    if (!Array.isArray(value.integratedReviews)) issues.push("results.integratedReviews must be an array");
+    else for (const [index, item] of value.integratedReviews.entries()) validateOutcome(item, "integrated.review", `results.integratedReviews[${index}]`, issues);
+  }
   if (value.remediation !== undefined) {
     if (!record(value.remediation)) issues.push("results.remediation must be an object");
     else {
@@ -538,7 +677,7 @@ function validateStateConsistency(state: Record<string, unknown>, issues: string
     if (!record(inFlight) || !ROLE_NAMES.includes(inFlight.role as RoleName) || typeof inFlight.phase !== "string" || PHASE_ROLES[inFlight.phase] !== inFlight.role || typeof inFlight.agentId !== "string" || typeof inFlight.target !== "string" || !finite(inFlight.spawnedAt)) issues.push("inFlight has invalid role, phase, agent, target, or timestamp");
     else {
       const allowed: Record<FactoryState, string[]> = {
-        DISCOVERY: ["discovery.lead"], INITIAL_ARCHITECT: ["initial.architect"], EXECUTION: ["execution.engineer", "escalation.lead"], REVIEW: ["review.reviewer"], ARCHITECT_ESCALATION: ["escalation.architect"], INTEGRATION: ["integration.lead"], FINAL_ARCHITECT: ["final.architect"], REMEDIATION: ["remediation.engineer", "remediation.reviewer"], FINAL_ARCHITECT_RECHECK: ["final_recheck.architect"], FINAL_SYNTHESIS: ["final_synthesis.lead"], WAITING_CAPACITY: [], DONE: [], STOPPED: [], FAILED: [],
+        DISCOVERY: ["discovery.lead", "execution.proposal"], INITIAL_ARCHITECT: ["initial.architect"], EXECUTION: ["execution.engineer", "escalation.lead"], REVIEW: ["review.reviewer"], INTEGRATED_REVIEW: ["integrated.review"], ARCHITECT_ESCALATION: ["escalation.architect"], INTEGRATION: ["integration.lead"], FINAL_ARCHITECT: ["final.architect", "conformance.architect"], REMEDIATION: ["remediation.engineer", "remediation.reviewer", "integrated.review"], FINAL_ARCHITECT_RECHECK: ["final_recheck.architect", "conformance.recheck"], FINAL_SYNTHESIS: ["final_synthesis.lead"], WAITING_CAPACITY: [], DONE: [], STOPPED: [], FAILED: [],
       };
       if (!allowed[current]?.includes(inFlight.phase)) issues.push("inFlight phase does not match the persisted state");
     }
@@ -546,10 +685,14 @@ function validateStateConsistency(state: Record<string, unknown>, issues: string
   for (const key of ["repairRound", "remediationRounds", "architectEscalations", "leadEscalations"]) if (!integer(state[key])) issues.push(`${key} must be a non-negative integer`);
   if (strictV2 && record(state.results)) {
     const results = state.results;
-    const required: Partial<Record<FactoryState, string>> = { INITIAL_ARCHITECT: "proposal", REVIEW: "engineers", INTEGRATION: "reviewers", FINAL_ARCHITECT: "integration", REMEDIATION: "finalArchitect", FINAL_ARCHITECT_RECHECK: "remediation", FINAL_SYNTHESIS: "finalArchitect", DONE: "finalReport" };
+    const execution = record(state.workflow) && state.workflow.mode !== "full";
+    const required: Partial<Record<FactoryState, string>> = execution
+      ? { INTEGRATION: "integratedReview", FINAL_ARCHITECT: "integration", REMEDIATION: "finalArchitect", FINAL_ARCHITECT_RECHECK: "remediation", FINAL_SYNTHESIS: "integratedReview", DONE: "finalReport" }
+      : { INITIAL_ARCHITECT: "proposal", REVIEW: "engineers", INTEGRATION: "reviewers", FINAL_ARCHITECT: "integration", REMEDIATION: "finalArchitect", FINAL_ARCHITECT_RECHECK: "remediation", FINAL_SYNTHESIS: "finalArchitect", DONE: "finalReport" };
     for (const [phase, resultKey] of Object.entries(required)) {
       if (current === phase && ((resultKey === "engineers" || resultKey === "reviewers") ? (!Array.isArray(results[resultKey]) || results[resultKey].length === 0) : results[resultKey] === undefined)) issues.push(`${current} is missing required persisted result ${resultKey}`);
     }
+    if (record(state.workflow) && state.workflow.mode === "verified_execution" && (current === "FINAL_SYNTHESIS" || current === "DONE") && results.finalArchitect === undefined) issues.push(`${current} is missing required persisted result finalArchitect`);
   }
   if (state.repairExhausted !== true && state.repairExhausted !== false) issues.push("repairExhausted must be boolean");
   if (state.parked !== true && state.parked !== false) issues.push("parked must be boolean");
@@ -567,10 +710,19 @@ export function validatePersistedFactoryRunState(value: unknown, intendedProject
   if (!record(value)) return { ok: false, issues: ["Factory run state must be an object"], legacy: false };
   const state = value;
   const legacy = state.version === LEGACY_FACTORY_STATE_VERSION;
-  exactKeys(state, ["version", "runId", "createdAt", "updatedAt", "task", "cwd", "config", "state", "repairRound", "repairExhausted", "effectiveArchitecture", "remediationRounds", "architectEscalations", "leadEscalations", "results", "metrics", "errors", "parked"], ["inFlight", "waiting", "stoppedReason", "stateRevision", "checkpoint", "attempts", "presetReplacement", "targetPlan"], "state", issues);
+  exactKeys(state, ["version", "runId", "createdAt", "updatedAt", "task", "cwd", "config", "state", "repairRound", "repairExhausted", "effectiveArchitecture", "remediationRounds", "architectEscalations", "leadEscalations", "results", "metrics", "errors", "parked"], ["workflow", "architectureContradiction", "inFlight", "waiting", "stoppedReason", "stateRevision", "checkpoint", "attempts", "presetReplacement", "targetPlan"], "state", issues);
+  if (state.workflow !== undefined) {
+    if (!record(state.workflow)) issues.push("workflow must be an object");
+    else {
+      exactKeys(state.workflow, ["mode"], [], "workflow", issues);
+      if (!["full", "verified_execution", "lean"].includes(String(state.workflow.mode))) issues.push("workflow.mode is invalid");
+    }
+  }
+  if (state.architectureContradiction !== undefined) validateContradiction(state.architectureContradiction, "architectureContradiction", record(state.targetPlan) && Array.isArray(state.targetPlan.targets) ? new Set(state.targetPlan.targets.filter(record).map((target) => String(target.id))) : undefined, issues);
   const supportedVersions: readonly number[] = [LEGACY_FACTORY_STATE_VERSION, RECOVERY_FACTORY_STATE_VERSION, FACTORY_STATE_VERSION];
   if (!supportedVersions.includes(state.version as number)) issues.push("unsupported Factory state version");
   if (state.version !== 3 && state.targetPlan !== undefined) issues.push("historical runs cannot contain a targetPlan");
+  if (state.version !== 3 && state.workflow !== undefined && (!record(state.workflow) || state.workflow.mode !== "full")) issues.push("historical runs cannot contain a workflow override");
   if (state.version === 3 && state.targetPlan !== undefined) validateTargetPlan(state.targetPlan, state, issues);
   if (state.version === 3 && record(state.results) && state.results.initialArchitect !== undefined && state.targetPlan === undefined && !["INITIAL_ARCHITECT", "STOPPED", "FAILED"].includes(String(state.state))) issues.push("approved version 3 run requires a targetPlan");
   issues.push(...validateRunId(state.runId));
@@ -581,7 +733,8 @@ export function validatePersistedFactoryRunState(value: unknown, intendedProject
   if (!FACTORY_STATES.includes(state.state as FactoryState)) issues.push("state is invalid");
   if (!validateConfig(state.config, issues)) { /* issues already recorded */ }
   validateResults(state.results, issues);
-  if (state.version === 3 && state.targetPlan !== undefined) validateTargetApprovalConsistency(state, issues);
+  validateExecutionResults(state, issues);
+  if (state.version === 3 && state.targetPlan !== undefined && (!record(state.workflow) || state.workflow.mode === "full")) validateTargetApprovalConsistency(state, issues);
   validateMetrics(state.metrics, issues);
   if (!Array.isArray(state.errors)) issues.push("errors must be an array");
   else for (const [index, error] of state.errors.entries()) if (!record(error) || typeof error.phase !== "string" || typeof error.message !== "string" || !finite(error.at)) issues.push(`errors[${index}] is invalid`);
@@ -652,8 +805,14 @@ export function isValidFactoryRunState(value: unknown, intendedProjectDir?: stri
   return validatePersistedFactoryRunState(value, intendedProjectDir).ok;
 }
 
-function phaseForState(state: FactoryState): string {
+function phaseForState(state: FactoryState, run?: FactoryRunState): string {
   if (TERMINAL_STATES.includes(state)) return `terminal:${state}`;
+  if (run?.workflow?.mode === "lean" || run?.workflow?.mode === "verified_execution") {
+    if (state === "DISCOVERY") return "execution.proposal";
+    if (state === "INTEGRATED_REVIEW") return "integrated.review";
+    if (state === "FINAL_ARCHITECT") return "conformance.architect";
+    if (state === "FINAL_ARCHITECT_RECHECK") return "conformance.recheck";
+  }
   const phases: Partial<Record<FactoryState, string>> = {
     DISCOVERY: "discovery.lead",
     INITIAL_ARCHITECT: "initial.architect",
@@ -710,13 +869,13 @@ export function unresolvedAttemptForPhase(state: FactoryRunState, phase: string)
 
 /** The unresolved attempt for the phase the run would drive next, if any. */
 export function unresolvedSpawnAttempt(state: FactoryRunState): FactoryAttempt | undefined {
-  const phase = state.inFlight?.phase ?? state.waiting?.phase ?? phaseForState(state.state);
+  const phase = state.inFlight?.phase ?? state.waiting?.phase ?? phaseForState(state.state, state);
   return unresolvedAttemptForPhase(state, phase);
 }
 
 /** Construct a collision-resistant checkpoint from persisted state only. */
 export function createFactoryCheckpoint(state: FactoryRunState, revision = state.stateRevision ?? 0): FactoryCheckpoint {
-  const phase = state.inFlight?.phase ?? state.waiting?.phase ?? phaseForState(state.state);
+  const phase = state.inFlight?.phase ?? state.waiting?.phase ?? phaseForState(state.state, state);
   const attempt = latestAttempt(state, phase);
   const attemptId = state.inFlight?.agentId === undefined ? attempt?.attemptId : attempt?.attemptId;
   const agentId = state.inFlight?.agentId;
