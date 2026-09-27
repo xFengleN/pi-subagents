@@ -144,15 +144,24 @@ describe("execution workflow packets and prompts", () => {
     expect(prompt).toContain("Factory derives the \"warnings\" array exclusively from active mission-scoped findings");
   });
 
-  it("preserves explicit owner-required manual verification as owner-pending", () => {
+  it("preserves post-implementation owner acceptance separately from machine verification", () => {
     const packet = parsePacketTyped("execution_proposal", JSON.stringify({
       ...contract,
-      humanRequirements: ["Implement the settings screen", "The owner must manually verify the UI layout on an iPad"],
-      targets: [{ id: "SETTINGS_UI", description: "Implement settings screen", dependsOn: [], acceptanceCriteria: ["Owner manually verifies layout on iPad"] }],
+      targets: [{ id: "SETTINGS_UI", description: "Implement settings screen", dependsOn: [], acceptanceCriteria: ["Automated layout checks pass"] }],
       workPackages: ["Settings UI"],
-      verification: { SETTINGS_UI: { evidence: "Owner inspects rendered layout on an iPad", ownerPending: true } },
+      humanDependencies: [],
+      verification: { SETTINGS_UI: { command: "npm test -- settings", evidence: "Automated layout checks pass", ownerAcceptance: "Owner inspects rendered layout on an iPad" } },
     }), undefined);
-    expect(packet?.verification.SETTINGS_UI).toMatchObject({ ownerPending: true, evidence: "Owner inspects rendered layout on an iPad" });
+    expect(packet?.verification.SETTINGS_UI).toMatchObject({ command: "npm test -- settings", ownerAcceptance: "Owner inspects rendered layout on an iPad" });
+    expect(packet?.humanDependencies).toEqual([]);
+  });
+
+  it("parses genuine blocking human prerequisites separately from owner acceptance", () => {
+    const packet = parsePacketTyped("execution_proposal", JSON.stringify({
+      ...contract,
+      blockingHumanDependencies: { "target-a": "Owner must provide the test device before implementation." },
+    }), undefined);
+    expect(packet?.blockingHumanDependencies).toEqual({ "target-a": "Owner must provide the test device before implementation." });
   });
 
   it("keeps FULL proposal IDs Factory-generated using the existing shared catalog", () => {
@@ -190,7 +199,9 @@ describe("execution workflow packets and prompts", () => {
     expect(execution).toContain("Factory assigns stable REQ-NNN identities deterministically");
     expect(execution).toContain("Do not provide a requirementCatalog or invent requirement IDs");
     expect(execution).toContain("conditional reporting such as \"report incomplete/manual/owner-pending verification, if any\"");
-    expect(execution).toContain("Set ownerPending=true only when the original task expressly requires human/manual verification");
+    expect(execution).toContain("verification.ownerAcceptance text; it is informational and does not block engineering");
+    expect(execution).toContain("Never encode ownerAcceptance as a target dependency or humanDependencies edge");
+    expect(execution).toContain("Use blockingHumanDependencies only for a genuine external prerequisite");
     expect(execution).toContain("Integrated Reviewer is a configured LLM gate, not owner/manual sign-off");
     expect(execution).toContain("missionRequirements");
     expect(execution).toContain("scoped to that target");

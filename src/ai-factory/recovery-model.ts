@@ -51,7 +51,7 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "execution.proposal": {
     required: ["goal", "repositoryFindings", "currentArchitecture", "assumptions", "proposedSolution", "constraints", "workPackages", "dependencies", "risks", "acceptanceCriteria", "architecturalQuestions", "verification", "humanRequirements", "missionRequirements", "requirementCatalog"],
-    optional: ["targets", "humanDependencies", "architectureContradiction"],
+    optional: ["targets", "humanDependencies", "blockingHumanDependencies", "architectureContradiction"],
     kinds: ["execution_proposal"],
   },
   "integrated.review": {
@@ -159,9 +159,10 @@ function validateVerification(value: unknown, path: string, issues: string[]): v
   for (const [targetId, item] of Object.entries(value)) {
     if (!TARGET_ID.test(targetId)) issues.push(`${path}.${targetId} is not a canonical target identifier`);
     if (!record(item)) { issues.push(`${path}.${targetId} must be an object`); continue; }
-    exactKeys(item, ["evidence"], ["command", "ownerPending"], `${path}.${targetId}`, issues);
+    exactKeys(item, ["evidence"], ["command", "ownerAcceptance", "ownerPending"], `${path}.${targetId}`, issues);
     if (typeof item.evidence !== "string" || item.evidence === "") issues.push(`${path}.${targetId}.evidence must be a non-empty string`);
     if (item.command !== undefined && typeof item.command !== "string") issues.push(`${path}.${targetId}.command must be a string`);
+    if (item.ownerAcceptance !== undefined && (typeof item.ownerAcceptance !== "string" || item.ownerAcceptance.trim() === "")) issues.push(`${path}.${targetId}.ownerAcceptance must be a non-empty string`);
     if (item.ownerPending !== undefined && typeof item.ownerPending !== "boolean") issues.push(`${path}.${targetId}.ownerPending must be boolean`);
   }
 }
@@ -484,6 +485,13 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
     if (JSON.stringify(value.warnings) !== JSON.stringify(expectedWarnings)) issues.push(`${path}.warnings must contain only active mission-scoped warning findings`);
   }
   if (value.humanDependencies !== undefined) validateDependencyArray(value.humanDependencies, `${path}.humanDependencies`, issues);
+  if (value.blockingHumanDependencies !== undefined) {
+    if (!record(value.blockingHumanDependencies)) issues.push(`${path}.blockingHumanDependencies must be an object`);
+    else for (const [targetId, reason] of Object.entries(value.blockingHumanDependencies)) {
+      if (!TARGET_ID.test(targetId)) issues.push(`${path}.blockingHumanDependencies contains a non-canonical target ID`);
+      if (typeof reason !== "string" || reason.trim() === "") issues.push(`${path}.blockingHumanDependencies.${targetId} must be a non-empty reason`);
+    }
+  }
   if (value.verification !== undefined) validateVerification(value.verification, `${path}.verification`, issues);
   if (value.architectureContradiction !== undefined) validateContradiction(value.architectureContradiction, `${path}.architectureContradiction`, undefined, issues);
   if (value.planAssessment !== undefined) validatePlanAssessment(value.planAssessment, `${path}.planAssessment`, issues);

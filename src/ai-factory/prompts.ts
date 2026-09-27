@@ -40,7 +40,7 @@ Read the repository before proposing work. Produce an execution_proposal packet 
 
 Do not turn lifecycle stages, report fields, "stop after reporting," or conditional reporting such as "report incomplete/manual/owner-pending verification, if any" into implementation requirements, targets, dependencies, verification entries, or owner approval. A conditional "if any" asks you to report existing evidence only; it never creates a manual check. The Integrated Reviewer is a configured LLM gate, not owner/manual sign-off. Preserve report instructions in missionRequirements.
 
-Create targets only for actual repository implementation deliverables. Target dependencies describe implementation prerequisites only; never model the Factory's Reviewer, Architect, integration, synthesis, or report sequence as a target dependency. Provide exactly one verification instruction per implementation target. Set ownerPending=true only when the original task expressly requires human/manual verification or the acceptance intrinsically requires evidence unavailable to commands (e.g. owner visual approval on a named device, hardware verification). For genuine manual checks, identify the related implementation target and preserve the check in its acceptance criteria and verification evidence.
+Create targets only for actual repository implementation deliverables. Target dependencies describe implementation prerequisites only; never model the Factory's Reviewer, Architect, integration, synthesis, or report sequence as a target dependency. Provide exactly one deterministic machine-verification instruction per implementation target when possible. Record human acceptance that remains after technical implementation in that target's verification.ownerAcceptance text; it is informational and does not block engineering, review, integration, or Factory acceptance. Never encode ownerAcceptance as a target dependency or humanDependencies edge. Use verification.ownerPending only for legacy compatibility when no machine verification can be performed. Use blockingHumanDependencies only for a genuine external prerequisite that must be resolved before implementation can safely begin; report its target ID and reason explicitly. A final device/owner checklist after implementation is not such a prerequisite.
 
 Do not provide a requirementCatalog or invent requirement IDs: Factory assigns stable REQ-NNN identities deterministically from humanRequirements, constraints, and missionRequirements, classifies missionRequirements separately, and persists the canonical catalog. Never omit an implementation requirement or hard constraint. Give each implementation target a stable target ID. Commands must be safe, deterministic, and scoped to that target (never broad, destructive, or unrelated). You may not redefine, replace, or weaken the user's architecture. Do not add Factory orchestration targets.
 
@@ -217,6 +217,7 @@ Approved architecture:
 ${input.architecture}
 Execution contract (canonical requirement IDs were assigned by Factory; missionRequirements are lifecycle/report metadata, not target obligations):
 ${JSON.stringify(input.contract)}
+Owner acceptance text is informational and not a gate. Do not require its completion for an integrated PASS; state clearly that it remains pending until the owner performs it.
 Independently compare the original task against every implementation requirement and hard constraint in humanRequirements/constraints. Do not demand a code target for missionRequirements; the Factory lifecycle/synthesis fulfills those instructions. Your Integrated Reviewer verdict is this LLM workflow gate, not owner/manual sign-off. If any explicit requirement or constraint was omitted, merged so it loses an independently testable obligation, or weakened, do not PASS; report the missing coverage as a concrete finding.
 
 Engineer packets:
@@ -229,7 +230,7 @@ Latest global diff (inspect the workspace yourself; this is supporting evidence,
 ${input.latestGlobalDiff || "(none reported)"}
 Deterministic verification output (commands and observed stdout/stderr/results):
 ${list(input.verificationOutput)}
-Pending owner/manual verification:
+Owner-pending acceptance (not a Factory gate):
 ${list(input.pendingOwnerVerification)}
 
 Examine the final integrated state every time, including the current workspace and global diff after all target work. Do not rely on earlier target PASS packets or status-only summaries. Produce an integrated_review packet. Verdict must be PASS when the implementation conforms, REPAIR_REQUIRED for a coding, test, integration, or evidence defect, and ARCHITECTURE_CONTRADICTION only when repository evidence disproves an authoritative architecture assumption and continuation is impossible. For every finding cite real diff/workspace evidence, affectedTargetIds, and a concrete repair or verification. Do not turn a defect into a contradiction and do not redesign architecture. If contradiction applies, fill every architectureContradiction field, including the owner decision needed.
@@ -318,7 +319,7 @@ Known limitations:
 ${list(input.limitations)}
 Original execution contract (authoritative):
 ${JSON.stringify(input.contract)}
-missionRequirements are Factory lifecycle/report metadata, not implementation targets or code acceptance criteria; the final synthesis fulfills those report instructions after this audit.
+missionRequirements are Factory lifecycle/report metadata, not implementation targets or code acceptance criteria; the final synthesis fulfills those report instructions after this audit. Any verification.ownerAcceptance is a non-blocking manual check that remains pending after technical acceptance; do not reject an otherwise conforming implementation because the owner has not performed it, and never claim it passed.
 Latest integrated review:
 ${JSON.stringify(input.review)}
 ${input.earlierRejection ? "Historical integration packet from before remediation (NOT current acceptance evidence):" : "Latest integrated state:"}
@@ -416,6 +417,7 @@ export function finalReportPrompt(input: {
   roleTargets: string[];
   missionRequirements?: string[];
   warningEvidence: ReportWarningEvidence[];
+  ownerPendingAcceptance?: string[];
 }): string {
   const iso = (ms?: number): string => (ms === undefined ? "(unknown)" : new Date(ms).toISOString());
   const remediationBlock = input.remediation
@@ -474,6 +476,8 @@ Deterministic orchestration facts: repair rounds ${input.repairRounds}, remediat
 
 Execution mission/report metadata (reporting obligations only; do not treat these as implementation targets or dependencies):
 ${list(input.missionRequirements)}
+Owner-pending acceptance after technical completion (not a Factory gate; do not claim it has passed):
+${list(input.ownerPendingAcceptance)}
 
 Controller-owned warning evidence (IDs, sources, scopes, target ownership and text are authoritative; do not change or merge them):
 ${JSON.stringify(input.warningEvidence)}
@@ -501,7 +505,7 @@ This is a read-only synthesis. Do not modify files, run commands that write, cre
 
 Original authoritative request: ${input.task}
 Execution contract: ${JSON.stringify(input.contract)}
-Mission/report requirements are metadata for this synthesis, not implementation targets. A conditional request to report incomplete/manual/owner-pending verification "if any" means report only actual recorded evidence; it does not create owner sign-off. The Integrated Reviewer verdict is an LLM workflow result, never owner/manual verification.
+Mission/report requirements are metadata for this synthesis, not implementation targets. A conditional request to report incomplete/manual/owner-pending verification "if any" means report only actual recorded evidence; it does not create owner sign-off. The Integrated Reviewer verdict is an LLM workflow result, never owner/manual verification. The contract's ownerAcceptance checks remain pending after Factory technical acceptance and do not block the integrated PASS; never claim they passed.
 Implemented targets: ${JSON.stringify(input.engineers)}
 Deterministic and manual verification: ${list(input.verification)}
 Integrated Reviewer: ${JSON.stringify(input.review)}

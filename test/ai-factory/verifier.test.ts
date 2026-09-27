@@ -20,7 +20,17 @@ describe("deterministic target verification", () => {
     expect(await verifyFactoryTarget(dir, "T1", { command: "exit 7", evidence: "check" })).toMatchObject({ status: "failed", evidence: expect.stringContaining("exit=7") });
   });
 
-  it("distinguishes manual owner-pending from unavailable", async () => {
+  it("runs deterministic checks despite separate post-implementation owner acceptance", async () => {
+    const dir = cwd();
+    expect(await verifyFactoryTarget(dir, "T1", {
+      command: "printf machine-check-passed",
+      evidence: "Machine check passes",
+      ownerPending: true,
+      ownerAcceptance: "Owner confirms on iPad after delivery",
+    })).toMatchObject({ status: "passed", command: "printf machine-check-passed", evidence: expect.stringContaining("machine-check-passed") });
+  });
+
+  it("distinguishes manual owner-pending from unavailable when no command exists", async () => {
     const dir = cwd();
     expect(await verifyFactoryTarget(dir, "T1", { evidence: "Visual inspection required", ownerPending: true })).toMatchObject({ status: "owner_pending", evidence: "Visual inspection required" });
     expect(await verifyFactoryTarget(dir, "T1", { evidence: "No check exists" })).toMatchObject({ status: "unavailable", evidence: "No check exists" });

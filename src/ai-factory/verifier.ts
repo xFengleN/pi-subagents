@@ -5,10 +5,13 @@ import type { FactoryVerificationResult } from "./types.js";
 export async function verifyFactoryTarget(
   cwd: string,
   _targetId: string,
-  instruction: { command?: string; evidence: string; ownerPending?: boolean },
+  instruction: { command?: string; evidence: string; ownerAcceptance?: string; ownerPending?: boolean },
 ): Promise<FactoryVerificationResult> {
-  if (instruction.ownerPending) return { status: "owner_pending", evidence: instruction.evidence };
-  if (!instruction.command?.trim()) return { status: "unavailable", evidence: instruction.evidence || "No reproducible verification command supplied" };
+  if (!instruction.command?.trim()) {
+    return instruction.ownerPending
+      ? { status: "owner_pending", evidence: instruction.ownerAcceptance ?? instruction.evidence }
+      : { status: "unavailable", evidence: instruction.evidence || "No reproducible verification command supplied" };
+  }
   const command = instruction.command;
   return new Promise((resolve) => {
     const child = spawn("sh", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });

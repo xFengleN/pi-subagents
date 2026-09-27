@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatFactoryReport } from "../../src/ai-factory/commands.js";
 import { defaultFactoryConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
 import { createRequirementCatalog } from "../../src/ai-factory/targets.js";
@@ -177,7 +178,87 @@ describe("execution workflows", () => {
     }
   });
 
-  it("records manual verification as owner-pending and stops instead of fabricating acceptance", async () => {
+  it("keeps post-implementation owner acceptance separate from machine verification through final acceptance", async () => {
+    const m = make("verified_execution");
+    const ownerCheck = "Owner runs the human iPad Safari acceptance checklist after technical delivery.";
+    const targetContract = {
+      ...contract,
+      workPackages: ["PWA20-T6"],
+      targets: [{ id: "PWA20-T6", description: "Live delivery and owner checklist", dependsOn: [], acceptanceCriteria: ["Complete live delivery evidence"] }],
+      verification: {
+        "PWA20-T6": { command: "true", evidence: "Live E2E delivery verification", ownerPending: true, ownerAcceptance: ownerCheck },
+      },
+      humanDependencies: [],
+    };
+    await start(m);
+    await complete(m, targetContract);
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    expect(m.controller.getState().results.executionProposal?.packet.humanDependencies).toEqual([]);
+    expect(m.controller.getState().results.executionProposal?.packet.blockingHumanDependencies).toBeUndefined();
+    await complete(m, engineer("PWA20-T6"));
+    expect(m.controller.getState().targetPlan?.outcomes["PWA20-T6"].verification?.status).toBe("passed");
+    expect(phases(m).at(-1)).toBe("integrated.review");
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("not a Factory gate");
+    await complete(m, integratedPass);
+    await complete(m, packets.integration);
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("do not reject an otherwise conforming implementation");
+    await complete(m, conformanceAccept);
+    await complete(m, packets.finalReport);
+    expect(m.controller.getState().state).toBe("DONE");
+    const report = formatFactoryReport(m.controller.getState());
+    expect(report).toContain("Technical Factory acceptance");
+    expect(report).toContain("ACCEPTED; the listed owner/manual acceptance remains pending");
+    expect(report).toContain(`PWA20-T6: ${ownerCheck}`);
+    expect(report).not.toContain("Owner acceptance: passed");
+    m.store.cleanup();
+  });
+
+  it("preserves genuine blocking human prerequisites", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, { ...contract, blockingHumanDependencies: { "wp-1": "Owner must provide the required hardware before implementation." } });
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toContain("Owner must provide the required hardware");
+    expect(phases(m)).not.toContain("execution.engineer");
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Execution did not begin.");
+    expect(report).toContain("Blocking human dependencies");
+    expect(report).toContain("wp-1: Owner must provide the required hardware");
+    m.store.cleanup();
+  });
+
+  it("reports invalid pre-Engineer proposals as planned, not completed, evidence", async () => {
+    const m = make("verified_execution");
+    const ownerCheck = "Owner runs the human iPad Safari acceptance checklist after technical delivery.";
+    await start(m);
+    await complete(m, {
+      ...contract,
+      workPackages: ["PWA20-T6"],
+      targets: [{ id: "PWA20-T6", description: "Live delivery and owner checklist", dependsOn: [], acceptanceCriteria: ["Complete live delivery evidence"] }],
+      humanDependencies: [{ targetId: "PWA20-T6", dependsOn: ownerCheck }],
+      verification: { "PWA20-T6": { command: "node verify-live.mjs", evidence: "Live E2E verification and human iPad checklist", ownerPending: true } },
+    });
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toContain("Execution contract omitted user dependency");
+    expect(phases(m)).not.toContain("execution.engineer");
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Stop phase: execution.proposal");
+    expect(report).toContain("Proposal status: produced, rejected by contract validation");
+    expect(report).toContain("Engineer executions: 0");
+    expect(report).toContain("Reviewer executions: 0");
+    expect(report).toContain("Implementation evidence: none");
+    expect(report).toContain("Planned targets (not executed)");
+    expect(report).toContain("Planned verification (not run)");
+    expect(report).toContain('PWA20-T6: planned command "node verify-live.mjs"');
+    expect(report).toContain("Planned owner-pending acceptance (not performed)");
+    expect(report).not.toContain("Target evidence");
+    expect(report).not.toContain("Owner-pending acceptance\n");
+    m.store.cleanup();
+  });
+
+  it("records legacy owner-only verification as pending rather than fabricating acceptance", async () => {
     const m = make("lean", "owner_pending");
     await start(m);
     await complete(m, { ...contract, verification: {

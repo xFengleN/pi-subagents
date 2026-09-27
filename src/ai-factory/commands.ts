@@ -606,6 +606,38 @@ function formatWarningEvidence(finding: ReturnType<typeof collectReportWarningEv
   return `${finding.source}${target} (${finding.category}): ${finding.text}`;
 }
 
+function isPreExecutionContractStop(state: FactoryRunState): boolean {
+  if (state.state !== "STOPPED" || workflowMode(state) === "full" || !state.results.executionProposal) return false;
+  if (!state.stoppedReason?.startsWith("Invalid execution contract:")
+    && !state.stoppedReason?.startsWith("Blocking human dependencies prevent execution:")) return false;
+  const engineerStarted = state.results.engineers.length > 0 || (state.attempts ?? []).some((attempt) =>
+    attempt.phase === "execution.engineer" && !["not_started", "prepared"].includes(attempt.provenance),
+  );
+  return !engineerStarted;
+}
+
+function renderPreExecutionContractStop(lines: string[], state: FactoryRunState): void {
+  const contract = state.results.executionProposal!.packet;
+  lines.push("", "Execution did not begin.");
+  lines.push("- Stop phase: execution.proposal");
+  lines.push(`- Stop reason: ${state.stoppedReason ?? "not recorded"}`);
+  const contractRejected = state.stoppedReason?.startsWith("Invalid execution contract:") ?? false;
+  lines.push(`- Proposal status: produced${contractRejected ? ", rejected by contract validation" : ", blocked before execution by an explicit human prerequisite"}`);
+  lines.push(`- Engineer executions: ${state.results.engineers.length}`);
+  lines.push(`- Reviewer executions: ${state.results.reviewers.length + (state.results.integratedReview ? 1 : 0) + (state.results.integratedReviews?.length ?? 0)}`);
+  lines.push("- Implementation evidence: none; no Engineer packet or changed-file evidence was recorded.");
+  section(lines, "Planned targets (not executed)", (contract.targets ?? []).map((target) => `${target.id}: ${target.description}`));
+  section(lines, "Planned verification (not run)", Object.entries(contract.verification).map(([targetId, item]) =>
+    `${targetId}: planned command ${item.command ? `"${item.command}"` : "(none)"}; expected evidence: ${item.evidence}`,
+  ));
+  const blockingHumanDependencies = Object.entries(contract.blockingHumanDependencies ?? {}).map(([targetId, reason]) => `${targetId}: ${reason}`);
+  section(lines, "Blocking human dependencies", blockingHumanDependencies.length > 0 ? blockingHumanDependencies : ["(none recorded)"]);
+  section(lines, "Planned owner-pending acceptance (not performed)", Object.entries(contract.verification).flatMap(([targetId, item]) => {
+    const check = item.ownerAcceptance ?? (item.ownerPending ? item.evidence : undefined);
+    return check ? [`${targetId}: ${check}`] : [];
+  }));
+}
+
 /** Render canonical warnings by source and scope; legacy reports keep their old shape. */
 function renderFinalReportWarnings(lines: string[], report: FinalReportPacket): void {
   if (!report.warningFindings) {
@@ -667,6 +699,12 @@ function formatWorkflowReport(state: FactoryRunState): string {
           : "completed";
   lines.push(`Result: ${result}`);
   lines.push("", "Run statistics", ...runStatistics(state));
+
+  if (isPreExecutionContractStop(state)) {
+    renderPreExecutionContractStop(lines, state);
+    lines.push("", `Full report persisted: ${FACTORY_DIR}/${state.runId}.json`);
+    return lines.join("\n");
+  }
 
   if (acceptedSynthesis?.summary.trim()) {
     lines.push("", acceptedSynthesis.summary.trim());
@@ -730,14 +768,27 @@ function formatWorkflowReport(state: FactoryRunState): string {
     ]);
   }
 
-  const ownerPending = [
-    ...Object.values(state.results.executionProposal?.packet.verification ?? {}).filter((item) => item.ownerPending).map((item) => item.evidence),
-    ...(targetPlan?.targets.flatMap((target) => {
-      const verification = targetPlan.outcomes[target.id].verification;
-      return verification?.status === "owner_pending" ? [`${target.id}: ${verification.evidence}`] : [];
-    }) ?? []),
-  ];
-  if (ownerPending.length > 0) section(lines, "Owner-pending verification", ownerPending);
+  const ownerAcceptance = Object.entries(state.results.executionProposal?.packet.verification ?? {}).flatMap(([targetId, item]) => {
+    const check = item.ownerAcceptance ?? (item.ownerPending && !item.command ? item.evidence : undefined);
+    return check ? [{ targetId, check }] : [];
+  });
+  const completedOwnerAcceptance = ownerAcceptance.filter(({ targetId }) => {
+    const outcome = targetPlan?.outcomes[targetId];
+    return outcome?.status === "passed" && outcome.verification?.status === "passed";
+  });
+  const notYetDueOwnerAcceptance = ownerAcceptance.filter(({ targetId }) => !completedOwnerAcceptance.some((item) => item.targetId === targetId));
+  if (completedOwnerAcceptance.length > 0) {
+    section(lines, "Owner-pending acceptance", completedOwnerAcceptance.map(({ targetId, check }) => `${targetId}: ${check}`));
+    if (state.state === "DONE") section(lines, "Technical Factory acceptance", ["ACCEPTED; the listed owner/manual acceptance remains pending and was not treated as a Factory gate."]);
+  }
+  if (notYetDueOwnerAcceptance.length > 0) {
+    section(lines, "Planned owner-pending acceptance (not yet due)", notYetDueOwnerAcceptance.map(({ targetId, check }) => `${targetId}: ${check}`));
+  }
+  const ownerPendingVerification = targetPlan?.targets.flatMap((target) => {
+    const verification = targetPlan.outcomes[target.id].verification;
+    return verification?.status === "owner_pending" ? [`${target.id}: ${verification.evidence}`] : [];
+  }) ?? [];
+  if (ownerPendingVerification.length > 0) section(lines, "Owner-pending verification", ownerPendingVerification);
 
   if (acceptedSynthesis?.warningFindings) {
     renderFinalReportWarnings(lines, acceptedSynthesis);
@@ -788,6 +839,13 @@ const REPORT_HEADINGS = new Set([
   "Integration evidence",
   "Pre-remediation integration evidence (historical)",
   "Owner-pending verification",
+  "Owner-pending acceptance",
+  "Planned owner-pending acceptance (not performed)",
+  "Planned owner-pending acceptance (not yet due)",
+  "Technical Factory acceptance",
+  "Planned targets (not executed)",
+  "Planned verification (not run)",
+  "Blocking human dependencies",
   "Artifacts and git evidence",
   "Delivered",
   "Architecture / decisions",

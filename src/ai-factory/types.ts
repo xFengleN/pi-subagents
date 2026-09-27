@@ -137,7 +137,9 @@ export interface ExecutionContractPacket extends LeadProposalPacket {
   /** Factory lifecycle/report obligations; never target, dependency, or verification requirements. */
   missionRequirements: string[];
   requirementCatalog: FactoryMissionRequirement[];
-  verification: Record<string, { command?: string; evidence: string; ownerPending?: boolean }>;
+  verification: Record<string, { command?: string; evidence: string; ownerAcceptance?: string; ownerPending?: boolean }>;
+  /** Human prerequisites that genuinely block implementation; keyed by target ID. */
+  blockingHumanDependencies?: Record<string, string>;
   architectureContradiction?: FactoryArchitectureContradiction;
 }
 

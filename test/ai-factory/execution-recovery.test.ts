@@ -61,6 +61,20 @@ describe("execution workflow persisted recovery", () => {
     expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
   });
 
+  it("continues to read legacy contracts with ownerPending and command but no new metadata fields", () => {
+    const state = baseState();
+    state.workflow = { mode: "verified_execution" };
+    state.results.executionProposal = {
+      packet: {
+        ...proposal,
+        humanDependencies: [{ targetId: "WP0", dependsOn: "Owner performs the real-device acceptance checklist" }],
+        verification: { WP0: { command: "npm run verify", evidence: "Automated verification and device checklist", ownerPending: true } },
+      },
+      agentId: "lead-1",
+    };
+    expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
+  });
+
   it("accepts reordered identity references with paraphrased explanatory text in persisted state", () => {
     const state = baseState();
     state.results.executionProposal = {

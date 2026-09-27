@@ -67,6 +67,7 @@ const verificationSchema = {
   properties: {
     command: { type: "string" },
     evidence: { type: "string" },
+    ownerAcceptance: { type: "string" },
     ownerPending: { type: "boolean" },
   },
 } as const;
@@ -157,6 +158,7 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       humanRequirements: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
       missionRequirements: strArr,
       humanDependencies: dependencyArr,
+      blockingHumanDependencies: { type: "object", additionalProperties: { type: "string" } },
       dependencies: { type: "string" },
       risks: strArr,
       acceptanceCriteria: strArr,
@@ -369,10 +371,12 @@ const verification = (value: unknown): ExecutionContractPacket["verification"] |
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
     const item = raw as Record<string, unknown>;
     if (typeof item.evidence !== "string" || (item.command !== undefined && typeof item.command !== "string")
+      || (item.ownerAcceptance !== undefined && typeof item.ownerAcceptance !== "string")
       || (item.ownerPending !== undefined && typeof item.ownerPending !== "boolean")) return undefined;
     result[targetId] = {
       evidence: item.evidence,
       ...(item.command === undefined ? {} : { command: item.command }),
+      ...(item.ownerAcceptance === undefined ? {} : { ownerAcceptance: item.ownerAcceptance }),
       ...(item.ownerPending === undefined ? {} : { ownerPending: item.ownerPending }),
     };
   }
@@ -499,6 +503,13 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
       const humanDependencies = raw.humanDependencies === undefined ? undefined : dependencies(raw.humanDependencies);
       if (raw.humanDependencies !== undefined && humanDependencies === undefined) return undefined;
+      const blockingHumanDependencies = raw.blockingHumanDependencies === undefined
+        ? undefined
+        : raw.blockingHumanDependencies && typeof raw.blockingHumanDependencies === "object" && !Array.isArray(raw.blockingHumanDependencies)
+          && Object.values(raw.blockingHumanDependencies).every((reason) => typeof reason === "string")
+          ? raw.blockingHumanDependencies as Record<string, string>
+          : undefined;
+      if (raw.blockingHumanDependencies !== undefined && blockingHumanDependencies === undefined) return undefined;
       const suppliedCatalog = raw.requirementCatalog === undefined ? undefined : requirementCatalog(raw.requirementCatalog);
       if (raw.requirementCatalog !== undefined && suppliedCatalog === undefined) return undefined;
       const humanRequirements = strList(raw.humanRequirements);
@@ -512,7 +523,8 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
         workPackages: raw.workPackages.map(String), ...(proposedTargets === undefined ? {} : { targets: proposedTargets }),
         humanRequirements, missionRequirements,
         requirementCatalog: canonicalCatalog,
-        ...(humanDependencies === undefined ? {} : { humanDependencies }), dependencies: str(raw.dependencies),
+        ...(humanDependencies === undefined ? {} : { humanDependencies }),
+        ...(blockingHumanDependencies === undefined ? {} : { blockingHumanDependencies }), dependencies: str(raw.dependencies),
         risks: strList(raw.risks), acceptanceCriteria: raw.acceptanceCriteria.map(String), architecturalQuestions: strList(raw.architecturalQuestions),
         verification: contractVerification, ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
       } satisfies ExecutionContractPacket;

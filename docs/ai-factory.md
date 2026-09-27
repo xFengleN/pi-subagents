@@ -54,12 +54,11 @@ cover exactly those IDs and preserve source classification; ordering and
 explanatory wording are not identity. Missing, duplicate, unknown, or
 misclassified identities fail closed. Conditional requests to report manual or
 owner-pending checks "if any" do not create such a check; only explicit or
-inherently human verification becomes owner-pending. A structured
+inherently human acceptance becomes a recorded owner-pending acceptance. A structured
 architecture contradiction records the contradicted assumption, repository
 evidence, affected targets, reason work cannot safely proceed and smallest
 owner decision required; V1 stops rather than auto-redesigning the contract.
-Each target needs non-LLM verification (command output or explicitly recorded
-owner/manual verification); owner-pending verification stops the run for owner action (a fresh run is needed after manual verification) rather than counting as PASS, and unavailable evidence is not fabricated as PASS. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted.
+Each target needs non-LLM verification (normally command output). A manual check that remains after technical implementation is recorded separately as `verification.ownerAcceptance`; it is reported as pending but does not block engineering, integrated review, integration, or Factory acceptance. For legacy packets, `ownerPending` with no command remains non-passing; when a command is present, deterministic machine verification takes precedence and runs. Genuine external prerequisites that must be resolved before implementation belong in `blockingHumanDependencies` and stop the run before Engineers start. `humanDependencies` records user-mandated target ordering only; do not encode post-implementation owner acceptance there. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted. A contract STOPPED before engineering reports proposal status, stop reason, planned targets/checks, and blocking prerequisites separately from completed evidence.
 A verified implementation is not independently reviewed until integrated review
 PASS on the latest integrated state. VERIFIED EXECUTION's final Architect audits
 conformance with the owner's contract, not architectural taste. Model presets
@@ -183,9 +182,12 @@ plan. This stops the run before engineering; it does not trigger an automatic
 retry or another Architect call. For multi-target runs the explicit graph and
 assessment are mandatory even for APPROVE; an unchanged Lead proposal is not
 implicitly Architect approval. `dependsOn` edges listed separately as
-`humanDependencies` are user-mandated; other proposed edges are
-technical/inferred and may be corrected without claiming the user required
-that ordering. CLARIFY or incomplete approval stops safely.
+`humanDependencies` are user-mandated target-ordering edges; other proposed
+edges are technical/inferred and may be corrected without claiming the user
+required that ordering. Post-implementation manual acceptance is separate from
+both dependency types and is non-blocking. Use `blockingHumanDependencies` only
+for a real external prerequisite that must be resolved before execution.
+CLARIFY or incomplete approval stops safely.
 
 The controller verifies graph structure, preserves explicit human dependency
 edges, and checks the Architect's identity mappings and constraint assertions.

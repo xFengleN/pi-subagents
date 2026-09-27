@@ -65,7 +65,7 @@ export interface FactoryControllerDeps {
   clock: Clock;
   store: FactoryStore;
   config: FactoryConfig;
-  verifyTarget?: (cwd: string, targetId: string, instruction: { command?: string; evidence: string; ownerPending?: boolean }) => Promise<{ status: "passed" | "failed" | "owner_pending" | "unavailable"; evidence: string; command?: string }>;
+  verifyTarget?: (cwd: string, targetId: string, instruction: { command?: string; evidence: string; ownerAcceptance?: string; ownerPending?: boolean }) => Promise<{ status: "passed" | "failed" | "owner_pending" | "unavailable"; evidence: string; command?: string }>;
 }
 
 /** One spawn phase: which role, which packet schema, and the exact prompt. */
@@ -97,6 +97,13 @@ interface PendingSpawn {
 }
 
 const FIRST_WORK_PACKAGE = "wp-1";
+
+function ownerAcceptanceForContract(contract?: ExecutionContractPacket): string[] {
+  return Object.entries(contract?.verification ?? {}).flatMap(([targetId, item]) => {
+    const check = item.ownerAcceptance ?? (item.ownerPending && !item.command ? item.evidence : undefined);
+    return check?.trim() ? [`${targetId}: ${check}`] : [];
+  });
+}
 
 export class FactoryController {
   private readonly transport: FactoryTransport;
@@ -1057,7 +1064,10 @@ export class FactoryController {
         return {
           role: "reviewer",
           kind: "integrated_review",
-          prompt: integratedReviewPrompt({ task: s.task, architecture: s.effectiveArchitecture, contract: packet!, targetPlan: s.targetPlan?.targets ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), reviewers: s.results.reviewers.map((item) => item.outcome.packet), latestGlobalDiff: "Inspect the current workspace and git diff directly.", verificationOutput: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [], pendingOwnerVerification: s.targetPlan?.targets.filter((target) => s.targetPlan!.outcomes[target.id].verification?.status === "owner_pending").map((target) => target.id) ?? [] }),
+          prompt: integratedReviewPrompt({ task: s.task, architecture: s.effectiveArchitecture, contract: packet!, targetPlan: s.targetPlan?.targets ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), reviewers: s.results.reviewers.map((item) => item.outcome.packet), latestGlobalDiff: "Inspect the current workspace and git diff directly.", verificationOutput: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [], pendingOwnerVerification: [
+            ...ownerAcceptanceForContract(packet!),
+            ...(s.targetPlan?.targets.filter((target) => s.targetPlan!.outcomes[target.id].verification?.status === "owner_pending").map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].verification?.evidence}`) ?? []),
+          ] }),
         };
       }
       case "conformance.recheck":
@@ -1162,6 +1172,7 @@ export class FactoryController {
             remediationRounds: s.remediationRounds,
             roleTargets: ROLE_NAMES.map((role) => `${role}: ${s.metrics.roles[role].targetUsed ?? this.config.roles[role]?.targets?.primary ?? "unknown"}`),
             missionRequirements: s.results.executionProposal?.packet.missionRequirements,
+            ownerPendingAcceptance: ownerAcceptanceForContract(s.results.executionProposal?.packet),
             warningEvidence: collectReportWarningEvidence(s),
           }),
         };
@@ -1577,6 +1588,10 @@ export class FactoryController {
         }
         if (Object.keys(contract.verification).length !== targets.length || targets.some((target) => !contract.verification[target.id])) errors.push("Execution contract must define verification for every target");
         if (Object.keys(contract.verification).some((id) => !ids.has(id))) errors.push("Execution contract contains verification for an unknown target");
+        for (const [targetId, reason] of Object.entries(contract.blockingHumanDependencies ?? {})) {
+          if (!ids.has(targetId)) errors.push(`Blocking human dependency refers to unknown target ${targetId}`);
+          if (!reason.trim()) errors.push(`Blocking human dependency for ${targetId} needs a reason`);
+        }
         if (contract.architectureContradiction) {
           s.architectureContradiction = contract.architectureContradiction;
           s.stoppedReason = "Execution contract reported an architecture contradiction";
@@ -1585,6 +1600,12 @@ export class FactoryController {
         }
         if (errors.length > 0) {
           s.stoppedReason = `Invalid execution contract: ${[...new Set(errors)].join("; ")}`;
+          this.applyTransition("STOPPED");
+          return;
+        }
+        const blockingHumanDependencies = Object.entries(contract.blockingHumanDependencies ?? {});
+        if (blockingHumanDependencies.length > 0) {
+          s.stoppedReason = `Blocking human dependencies prevent execution: ${blockingHumanDependencies.map(([targetId, reason]) => `${targetId}: ${reason}`).join("; ")}`;
           this.applyTransition("STOPPED");
           return;
         }
