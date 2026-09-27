@@ -535,6 +535,8 @@ export interface FactoryRunState {
    * with identical role/model targets even if the project file or an inline
    * override has since changed. */
   config: FactoryConfig;
+  /** Project-selected preset captured at run creation; null means no named preset. */
+  preset?: string | null;
   /** Immutable per-run policy identity. Missing in historical snapshots = FULL. */
   workflow?: { mode: FactoryWorkflowMode };
   architectureContradiction?: FactoryArchitectureContradiction;

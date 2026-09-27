@@ -213,6 +213,87 @@ function section(lines: string[], title: string, items: string[]): void {
   for (const item of items) lines.push(`- ${item}`);
 }
 
+function formatRunTimestamp(timestamp: number): string {
+  if (!Number.isFinite(timestamp)) return "not recorded";
+  const iso = new Date(timestamp).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)} +00:00`;
+}
+
+/** Persisted run facts shared by automatic delivery and `/factory-report`. */
+function runStatistics(state: FactoryRunState): string[] {
+  const startedAt = state.createdAt;
+  const finishedAt = isTerminal(state.state) ? state.metrics.runEndedAt ?? state.updatedAt : undefined;
+  const duration = finishedAt !== undefined && Number.isFinite(startedAt) && finishedAt >= startedAt
+    ? formatDuration(finishedAt - startedAt)
+    : "not recorded";
+  const selectedPreset = state.preset === undefined ? "not recorded" : state.preset ?? "none";
+  const preset = state.presetReplacement
+    ? `${selectedPreset} → ${state.presetReplacement.preset} (replacement)`
+    : selectedPreset;
+  const workflow = workflowPolicy(workflowMode(state)).displayName;
+  const targetPlan = state.targetPlan;
+  let targetLine = "Targets: not recorded";
+  if (targetPlan) {
+    const counts = { passed: 0, failed: 0, blocked: 0, unresolved: 0 };
+    const revalidation = new Set(targetPlan.revalidationIds ?? []);
+    for (const target of targetPlan.targets) {
+      const status = targetPlan.outcomes[target.id]?.status;
+      if (revalidation.has(target.id)) counts.unresolved++;
+      else if (status === "passed") counts.passed++;
+      else if (status === "failed") counts.failed++;
+      else if (status === "blocked") counts.blocked++;
+      else counts.unresolved++;
+    }
+    targetLine = `Targets: ${targetPlan.targets.length} total · ${counts.passed} passed · ${counts.failed} failed · ${counts.blocked} blocked`;
+    if (counts.unresolved > 0) targetLine += ` · ${counts.unresolved} unresolved`;
+  } else {
+    const proposedTargets = state.results.proposal?.packet.targets;
+    if (proposedTargets) targetLine = `Targets: ${proposedTargets.length} total · outcomes not recorded`;
+  }
+  const maxRepairRound = state.attempts?.reduce((max, attempt) => Math.max(max, attempt.round), state.repairRound) ?? state.repairRound;
+  const usageLines: string[] = [];
+  const calls = state.metrics.calls;
+  if (calls && state.metrics.totalAttempts > 0 && calls.length === state.metrics.totalAttempts) {
+    const completeTotal = (key: "input" | "output" | "cacheRead" | "cost"): number | undefined =>
+      calls.every((call) => call[key] !== undefined) ? calls.reduce((sum, call) => sum + call[key]!, 0) : undefined;
+    const input = completeTotal("input");
+    const output = completeTotal("output");
+    const cached = completeTotal("cacheRead");
+    const cost = completeTotal("cost");
+    if (input !== undefined) usageLines.push(`- Input tokens: ${input.toLocaleString("en-US")}`);
+    if (output !== undefined) usageLines.push(`- Output tokens: ${output.toLocaleString("en-US")}`);
+    if (cached !== undefined) usageLines.push(`- Cached tokens: ${cached.toLocaleString("en-US")}`);
+    if (cost !== undefined) usageLines.push(`- Provider-reported cost: $${cost.toFixed(6)}`);
+  }
+  const architect = state.results.finalRecheck?.packet ?? state.results.finalArchitect?.packet;
+  const integratedReviewer = state.results.integratedReview?.packet;
+  const result = state.state === "DONE"
+    ? workflow === "LEAN"
+      ? integratedReviewer?.verdict ?? state.results.finalReport?.packet.result ?? "PASS"
+      : architect?.verdict ?? state.results.finalReport?.packet.result ?? "accepted"
+    : state.state === "FAILED"
+      ? "runtime failure"
+      : "not accepted";
+  return [
+    `- Started: ${formatRunTimestamp(startedAt)}`,
+    `- Finished: ${finishedAt === undefined ? "in progress" : formatRunTimestamp(finishedAt)}`,
+    `- Duration: ${duration}`,
+    `- Workflow: ${workflow}`,
+    `- Preset: ${preset}`,
+    `- ${targetLine}`,
+    `- Agent attempts: ${state.metrics.totalAttempts}`,
+    `- Repair rounds: ${maxRepairRound}/${state.config.maxRepairRounds}`,
+    `- Remediation rounds: ${state.remediationRounds}/${state.config.maxArchitectRemediationRounds}`,
+    `- Retries: ${state.metrics.totalRetries}`,
+    `- Fallbacks: ${state.metrics.totalFallbacks}`,
+    `- Capacity waits: ${state.metrics.capacityWaits}`,
+    `- Lead escalations: ${state.leadEscalations}`,
+    `- Architect escalations: ${state.architectEscalations}`,
+    ...usageLines,
+    `- Result: ${state.state} / ${result}`,
+  ];
+}
+
 /**
  * A legacy view: the authoritative result/source for the header plus the body.
  * Used only when `results.finalReport` is absent (the run predates the final
@@ -382,13 +463,7 @@ function formatFactoryReportFull(state: FactoryRunState): string {
   } else {
     lines.push("Authoritative final verdict: not available");
   }
-  if (state.metrics.runDurationMs !== undefined) lines.push(`Duration: ${formatDuration(state.metrics.runDurationMs)}`);
-  lines.push(`Remediation rounds: ${state.remediationRounds}`);
-  lines.push(
-    `Counters: repair ${state.repairRound}/${state.config.maxRepairRounds}; remediation ${state.remediationRounds}/${state.config.maxArchitectRemediationRounds}; `
-    + `architect escalations ${state.architectEscalations}/${state.config.maxArchitectEscalations}; lead escalations ${state.leadEscalations}/${state.config.maxLeadEscalations}; `
-    + `attempts ${state.metrics.totalAttempts}; retries ${state.metrics.totalRetries}; fallbacks ${state.metrics.totalFallbacks}; capacity waits ${state.metrics.capacityWaits}`,
-  );
+  lines.push("", "Run statistics", ...runStatistics(state));
 
   if (state.state === "STOPPED") {
     lines.push(`Stop reason: ${controlledStopReason(state)}`);
@@ -552,7 +627,7 @@ function renderFinalReportWarnings(lines: string[], report: FinalReportPacket): 
 function formatWorkflowReport(state: FactoryRunState): string {
   const mode = workflowMode(state);
   const policy = workflowPolicy(mode);
-  const lines = ["Factory final report", `Run: ${state.runId}`, `Terminal state: ${state.state}`, `Workflow: ${policy.displayName}`];
+  const lines = ["Factory final report", `Run: ${state.runId}`, `Terminal state: ${state.state}`];
   const finalArchitect = authoritativeArchitectOutcome(state);
   const integratedReview = state.results.integratedReview?.packet;
   const targetPlan = state.targetPlan;
@@ -591,6 +666,7 @@ function formatWorkflowReport(state: FactoryRunState): string {
           ? "ARCHITECTURE_CONTRADICTION"
           : "completed";
   lines.push(`Result: ${result}`);
+  lines.push("", "Run statistics", ...runStatistics(state));
 
   if (acceptedSynthesis?.summary.trim()) {
     lines.push("", acceptedSynthesis.summary.trim());
@@ -703,6 +779,7 @@ export function formatFactoryCompletion(state: FactoryRunState): string {
 /** Section titles promoted to `##` headings in the Markdown report message. */
 const REPORT_HEADINGS = new Set([
   "Factory final report",
+  "Run statistics",
   "Workflow gates",
   "Target evidence",
   "Architecture contradiction",

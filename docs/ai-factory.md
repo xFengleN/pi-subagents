@@ -259,7 +259,7 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 | `/factory-workflow [full\|verified\|lean]` | Selects the sticky next-run workflow for this Pi session. Defaults to FULL; separate from the model preset. |
 | `/factory-verbose [mode]` | Selects what the Factory's focused live view shows (read-only; no model call). With no argument it reports the current mode and usage. Modes: `on` (follow the active agent, then the last finished one — the default), `off` (compact progress only, no live view), `active` (only the running agent, following phase changes), a role (`lead`/`architect`/`engineer`/`reviewer`, the latest agent of that role), or an exact phase (e.g. `execution.engineer`, that phase's agent). For every mode except `off` the command opens a scrollable, live-updating transcript overlay (Esc closes it) that reuses pi-subagents' own conversation viewer; `/agents` remains the full history. The mode is a session-scoped UI preference, independent of Factory configuration and persisted run data, and never affects execution. Invalid arguments show usage and never invoke a model. |
 | `/factory-status` | Compact read-only status of the latest run for the project. Live: state/phase, active role and model, repair/remediation counts, retries, fallbacks, capacity waits, elapsed. Completed: final verdict, duration, remediation rounds, final HEAD, commit count, validation summary, human-verification state, per-role last target. Never prints the full report and never spends a request. |
-| `/factory-report [runId]` | Prints the human-readable final report again for the latest terminal run, or for an explicit run id. Reads persisted state only — no model call — and is not suppressed by the automatic-delivery marker. Legacy runs without a final Lead synthesis use the latest authoritative Architect outcome first, then the integration fallback where valid, all clearly labelled. |
+| `/factory-report [runId]` | Prints the human-readable final report again for the latest terminal run, or for an explicit run id. Reads persisted state only — no model call — and is not suppressed by the automatic-delivery marker. Reports include the same persisted Run statistics as automatic terminal delivery. Legacy runs without a final Lead synthesis use the latest authoritative Architect outcome first, then the integration fallback where valid, all clearly labelled. |
 | `/factory-metrics [runId]` | Appends operational metrics for the latest run, or an explicit run id, as a normal message at the current bottom of the conversation: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
 | `/factory-resume <runId> [--preset <name>]` | Inspects an interrupted run read-only (state, phase, completed vs incomplete work, recovery checkpoint, next-action classification) and resumes it after confirmation where necessary. Preserves all completed packets and never replays a finished phase. Safe automatic continuation (clean checkpoints, WAITING_CAPACITY) proceeds directly; an interrupted Engineer whose workspace outcome is uncertain requires explicit approval (acknowledging the workspace is used as-is) before exactly one new attempt. `--preset <name>` swaps ONLY future children's model targets/fallbacks/retry/turn limits to a saved preset — workflow budgets, isolation, and the original config history are preserved. DONE/STOPPED/FAILED runs are not resumed. |
@@ -444,6 +444,18 @@ classification cannot promote a target finding into a mission warning. Execution
 provenance label legacy warnings as unscoped instead of promoting them to mission
 findings. FULL's historical report format remains unchanged for older reports
 without provenance.
+
+Every terminal report and `/factory-report` recall includes a `Run statistics`
+section built from persisted state: creation and terminal timestamps, duration,
+workflow and captured preset identity, target outcomes, attempts, repair and
+remediation rounds, retries, fallbacks, capacity waits, escalations, and final
+state/result. Timestamps are rendered in UTC with an explicit `+00:00` offset.
+`Started` uses `createdAt`; `Finished` uses the persisted terminal `runEndedAt`,
+falling back to `updatedAt` for older snapshots, and duration is their difference.
+The repair-round figure is the highest round in persisted invocation attempts over
+the configured per-target limit, not a live mutable cursor. An unavailable legacy
+preset is labelled “not recorded”; token and cost totals appear only when every
+persisted attempt reported that metric, and are omitted otherwise.
 
 Automatic delivery uses a durable sidecar marker beside the run artifact, so
 repeated terminal callbacks, status refreshes, and ordinary session rehydration

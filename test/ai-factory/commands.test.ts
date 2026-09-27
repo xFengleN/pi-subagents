@@ -494,6 +494,36 @@ describe("AI Factory — /factory-report", () => {
     expect(b.spawns).toHaveLength(0);
   });
 
+  it("renders persisted run statistics on every /factory-report recall", async () => {
+    const cwd = workdir();
+    const store = new FactoryStore(cwd);
+    const startedAt = Date.parse("2026-09-27T00:14:32+02:00");
+    const finishedAt = Date.parse("2026-09-27T01:07:51+02:00");
+    const state = completedState(cwd, "factory_persisted_stats", "Stats report.", {
+      createdAt: startedAt,
+      updatedAt: finishedAt + 10_000,
+      preset: "codex-go-balanced",
+      metrics: { ...emptyFactoryMetrics(startedAt), runEndedAt: finishedAt },
+    });
+    store.save(state);
+    const b = await boot(cwd);
+    const { ctx, notifications } = commandCtx(cwd);
+    const reportCommand = b.commands.get("factory-report").handler;
+
+    await reportCommand(state.runId, ctx);
+    const first = notifications.find((n) => n.message.includes("Factory final report"))?.message ?? "";
+    await reportCommand(state.runId, ctx);
+    const reports = notifications.filter((n) => n.message.includes("Factory final report"));
+
+    expect(first).toContain("Started: 2026-09-26 22:14:32 +00:00");
+    expect(first).toContain("Finished: 2026-09-26 23:07:51 +00:00");
+    expect(first).toContain("Duration: 53m 19s");
+    expect(first).toContain("Preset: codex-go-balanced");
+    expect(reports).toHaveLength(2);
+    expect(reports[1].message).toBe(first);
+    expect(b.spawns).toHaveLength(0);
+  });
+
   it("G. legacy remediation run uses the ACCEPT recheck, not the stale integration", async () => {
     const cwd = workdir();
     const store = new FactoryStore(cwd);
@@ -506,7 +536,8 @@ describe("AI Factory — /factory-report", () => {
     };
     store.save(completedState(cwd, "factory_mu7ct43l_Vqof08", "", {
       remediationRounds: 1,
-      metrics: { ...emptyFactoryMetrics(1_000), runEndedAt: 2_000, runDurationMs: 1_777_000 },
+      updatedAt: 1_778_000,
+      metrics: { ...emptyFactoryMetrics(1_000), runEndedAt: 1_778_000, runDurationMs: 1_777_000 },
       results: {
         engineers: [{ round: 0, outcome: { packet: packets.engineer, agentId: "e0" } }],
         reviewers: [],

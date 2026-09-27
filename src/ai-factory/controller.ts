@@ -12,7 +12,7 @@
  */
 
 import type { Clock } from "./clock.js";
-import { configRevision, replacementConfig, targetsForRole } from "./config.js";
+import { configRevision, projectPresetName, replacementConfig, targetsForRole } from "./config.js";
 import { FactoryLeaseError } from "./lease.js";
 import { appendCallMetric, emptyFactoryMetrics, recordSettleMetrics } from "./metrics.js";
 import { type PacketKind, packetSchema, parsePacketTyped } from "./packets.js";
@@ -168,6 +168,7 @@ export class FactoryController {
       task,
       cwd,
       config: deps.config,
+      preset: projectPresetName(cwd) ?? null,
       workflow: { mode },
       state: "DISCOVERY",
       repairRound: 0,

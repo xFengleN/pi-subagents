@@ -710,7 +710,8 @@ export function validatePersistedFactoryRunState(value: unknown, intendedProject
   if (!record(value)) return { ok: false, issues: ["Factory run state must be an object"], legacy: false };
   const state = value;
   const legacy = state.version === LEGACY_FACTORY_STATE_VERSION;
-  exactKeys(state, ["version", "runId", "createdAt", "updatedAt", "task", "cwd", "config", "state", "repairRound", "repairExhausted", "effectiveArchitecture", "remediationRounds", "architectEscalations", "leadEscalations", "results", "metrics", "errors", "parked"], ["workflow", "architectureContradiction", "inFlight", "waiting", "stoppedReason", "stateRevision", "checkpoint", "attempts", "presetReplacement", "targetPlan"], "state", issues);
+  exactKeys(state, ["version", "runId", "createdAt", "updatedAt", "task", "cwd", "config", "state", "repairRound", "repairExhausted", "effectiveArchitecture", "remediationRounds", "architectEscalations", "leadEscalations", "results", "metrics", "errors", "parked"], ["workflow", "preset", "architectureContradiction", "inFlight", "waiting", "stoppedReason", "stateRevision", "checkpoint", "attempts", "presetReplacement", "targetPlan"], "state", issues);
+  if (state.preset !== undefined && state.preset !== null && (typeof state.preset !== "string" || state.preset.trim() === "")) issues.push("preset must be a non-empty string or null");
   if (state.workflow !== undefined) {
     if (!record(state.workflow)) issues.push("workflow must be an object");
     else {
