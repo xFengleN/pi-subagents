@@ -47,6 +47,7 @@ import {
   type FactoryRecoveryEligibility,
   type FactoryResumeResult,
   type FactoryRunState,
+  type FactoryRunVerificationOutcome,
   type FactoryTarget,
   type FinalReportPacket,
   type IntegratedReviewPacket,
@@ -105,6 +106,14 @@ function ownerAcceptanceForContract(contract?: ExecutionContractPacket): string[
   });
 }
 
+function runVerificationOutputForState(state: FactoryRunState): string[] {
+  const checks = state.results.executionProposal?.packet.runVerification ?? [];
+  return checks.map((check) => {
+    const outcome = state.results.runVerification?.find((item) => item.name === check.name);
+    return `${check.name}: ${JSON.stringify(outcome ?? { status: "not run", command: check.command, evidence: check.evidence })}`;
+  });
+}
+
 export class FactoryController {
   private readonly transport: FactoryTransport;
   private readonly clock: Clock;
@@ -115,6 +124,7 @@ export class FactoryController {
   private readonly verifyTarget: NonNullable<FactoryControllerDeps["verifyTarget"]>;
   private readonly workflow: FactoryWorkflowMode;
   private verificationPending = false;
+  private runVerificationPending = false;
   /** Task 2 fencing token binding every commit to exclusive ownership. */
   private leaseToken: string | undefined;
   /** True once a fenced commit was rejected: the controller no longer owns the
@@ -596,6 +606,43 @@ export class FactoryController {
     void this.drive();
   }
 
+  private async verifyRunLevelChecks(): Promise<void> {
+    if (this.disposed || this.ownershipLost || this.runVerificationPending) return;
+    const contract = this.state.results.executionProposal?.packet;
+    const checks = contract?.runVerification ?? [];
+    const existing = this.state.results.runVerification ?? [];
+    if (existing.length >= checks.length) return;
+    this.runVerificationPending = true;
+    try {
+      for (let index = existing.length; index < checks.length; index++) {
+        const check = checks[index];
+        if (!check) continue;
+        let result: Awaited<ReturnType<typeof this.verifyTarget>>;
+        try {
+          result = await this.verifyTarget(this.cwd, check.name, { command: check.command, evidence: check.evidence });
+        } catch (error) {
+          result = { status: "failed", evidence: `Verification failed: ${error instanceof Error ? error.message : String(error)}` };
+        }
+        if (this.disposed || this.ownershipLost || isTerminal(this.state.state)) return;
+        const outcome: FactoryRunVerificationOutcome = {
+          name: check.name,
+          command: check.command,
+          status: result.status === "passed" ? "passed" : "failed",
+          evidence: result.status === "passed" ? result.evidence : `${result.status}: ${result.evidence}`,
+        };
+        this.state.results.runVerification = [...(this.state.results.runVerification ?? []), outcome];
+        this.commit();
+        if (outcome.status !== "passed") {
+          this.stop(`Run-level verification ${check.name} ${result.status}; integrated review will not start`);
+          return;
+        }
+      }
+    } finally {
+      this.runVerificationPending = false;
+    }
+    if (!this.disposed && !this.ownershipLost) void this.drive();
+  }
+
   private async verifyCompletedTarget(): Promise<void> {
     if (this.disposed || this.ownershipLost) return;
     const plan = this.state.targetPlan;
@@ -849,6 +896,15 @@ export class FactoryController {
         return { kind: "transition", to: "EXECUTION" };
       }
       case "INTEGRATED_REVIEW": {
+        const runChecks = s.results.executionProposal?.packet.runVerification ?? [];
+        if (this.runVerificationPending) return undefined;
+        const runResults = s.results.runVerification ?? [];
+        if (runResults.length < runChecks.length) {
+          void this.verifyRunLevelChecks();
+          return undefined;
+        }
+        const failedRunCheck = runResults.find((item) => item.status !== "passed");
+        if (failedRunCheck) return { kind: "transition", to: "STOPPED", note: `Run-level verification ${failedRunCheck.name} failed: ${failedRunCheck.evidence}` };
         const review = s.results.integratedReview;
         if (!review || s.results.integratedReviews?.at(-1)?.agentId !== review.agentId) return { kind: "spawn", phase: "integrated.review" };
         if (review.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer found an architecture contradiction" };
@@ -876,6 +932,7 @@ export class FactoryController {
           plan.currentTargetId = ordered[0];
           plan.outcomes[ordered[0]].status = "active";
           s.results.integratedReview = undefined;
+          s.results.runVerification = undefined;
           return { kind: "transition", to: "EXECUTION", note: `Scoped integrated repair: ${ids.join(", ")}` };
         }
         return { kind: "transition", to: "INTEGRATION" };
@@ -895,6 +952,7 @@ export class FactoryController {
         if (s.remediationRounds >= this.config.maxArchitectRemediationRounds) return { kind: "transition", to: "STOPPED", note: "conformance remediation budget exhausted" };
         s.remediationRounds++;
         s.results.integratedReview = undefined;
+        s.results.runVerification = undefined;
         if (s.targetPlan) for (const target of s.targetPlan.targets) s.targetPlan.outcomes[target.id].reviewerAgentId = undefined;
         const affected = s.results.finalArchitect.packet.affectedTargetIds ?? [];
         if (s.targetPlan && !s.results.finalArchitect.packet.integrationOnly && affected.length === 0) return { kind: "transition", to: "STOPPED", note: "Conformance rejection did not identify a safe remediation scope" };
@@ -1064,7 +1122,7 @@ export class FactoryController {
         return {
           role: "reviewer",
           kind: "integrated_review",
-          prompt: integratedReviewPrompt({ task: s.task, architecture: s.effectiveArchitecture, contract: packet!, targetPlan: s.targetPlan?.targets ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), reviewers: s.results.reviewers.map((item) => item.outcome.packet), latestGlobalDiff: "Inspect the current workspace and git diff directly.", verificationOutput: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [], pendingOwnerVerification: [
+          prompt: integratedReviewPrompt({ task: s.task, architecture: s.effectiveArchitecture, contract: packet!, targetPlan: s.targetPlan?.targets ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), reviewers: s.results.reviewers.map((item) => item.outcome.packet), latestGlobalDiff: "Inspect the current workspace and git diff directly.", verificationOutput: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [], runVerificationOutput: runVerificationOutputForState(s), pendingOwnerVerification: [
             ...ownerAcceptanceForContract(packet!),
             ...(s.targetPlan?.targets.filter((target) => s.targetPlan!.outcomes[target.id].verification?.status === "owner_pending").map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].verification?.evidence}`) ?? []),
           ] }),
@@ -1074,13 +1132,13 @@ export class FactoryController {
         return {
           role: "architect",
           kind: "conformance_final",
-          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], repairs: s.results.finalArchitect?.packet.requiredChanges ?? [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet, earlierRejection: s.results.finalArchitect?.packet }),
+          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], runVerificationEvidence: runVerificationOutputForState(s), repairs: s.results.finalArchitect?.packet.requiredChanges ?? [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet, earlierRejection: s.results.finalArchitect?.packet }),
         };
       case "conformance.architect":
         return {
           role: "architect",
           kind: "conformance_final",
-          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], repairs: [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet }),
+          prompt: conformanceArchitectPrompt({ task: s.task, architecture: s.effectiveArchitecture, targetOutcomes: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id])}`) ?? [], engineers: s.results.engineers.map((item) => item.outcome.packet), verificationEvidence: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? {})}`) ?? [], runVerificationEvidence: runVerificationOutputForState(s), repairs: [], limitations: s.results.engineers.flatMap((item) => item.outcome.packet.knownLimitations), contract: s.results.executionProposal!.packet, review: s.results.integratedReview!.packet, integration: s.results.integration!.packet }),
         };
       case "discovery.lead":
         return { role: "lead", kind: "proposal", prompt: leadProposalPrompt(s.task) };
@@ -1100,6 +1158,7 @@ export class FactoryController {
             engineers: s.results.engineers.map((e) => e.outcome.packet),
             reviewers: reviewerOutcomesForIntegration(s).map((item) => item.outcome.packet),
             ...(s.targetPlan ? { targetSummary: s.targetPlan.targets.map((target) => `${target.id}: ${s.targetPlan!.outcomes[target.id].status}`) } : {}),
+            runVerificationOutput: runVerificationOutputForState(s),
           }),
         };
       case "final.architect":
@@ -1142,6 +1201,7 @@ export class FactoryController {
             review: s.results.integratedReview!.packet,
             engineers: s.results.engineers.map((item) => item.outcome.packet),
             verification: s.targetPlan?.targets.map((target) => `${target.id}: ${JSON.stringify(s.targetPlan!.outcomes[target.id].verification ?? { status: "missing" })}`) ?? [],
+            runVerificationOutput: runVerificationOutputForState(s),
             warningEvidence: collectReportWarningEvidence(s),
           }) };
         }
@@ -1172,6 +1232,7 @@ export class FactoryController {
             remediationRounds: s.remediationRounds,
             roleTargets: ROLE_NAMES.map((role) => `${role}: ${s.metrics.roles[role].targetUsed ?? this.config.roles[role]?.targets?.primary ?? "unknown"}`),
             missionRequirements: s.results.executionProposal?.packet.missionRequirements,
+            runVerificationOutput: runVerificationOutputForState(s),
             ownerPendingAcceptance: ownerAcceptanceForContract(s.results.executionProposal?.packet),
             warningEvidence: collectReportWarningEvidence(s),
           }),
@@ -1588,6 +1649,8 @@ export class FactoryController {
         }
         if (Object.keys(contract.verification).length !== targets.length || targets.some((target) => !contract.verification[target.id])) errors.push("Execution contract must define verification for every target");
         if (Object.keys(contract.verification).some((id) => !ids.has(id))) errors.push("Execution contract contains verification for an unknown target");
+        const runVerificationNames = (contract.runVerification ?? []).map((check) => check.name.trim().toLowerCase());
+        if (new Set(runVerificationNames).size !== runVerificationNames.length) errors.push("Execution contract contains duplicate run-level verification names");
         for (const [targetId, reason] of Object.entries(contract.blockingHumanDependencies ?? {})) {
           if (!ids.has(targetId)) errors.push(`Blocking human dependency refers to unknown target ${targetId}`);
           if (!reason.trim()) errors.push(`Blocking human dependency for ${targetId} needs a reason`);

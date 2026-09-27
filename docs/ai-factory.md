@@ -46,7 +46,8 @@ Execution Contract Lead: the owner's supplied architecture is authoritative
 unless repository evidence proves a material assumption false. The Lead returns
 separate implementation `humanRequirements`, hard `constraints`, and
 Factory lifecycle/reporting `missionRequirements`; only implementation
-requirements and constraints can shape targets, dependencies, and verification.
+requirements and constraints shape targets and target-specific verification.
+Explicit whole-run/integration checks use the separate run-verification field.
 Factory assigns the shared deterministic `REQ-NNN` catalog from these arrays,
 with mission/report metadata classified separately. The model does not invent
 IDs or supply a second catalog. Any legacy/sanitized catalog references must
@@ -58,7 +59,9 @@ inherently human acceptance becomes a recorded owner-pending acceptance. A struc
 architecture contradiction records the contradicted assumption, repository
 evidence, affected targets, reason work cannot safely proceed and smallest
 owner decision required; V1 stops rather than auto-redesigning the contract.
-Each target needs non-LLM verification (normally command output). A manual check that remains after technical implementation is recorded separately as `verification.ownerAcceptance`; it is reported as pending but does not block engineering, integrated review, integration, or Factory acceptance. For legacy packets, `ownerPending` with no command remains non-passing; when a command is present, deterministic machine verification takes precedence and runs. Genuine external prerequisites that must be resolved before implementation belong in `blockingHumanDependencies` and stop the run before Engineers start. `humanDependencies` records user-mandated target ordering only; do not encode post-implementation owner acceptance there. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted. A contract STOPPED before engineering reports proposal status, stop reason, planned targets/checks, and blocking prerequisites separately from completed evidence.
+Execution contracts keep the legacy flat `verification` map target-only: it must provide one check per declared target, and every key must match a target ID. Add optional `runVerification: [{ name, command, evidence }]` for whole-run, integration, live-preview, deployment, regression-matrix, artifact-identity, or packaging checks. These commands run after all target checks and before integrated review; they are never targets and cannot fill missing target coverage. Unknown keys in the flat map remain invalid rather than being guessed as run-level checks. Historical contracts without `runVerification` remain readable.
+
+A manual check that remains after technical implementation is recorded separately as `verification.ownerAcceptance`; it is reported as pending but does not block engineering, integrated review, integration, or Factory acceptance. For legacy packets, `ownerPending` with no command remains non-passing; when a command is present, deterministic machine verification takes precedence and runs. Genuine external prerequisites that must be resolved before implementation belong in `blockingHumanDependencies` and stop the run before Engineers start. `humanDependencies` records user-mandated target ordering only; do not encode post-implementation owner acceptance there. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted. A contract STOPPED before engineering reports proposal status, stop reason, planned targets/checks, and blocking prerequisites separately from completed evidence.
 A verified implementation is not independently reviewed until integrated review
 PASS on the latest integrated state. VERIFIED EXECUTION's final Architect audits
 conformance with the owner's contract, not architectural taste. Model presets

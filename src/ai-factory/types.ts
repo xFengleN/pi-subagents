@@ -131,13 +131,30 @@ export interface FactoryArchitectureContradiction {
 }
 
 /** Execution workflow's authoritative contract and verification plan. */
+export interface FactoryRunVerificationInstruction {
+  /** Unique human-readable identity within this run-level checklist; not a target ID. */
+  name: string;
+  command: string;
+  evidence: string;
+}
+
+export interface FactoryRunVerificationOutcome {
+  name: string;
+  command: string;
+  status: "passed" | "failed";
+  evidence: string;
+}
+
 export interface ExecutionContractPacket extends LeadProposalPacket {
   /** Implementation requirements, distinct from lifecycle/report metadata. */
   humanRequirements: string[];
   /** Factory lifecycle/report obligations; never target, dependency, or verification requirements. */
   missionRequirements: string[];
   requirementCatalog: FactoryMissionRequirement[];
+  /** Legacy flat map; keys are target IDs only. */
   verification: Record<string, { command?: string; evidence: string; ownerAcceptance?: string; ownerPending?: boolean }>;
+  /** Whole-run checks; separate from target verification and never targets. */
+  runVerification?: FactoryRunVerificationInstruction[];
   /** Human prerequisites that genuinely block implementation; keyed by target ID. */
   blockingHumanDependencies?: Record<string, string>;
   architectureContradiction?: FactoryArchitectureContradiction;
@@ -366,6 +383,8 @@ export interface ReviewerOutcome {
 export interface PhaseResults {
   proposal?: RoleOutcome<LeadProposalPacket>;
   executionProposal?: RoleOutcome<ExecutionContractPacket>;
+  /** Persisted run-level verification evidence; never counted as target outcomes. */
+  runVerification?: FactoryRunVerificationOutcome[];
   integratedReview?: RoleOutcome<IntegratedReviewPacket>;
   integratedReviews?: RoleOutcome<IntegratedReviewPacket>[];
   initialArchitect?: RoleOutcome<ArchitectInitialResult>;

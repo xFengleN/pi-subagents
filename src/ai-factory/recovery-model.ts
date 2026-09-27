@@ -51,7 +51,7 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "execution.proposal": {
     required: ["goal", "repositoryFindings", "currentArchitecture", "assumptions", "proposedSolution", "constraints", "workPackages", "dependencies", "risks", "acceptanceCriteria", "architecturalQuestions", "verification", "humanRequirements", "missionRequirements", "requirementCatalog"],
-    optional: ["targets", "humanDependencies", "blockingHumanDependencies", "architectureContradiction"],
+    optional: ["targets", "humanDependencies", "blockingHumanDependencies", "runVerification", "architectureContradiction"],
     kinds: ["execution_proposal"],
   },
   "integrated.review": {
@@ -164,6 +164,37 @@ function validateVerification(value: unknown, path: string, issues: string[]): v
     if (item.command !== undefined && typeof item.command !== "string") issues.push(`${path}.${targetId}.command must be a string`);
     if (item.ownerAcceptance !== undefined && (typeof item.ownerAcceptance !== "string" || item.ownerAcceptance.trim() === "")) issues.push(`${path}.${targetId}.ownerAcceptance must be a non-empty string`);
     if (item.ownerPending !== undefined && typeof item.ownerPending !== "boolean") issues.push(`${path}.${targetId}.ownerPending must be boolean`);
+  }
+}
+
+function validateRunVerification(value: unknown, path: string, issues: string[]): void {
+  if (!Array.isArray(value)) { issues.push(`${path} must be an array`); return; }
+  const names = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const itemPath = `${path}[${index}]`;
+    if (!record(item)) { issues.push(`${itemPath} must be an object`); continue; }
+    exactKeys(item, ["name", "command", "evidence"], [], itemPath, issues);
+    if (typeof item.name !== "string" || item.name.trim() === "") issues.push(`${itemPath}.name must be non-empty`);
+    else {
+      const normalizedName = item.name.trim().toLowerCase();
+      if (names.has(normalizedName)) issues.push(`${path} contains duplicate verification name ${item.name}`);
+      names.add(normalizedName);
+    }
+    if (typeof item.command !== "string" || item.command.trim() === "") issues.push(`${itemPath}.command must be non-empty`);
+    if (typeof item.evidence !== "string" || item.evidence.trim() === "") issues.push(`${itemPath}.evidence must be non-empty`);
+  }
+}
+
+function validateRunVerificationOutcomes(value: unknown, path: string, issues: string[]): void {
+  if (!Array.isArray(value)) { issues.push(`${path} must be an array`); return; }
+  for (const [index, item] of value.entries()) {
+    const itemPath = `${path}[${index}]`;
+    if (!record(item)) { issues.push(`${itemPath} must be an object`); continue; }
+    exactKeys(item, ["name", "command", "status", "evidence"], [], itemPath, issues);
+    if (typeof item.name !== "string" || item.name.trim() === "") issues.push(`${itemPath}.name must be non-empty`);
+    if (typeof item.command !== "string" || item.command.trim() === "") issues.push(`${itemPath}.command must be non-empty`);
+    if (item.status !== "passed" && item.status !== "failed") issues.push(`${itemPath}.status is invalid`);
+    if (typeof item.evidence !== "string" || item.evidence.trim() === "") issues.push(`${itemPath}.evidence must be non-empty`);
   }
 }
 
@@ -493,6 +524,7 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
     }
   }
   if (value.verification !== undefined) validateVerification(value.verification, `${path}.verification`, issues);
+  if (value.runVerification !== undefined) validateRunVerification(value.runVerification, `${path}.runVerification`, issues);
   if (value.architectureContradiction !== undefined) validateContradiction(value.architectureContradiction, `${path}.architectureContradiction`, undefined, issues);
   if (value.planAssessment !== undefined) validatePlanAssessment(value.planAssessment, `${path}.planAssessment`, issues);
   if (value.clarificationQuestions !== undefined && !strings(value.clarificationQuestions)) issues.push(`${path}.clarificationQuestions must be an array of strings`);
@@ -538,6 +570,19 @@ function validateExecutionResults(state: Record<string, unknown>, issues: string
   if (proposal?.packet && record(proposal.packet)) {
     const verification = proposal.packet.verification;
     if (ids && record(verification) && (Object.keys(verification).length !== ids.size || [...ids].some((id) => !(id in verification)))) issues.push("executionProposal.verification must contain exactly one entry for every canonical target");
+    const plannedRunChecks = Array.isArray(proposal.packet.runVerification) ? proposal.packet.runVerification.filter(record) : [];
+    const completedRunChecks = record(state.results) ? state.results.runVerification : undefined;
+    if (completedRunChecks !== undefined) {
+      if (!Array.isArray(completedRunChecks)) issues.push("results.runVerification must be an array");
+      else if (!Array.isArray(proposal.packet.runVerification) && completedRunChecks.length > 0) issues.push("run verification results exist without planned run-level verification");
+      else {
+        if (completedRunChecks.length > plannedRunChecks.length) issues.push("run verification results exceed the planned checks");
+        for (const [index, result] of completedRunChecks.entries()) {
+          const planned = plannedRunChecks[index];
+          if (!record(result) || !planned || result.name !== planned.name || result.command !== planned.command) issues.push(`results.runVerification[${index}] does not match its planned run-level check`);
+        }
+      }
+    }
     if (proposal.packet.architectureContradiction !== undefined) validateContradiction(proposal.packet.architectureContradiction, "results.executionProposal.packet.architectureContradiction", ids, issues);
   }
   const integrated = record(state.results) && record(state.results.integratedReview) ? state.results.integratedReview : undefined;
@@ -554,7 +599,7 @@ function validateResults(value: unknown, issues: string[]): void {
     issues.push("results must be an object");
     return;
   }
-  exactKeys(value, ["engineers", "reviewers"], ["proposal", "executionProposal", "integratedReview", "integratedReviews", "initialArchitect", "integration", "finalArchitect", "finalRecheck", "finalReport", "escalationArchitect", "leadEscalation", "remediation"], "results", issues);
+  exactKeys(value, ["engineers", "reviewers"], ["proposal", "executionProposal", "runVerification", "integratedReview", "integratedReviews", "initialArchitect", "integration", "finalArchitect", "finalRecheck", "finalReport", "escalationArchitect", "leadEscalation", "remediation"], "results", issues);
   if (!Array.isArray(value.engineers)) issues.push("results.engineers must be an array");
   else for (const [index, item] of value.engineers.entries()) {
     if (!record(item) || !integer(item.round)) issues.push(`results.engineers[${index}] has an invalid round`);
@@ -570,6 +615,10 @@ function validateResults(value: unknown, issues: string[]): void {
       if (item.targetId !== undefined && typeof item.targetId !== "string") issues.push(`results.reviewers[${index}].targetId must be a string`);
       validateOutcome(item.outcome, "review.reviewer", `results.reviewers[${index}].outcome`, issues);
     }
+  }
+  if (value.runVerification !== undefined) {
+    validateRunVerificationOutcomes(value.runVerification, "results.runVerification", issues);
+    if (value.executionProposal === undefined) issues.push("results.runVerification requires an execution proposal");
   }
   const single: Array<[string, string]> = [["proposal", "discovery.lead"], ["executionProposal", "execution.proposal"], ["integratedReview", "integrated.review"], ["initialArchitect", "initial.architect"], ["integration", "integration.lead"], ["finalArchitect", "final.architect"], ["finalRecheck", "final_recheck.architect"], ["finalReport", "final_synthesis.lead"], ["escalationArchitect", "escalation.architect"], ["leadEscalation", "escalation.lead"]];
   for (const [key, phase] of single) if (value[key] !== undefined) validateOutcome(value[key], phase, `results.${key}`, issues);

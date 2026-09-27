@@ -134,11 +134,13 @@ describe("execution workflow packets and prompts", () => {
       finalAcceptance: { verdict: "ACCEPT", blockingIssues: [], requiredChanges: [], doNotChange: [], requiredEvidence: [] },
       engineers: [], reviewers: [], runStartedAt: 0, repairRounds: 0, remediationRounds: 0, roleTargets: [],
       missionRequirements: ["Include the Integrated Reviewer verdict", "Report owner-pending verification, if any"],
+      runVerificationOutput: ["Live preview: passed; HTTP 200"],
       warningEvidence: [],
     });
     expect(prompt).toContain("Execution mission/report metadata (reporting obligations, not implementation targets)");
     expect(prompt).toContain("Include the Integrated Reviewer verdict");
     expect(prompt).toContain("Report owner-pending verification, if any");
+    expect(prompt).toContain("Live preview: passed; HTTP 200");
     expect(prompt).toContain("a request to report such checks \"if any\" does not create a check");
     expect(prompt).toContain("Controller-owned warning evidence");
     expect(prompt).toContain("Factory derives the \"warnings\" array exclusively from active mission-scoped findings");
@@ -154,6 +156,34 @@ describe("execution workflow packets and prompts", () => {
     }), undefined);
     expect(packet?.verification.SETTINGS_UI).toMatchObject({ command: "npm test -- settings", ownerAcceptance: "Owner inspects rendered layout on an iPad" });
     expect(packet?.humanDependencies).toEqual([]);
+  });
+
+  it("parses explicit run-level checks separately from target verification", () => {
+    const packet = parsePacketTyped("execution_proposal", JSON.stringify({
+      ...contract,
+      targets: [
+        { id: "T1", description: "Tab focus", dependsOn: [], acceptanceCriteria: ["Focus routes correctly"] },
+        { id: "T2", description: "Virtual paging", dependsOn: [], acceptanceCriteria: ["No gaps"] },
+        { id: "T3", description: "Regression expectations", dependsOn: [], acceptanceCriteria: ["Regressions covered"] },
+      ],
+      verification: {
+        T1: { command: "node verify-tab.mjs", evidence: "Tab focus test passes" },
+        T2: { command: "node verify-paging.mjs", evidence: "Paging invariant passes" },
+        T3: { command: "node verify-regressions.mjs", evidence: "Regression suite passes" },
+      },
+      runVerification: [{
+        name: "Live preview",
+        command: "node verify-live-preview.mjs",
+        evidence: "HTTP 200, workspace identity matches, and tailnet exposure is restricted",
+      }],
+    }), undefined);
+    expect(packet).toBeDefined();
+    expect(Object.keys(packet?.verification ?? {})).toEqual(["T1", "T2", "T3"]);
+    expect(packet?.runVerification).toEqual([{
+      name: "Live preview",
+      command: "node verify-live-preview.mjs",
+      evidence: "HTTP 200, workspace identity matches, and tailnet exposure is restricted",
+    }]);
   });
 
   it("parses genuine blocking human prerequisites separately from owner acceptance", () => {
@@ -202,9 +232,11 @@ describe("execution workflow packets and prompts", () => {
     expect(execution).toContain("verification.ownerAcceptance text; it is informational and does not block engineering");
     expect(execution).toContain("Never encode ownerAcceptance as a target dependency or humanDependencies edge");
     expect(execution).toContain("Use blockingHumanDependencies only for a genuine external prerequisite");
+    expect(execution).toContain("whole-run, integration, live-preview, deployment, regression-matrix, artifact-identity, and packaging checks in the separate runVerification array");
+    expect(execution).toContain("invent pseudo-target IDs such as live-preview");
     expect(execution).toContain("Integrated Reviewer is a configured LLM gate, not owner/manual sign-off");
     expect(execution).toContain("missionRequirements");
-    expect(execution).toContain("scoped to that target");
+    expect(execution).toContain("scoped to their target");
     const integrated = integratedReviewPrompt({
       task: "TASK",
       architecture: "ARCH",
@@ -214,12 +246,15 @@ describe("execution workflow packets and prompts", () => {
       reviewers: [],
       latestGlobalDiff: "diff --git a/src/a.ts b/src/a.ts",
       verificationOutput: ["npm test -- feature: PASS"],
+      runVerificationOutput: ["Live preview: passed"],
       pendingOwnerVerification: ["Owner confirms deployment behavior"],
     });
     expect(integrated).toContain("real code diff");
     expect(integrated).toContain("original task against every implementation requirement and hard constraint");
     expect(integrated).toContain("Do not demand a code target for missionRequirements");
     expect(integrated).toContain("this LLM workflow gate, not owner/manual sign-off");
+    expect(integrated).toContain("Integrated/run-level verification output (never target outcomes)");
+    expect(integrated).toContain("Live preview: passed");
     expect(integrated).toContain("REPAIR_REQUIRED");
     expect(integrated).toContain("ARCHITECTURE_CONTRADICTION");
     const conformance = conformanceArchitectPrompt({
@@ -228,6 +263,7 @@ describe("execution workflow packets and prompts", () => {
       targetOutcomes: ["target-a passed"],
       engineers: [],
       verificationEvidence: ["feature test: PASS"],
+      runVerificationEvidence: ["Live preview: passed"],
       repairs: ["none"],
       limitations: ["manual deployment check pending"],
       contract,
@@ -248,6 +284,8 @@ describe("execution workflow packets and prompts", () => {
     });
     expect(conformance).toContain("Do not redesign");
     expect(conformance).toContain("latest actual integrated workspace/state");
+    expect(conformance).toContain("Integrated/run-level verification evidence");
+    expect(conformance).toContain("Live preview: passed");
     expect(conformance).toContain("manual deployment check pending");
   });
 });

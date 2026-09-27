@@ -626,13 +626,23 @@ function renderPreExecutionContractStop(lines: string[], state: FactoryRunState)
   lines.push(`- Engineer executions: ${state.results.engineers.length}`);
   lines.push(`- Reviewer executions: ${state.results.reviewers.length + (state.results.integratedReview ? 1 : 0) + (state.results.integratedReviews?.length ?? 0)}`);
   lines.push("- Implementation evidence: none; no Engineer packet or changed-file evidence was recorded.");
+  const targetIds = new Set((contract.targets ?? []).map((target) => target.id));
   section(lines, "Planned targets (not executed)", (contract.targets ?? []).map((target) => `${target.id}: ${target.description}`));
-  section(lines, "Planned verification (not run)", Object.entries(contract.verification).map(([targetId, item]) =>
-    `${targetId}: planned command ${item.command ? `"${item.command}"` : "(none)"}; expected evidence: ${item.evidence}`,
+  section(lines, "Planned target verification (not run)", (contract.targets ?? []).map((target) => {
+    const item = contract.verification[target.id];
+    return item
+      ? `${target.id}: planned command ${item.command ? `"${item.command}"` : "(none)"}; expected evidence: ${item.evidence}`
+      : `${target.id}: missing target verification instruction`;
+  }));
+  section(lines, "Planned run-level verification (not run)", (contract.runVerification ?? []).map((check) =>
+    `${check.name}: planned command "${check.command}"; expected evidence: ${check.evidence}`,
+  ));
+  section(lines, "Unclassified verification entries (rejected; not run)", Object.entries(contract.verification).filter(([targetId]) => !targetIds.has(targetId)).map(([key, item]) =>
+    `${key}: ${item.command ? `"${item.command}"` : "(no command)"}; this key is not a declared target and is not explicit runVerification; expected evidence: ${item.evidence}`,
   ));
   const blockingHumanDependencies = Object.entries(contract.blockingHumanDependencies ?? {}).map(([targetId, reason]) => `${targetId}: ${reason}`);
   section(lines, "Blocking human dependencies", blockingHumanDependencies.length > 0 ? blockingHumanDependencies : ["(none recorded)"]);
-  section(lines, "Planned owner-pending acceptance (not performed)", Object.entries(contract.verification).flatMap(([targetId, item]) => {
+  section(lines, "Planned owner-pending acceptance (not performed)", Object.entries(contract.verification).filter(([targetId]) => targetIds.has(targetId)).flatMap(([targetId, item]) => {
     const check = item.ownerAcceptance ?? (item.ownerPending ? item.evidence : undefined);
     return check ? [`${targetId}: ${check}`] : [];
   }));
@@ -717,6 +727,14 @@ function formatWorkflowReport(state: FactoryRunState): string {
       const verification = outcome.verification;
       lines.push(`- ${target.id}: ${outcome.status}; verification: ${verification ? `${verification.status}: ${verification.evidence}` : "not recorded"}`);
     }
+  }
+  const runVerificationChecks = state.results.executionProposal?.packet.runVerification ?? [];
+  if (runVerificationChecks.length > 0) {
+    const outcomes = new Map((state.results.runVerification ?? []).map((outcome) => [outcome.name, outcome]));
+    section(lines, "Integrated/run verification", runVerificationChecks.map((check) => {
+      const outcome = outcomes.get(check.name);
+      return `${check.name}: ${outcome ? `${outcome.status}; command: ${outcome.command}; evidence: ${outcome.evidence}` : `planned, not run; command: ${check.command}; expected evidence: ${check.evidence}`}`;
+    }));
   }
   if (contradiction !== undefined) {
     lines.push("", "Architecture contradiction");
@@ -844,7 +862,10 @@ const REPORT_HEADINGS = new Set([
   "Planned owner-pending acceptance (not yet due)",
   "Technical Factory acceptance",
   "Planned targets (not executed)",
-  "Planned verification (not run)",
+  "Planned target verification (not run)",
+  "Planned run-level verification (not run)",
+  "Unclassified verification entries (rejected; not run)",
+  "Integrated/run verification",
   "Blocking human dependencies",
   "Artifacts and git evidence",
   "Delivered",

@@ -61,6 +61,32 @@ describe("execution workflow persisted recovery", () => {
     expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
   });
 
+  it("continues to read the historical stopped flat-map contract with a live-preview pseudo-target", () => {
+    const state = baseState();
+    state.workflow = { mode: "verified_execution" };
+    state.state = "STOPPED";
+    state.stoppedReason = "Invalid execution contract: verification contains an unknown target";
+    state.checkpoint = { ...state.checkpoint!, state: "STOPPED", phase: "terminal:STOPPED" };
+    state.results.executionProposal = {
+      packet: {
+        ...proposal,
+        targets: [
+          { id: "T1", description: "Tab focus", dependsOn: [], acceptanceCriteria: ["Focus works"] },
+          { id: "T2", description: "Paging", dependsOn: [], acceptanceCriteria: ["No gaps"] },
+          { id: "T3", description: "Regression update", dependsOn: [], acceptanceCriteria: ["Tests updated"] },
+        ],
+        verification: {
+          T1: { command: "npm test -- T1", evidence: "T1 check" },
+          T2: { command: "npm test -- T2", evidence: "T2 check" },
+          T3: { command: "npm test -- T3", evidence: "T3 check" },
+          "live-preview": { command: "curl https://preview/schema19-edit", evidence: "HTTP 200 and workspace identity" },
+        },
+      },
+      agentId: "lead-1",
+    };
+    expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
+  });
+
   it("continues to read legacy contracts with ownerPending and command but no new metadata fields", () => {
     const state = baseState();
     state.workflow = { mode: "verified_execution" };

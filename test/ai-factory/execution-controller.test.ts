@@ -64,14 +64,14 @@ const integratedRepairT2 = { verdict: "REPAIR_REQUIRED", affectedTargetIds: ["wp
 const conformanceAccept = { verdict: "ACCEPT", blockingIssues: [], requiredChanges: [], doNotChange: [], requiredEvidence: [] };
 const conformanceRejectT2 = { verdict: "NEEDS_REMEDIATION", affectedTargetIds: ["wp-2"], integrationOnly: false, blockingIssues: ["wp-2 needs repair"], requiredChanges: ["repair wp-2"], doNotChange: [], requiredEvidence: [] };
 
-function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" = "passed") {
+function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" | ((id: string) => "passed" | "failed" | "owner_pending" | "unavailable") = "passed") {
   const transport = new FakeTransport();
   const clock = new FakeClock();
   const store = tempStore();
   const verified: string[] = [];
   const controller = FactoryController.create({
     transport, clock, store: store.store, config: defaultFactoryConfig(),
-    verifyTarget: async (_cwd, id) => { verified.push(id); return { status: verificationStatus, evidence: `verified ${id}`, command: "true" }; },
+    verifyTarget: async (_cwd, id) => { verified.push(id); return { status: typeof verificationStatus === "function" ? verificationStatus(id) : verificationStatus, evidence: `verified ${id}`, command: "true" }; },
   }, `execution-${mode}`, "Implement the widget", store.dir, mode);
   return { transport, controller, store, verified };
 }
@@ -178,6 +178,131 @@ describe("execution workflows", () => {
     }
   });
 
+  it("reproduces and rejects the legacy pseudo-target live-preview verification entry", async () => {
+    const m = make("verified_execution");
+    const targets = ["T1", "T2", "T3"].map((id) => ({ id, description: `${id} implementation`, dependsOn: [], acceptanceCriteria: [`${id} works`] }));
+    await start(m);
+    await complete(m, {
+      ...contract,
+      workPackages: targets.map((target) => target.id),
+      targets,
+      verification: {
+        T1: { command: "npm test -- T1", evidence: "T1 focused test passes" },
+        T2: { command: "npm test -- T2", evidence: "T2 paging tests pass" },
+        T3: { command: "npm test -- T3", evidence: "T3 regression suite passes" },
+        "live-preview": { command: "node verify-live-preview.mjs", evidence: "HTTP 200, workspace SHA matches, tailnet-only exposure" },
+      },
+    });
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toContain("Execution contract must define verification for every target");
+    expect(state.stoppedReason).toContain("Execution contract contains verification for an unknown target");
+    expect(phases(m)).not.toContain("execution.engineer");
+    expect(state.results.engineers).toHaveLength(0);
+    expect(state.results.reviewers).toHaveLength(0);
+    const report = formatFactoryReport(state);
+    expect(report).toContain("Unclassified verification entries (rejected; not run)");
+    expect(report).toContain("live-preview:");
+    expect(report).not.toContain("Target evidence");
+    m.store.cleanup();
+  });
+
+  it("executes multiple explicit run-level checks separately and completes VERIFIED EXECUTION", async () => {
+    const m = make("verified_execution");
+    const runVerification = [
+      { name: "Live preview", command: "node verify-live-preview.mjs", evidence: "HTTP 200, workspace SHA matches, tailnet-only exposure" },
+      { name: "Whole-run regression", command: "npm test -- regression", evidence: "Integrated regression matrix passes" },
+      { name: "Artifact identity", command: "shasum -a 256 dist/app.js", evidence: "Artifact hash matches expected identity" },
+      { name: "Deployment exposure", command: "node verify-exposure.mjs", evidence: "Service remains tailnet-only" },
+    ];
+    const targets = ["T1", "T2", "T3"].map((id) => ({ id, description: `${id} implementation`, dependsOn: [], acceptanceCriteria: [`${id} works`] }));
+    const targetVerification = {
+      T1: { command: "npm test -- T1", evidence: "T1 focused test passes" },
+      T2: { command: "npm test -- T2", evidence: "T2 paging tests pass" },
+      T3: { command: "npm test -- T3", evidence: "T3 regression suite passes", ownerAcceptance: "Owner verifies the real iPad workflow after technical acceptance" },
+    };
+    await start(m);
+    await complete(m, { ...contract, workPackages: targets.map((target) => target.id), targets, verification: targetVerification, runVerification });
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    expect(m.controller.getState().results.executionProposal?.packet.runVerification).toEqual(runVerification);
+    await complete(m, engineer("T1"));
+    await complete(m, engineer("T2"));
+    await complete(m, engineer("T3"));
+    expect(m.verified).toEqual(["T1", "T2", "T3", "Live preview", "Whole-run regression", "Artifact identity", "Deployment exposure"]);
+    expect(m.controller.getState().results.runVerification?.map((item) => item.status)).toEqual(["passed", "passed", "passed", "passed"]);
+    expect(phases(m).at(-1)).toBe("integrated.review");
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification output (never target outcomes)");
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Live preview");
+    await complete(m, integratedPass);
+    await complete(m, packets.integration);
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification evidence");
+    await complete(m, conformanceAccept);
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification");
+    await complete(m, packets.finalReport);
+    expect(m.controller.getState().state).toBe("DONE");
+    const report = formatFactoryReport(m.controller.getState());
+    expect(report).toContain("Target evidence");
+    expect(report).toContain("Integrated/run verification");
+    expect(report).toContain("Live preview: passed");
+    expect(report).toContain("Whole-run regression: passed");
+    expect(report).toContain("Artifact identity: passed");
+    expect(report).toContain("Deployment exposure: passed");
+    expect(report).toContain("Owner-pending acceptance");
+    expect(report).toContain("Owner verifies the real iPad workflow");
+    m.store.cleanup();
+  });
+
+  it("stops before integrated review when an explicit run-level check fails", async () => {
+    const m = make("verified_execution", (id) => id === "Live preview" ? "failed" : "passed");
+    await start(m);
+    await complete(m, {
+      ...contract,
+      runVerification: [{ name: "Live preview", command: "node verify-live-preview.mjs", evidence: "Preview responds and has the expected workspace identity" }],
+    });
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().results.runVerification).toEqual([{
+      name: "Live preview", command: "node verify-live-preview.mjs", status: "failed", evidence: "failed: verified Live preview",
+    }]);
+    expect(phases(m)).not.toContain("integrated.review");
+    expect(formatFactoryReport(m.controller.getState())).toContain("Live preview: failed");
+    m.store.cleanup();
+  });
+
+  it("rejects a misspelled target verification key", async () => {
+    const m = make("verified_execution");
+    const targets = ["T1", "T2"].map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] }));
+    await start(m);
+    await complete(m, { ...contract, targets, workPackages: ["T1", "T2"], verification: {
+      T1: { command: "true", evidence: "T1 passes" },
+      T22: { command: "true", evidence: "typo must not be accepted" },
+    } });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("verification for an unknown target");
+    expect(formatFactoryReport(m.controller.getState())).toContain("T2: missing target verification instruction");
+    expect(formatFactoryReport(m.controller.getState())).toContain("T22:");
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
+  it("does not let run-level checks satisfy missing target verification", async () => {
+    const m = make("verified_execution");
+    const targets = ["T1", "T2"].map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] }));
+    await start(m);
+    await complete(m, {
+      ...contract,
+      targets,
+      workPackages: ["T1", "T2"],
+      verification: { T1: { command: "true", evidence: "T1 passes" } },
+      runVerification: [{ name: "Live preview", command: "true", evidence: "live check passes" }],
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("verification for every target");
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
   it("keeps post-implementation owner acceptance separate from machine verification through final acceptance", async () => {
     const m = make("verified_execution");
     const ownerCheck = "Owner runs the human iPad Safari acceptance checklist after technical delivery.";
@@ -250,7 +375,7 @@ describe("execution workflows", () => {
     expect(report).toContain("Reviewer executions: 0");
     expect(report).toContain("Implementation evidence: none");
     expect(report).toContain("Planned targets (not executed)");
-    expect(report).toContain("Planned verification (not run)");
+    expect(report).toContain("Planned target verification (not run)");
     expect(report).toContain('PWA20-T6: planned command "node verify-live.mjs"');
     expect(report).toContain("Planned owner-pending acceptance (not performed)");
     expect(report).not.toContain("Target evidence");

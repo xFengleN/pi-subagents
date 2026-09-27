@@ -159,6 +159,15 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       missionRequirements: strArr,
       humanDependencies: dependencyArr,
       blockingHumanDependencies: { type: "object", additionalProperties: { type: "string" } },
+      runVerification: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "command", "evidence"],
+          properties: { name: { type: "string", minLength: 1 }, command: { type: "string", minLength: 1 }, evidence: { type: "string", minLength: 1 } },
+        },
+      },
       dependencies: { type: "string" },
       risks: strArr,
       acceptanceCriteria: strArr,
@@ -364,6 +373,20 @@ const architectureContradiction = (value: unknown): FactoryArchitectureContradic
   };
 };
 
+const runVerification = (value: unknown): ExecutionContractPacket["runVerification"] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const result: NonNullable<ExecutionContractPacket["runVerification"]> = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.name !== "string" || item.name.trim() === ""
+      || typeof item.command !== "string" || item.command.trim() === ""
+      || typeof item.evidence !== "string" || item.evidence.trim() === "") return undefined;
+    result.push({ name: item.name, command: item.command, evidence: item.evidence });
+  }
+  return result;
+};
+
 const verification = (value: unknown): ExecutionContractPacket["verification"] | undefined => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const result: ExecutionContractPacket["verification"] = {};
@@ -498,7 +521,9 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
         || !Array.isArray(raw.missionRequirements) || !raw.missionRequirements.every((item) => typeof item === "string" && item.trim() !== "")) return undefined;
       const proposedTargets = raw.targets === undefined ? undefined : targets(raw.targets);
       const contractVerification = verification(raw.verification);
-      if ((raw.targets !== undefined && proposedTargets === undefined) || contractVerification === undefined) return undefined;
+      const contractRunVerification = raw.runVerification === undefined ? undefined : runVerification(raw.runVerification);
+      if ((raw.targets !== undefined && proposedTargets === undefined) || contractVerification === undefined
+        || (raw.runVerification !== undefined && contractRunVerification === undefined)) return undefined;
       const contradiction = raw.architectureContradiction === undefined ? undefined : architectureContradiction(raw.architectureContradiction);
       if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
       const humanDependencies = raw.humanDependencies === undefined ? undefined : dependencies(raw.humanDependencies);
@@ -524,7 +549,9 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
         humanRequirements, missionRequirements,
         requirementCatalog: canonicalCatalog,
         ...(humanDependencies === undefined ? {} : { humanDependencies }),
-        ...(blockingHumanDependencies === undefined ? {} : { blockingHumanDependencies }), dependencies: str(raw.dependencies),
+        ...(blockingHumanDependencies === undefined ? {} : { blockingHumanDependencies }),
+        ...(contractRunVerification === undefined ? {} : { runVerification: contractRunVerification }),
+        dependencies: str(raw.dependencies),
         risks: strList(raw.risks), acceptanceCriteria: raw.acceptanceCriteria.map(String), architecturalQuestions: strList(raw.architecturalQuestions),
         verification: contractVerification, ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
       } satisfies ExecutionContractPacket;

@@ -40,9 +40,9 @@ Read the repository before proposing work. Produce an execution_proposal packet 
 
 Do not turn lifecycle stages, report fields, "stop after reporting," or conditional reporting such as "report incomplete/manual/owner-pending verification, if any" into implementation requirements, targets, dependencies, verification entries, or owner approval. A conditional "if any" asks you to report existing evidence only; it never creates a manual check. The Integrated Reviewer is a configured LLM gate, not owner/manual sign-off. Preserve report instructions in missionRequirements.
 
-Create targets only for actual repository implementation deliverables. Target dependencies describe implementation prerequisites only; never model the Factory's Reviewer, Architect, integration, synthesis, or report sequence as a target dependency. Provide exactly one deterministic machine-verification instruction per implementation target when possible. Record human acceptance that remains after technical implementation in that target's verification.ownerAcceptance text; it is informational and does not block engineering, review, integration, or Factory acceptance. Never encode ownerAcceptance as a target dependency or humanDependencies edge. Use verification.ownerPending only for legacy compatibility when no machine verification can be performed. Use blockingHumanDependencies only for a genuine external prerequisite that must be resolved before implementation can safely begin; report its target ID and reason explicitly. A final device/owner checklist after implementation is not such a prerequisite.
+Create targets only for actual repository implementation deliverables. Target dependencies describe implementation prerequisites only; never model the Factory's Reviewer, Architect, integration, synthesis, or report sequence as a target dependency. Provide exactly one deterministic machine-verification instruction per implementation target when possible in the verification map, keyed only by the exact declared target IDs. Put whole-run, integration, live-preview, deployment, regression-matrix, artifact-identity, and packaging checks in the separate runVerification array with name, command, and evidence fields; these checks run after target verification and before integrated review and are not targets. Never put run-level checks in the target verification map or invent pseudo-target IDs such as live-preview, deployment, integration, regression, or final-smoke unless they are genuine declared implementation targets. Record human acceptance that remains after technical implementation in that target's verification.ownerAcceptance text; it is informational and does not block engineering, review, integration, or Factory acceptance. Never encode ownerAcceptance as a target dependency or humanDependencies edge. Use verification.ownerPending only for legacy compatibility when no machine verification can be performed. Use blockingHumanDependencies only for a genuine external prerequisite that must be resolved before implementation can safely begin; report its target ID and reason explicitly. A final device/owner checklist after implementation is not such a prerequisite.
 
-Do not provide a requirementCatalog or invent requirement IDs: Factory assigns stable REQ-NNN identities deterministically from humanRequirements, constraints, and missionRequirements, classifies missionRequirements separately, and persists the canonical catalog. Never omit an implementation requirement or hard constraint. Give each implementation target a stable target ID. Commands must be safe, deterministic, and scoped to that target (never broad, destructive, or unrelated). You may not redefine, replace, or weaken the user's architecture. Do not add Factory orchestration targets.
+Do not provide a requirementCatalog or invent requirement IDs: Factory assigns stable REQ-NNN identities deterministically from humanRequirements, constraints, and missionRequirements, classifies missionRequirements separately, and persists the canonical catalog. Never omit an implementation requirement or hard constraint. Give each implementation target a stable target ID. Target-verification commands must be safe, deterministic, and scoped to their target. Run-level commands must be safe, deterministic, and scoped to the requested whole-run/integration surface; none may be broad, destructive, or unrelated. You may not redefine, replace, or weaken the user's architecture. Do not add Factory orchestration targets.
 
 Separate defects from architecture contradictions. A contradiction means repository evidence disproves an authoritative user architecture assumption and safe continuation is impossible; do not use it for an ordinary implementation defect. If there is a contradiction, report the structured architectureContradiction and stop short of redesigning.
 
@@ -208,6 +208,7 @@ export function integratedReviewPrompt(input: {
   reviewers?: ReviewerPacket[];
   latestGlobalDiff: string;
   verificationOutput: string[];
+  runVerificationOutput: string[];
   pendingOwnerVerification: string[];
 }): string {
   return `You are the integrated Reviewer for an AI Factory execution workflow. Review the actual current workspace and the real code diff across all targets. The user request and approved architecture are authoritative. Do not redesign the solution.
@@ -228,8 +229,10 @@ Target Reviewer packets:
 ${JSON.stringify(input.reviewers ?? [])}
 Latest global diff (inspect the workspace yourself; this is supporting evidence, not a substitute):
 ${input.latestGlobalDiff || "(none reported)"}
-Deterministic verification output (commands and observed stdout/stderr/results):
+Target verification output (commands and observed stdout/stderr/results):
 ${list(input.verificationOutput)}
+Integrated/run-level verification output (never target outcomes):
+${list(input.runVerificationOutput)}
 Owner-pending acceptance (not a Factory gate):
 ${list(input.pendingOwnerVerification)}
 
@@ -245,6 +248,7 @@ export function leadIntegrationPrompt(input: {
   engineers: EngineerPacket[];
   reviewers: ReviewerPacket[];
   targetSummary?: string[];
+  runVerificationOutput?: string[];
 }): string {
   return `You are the Technical Lead of an AI Factory run. The implementation work is complete. Integrate and verify the whole system, then produce a compact acceptance packet.
 
@@ -253,6 +257,9 @@ Approved architecture: ${input.architecture}
 
 Reviewed target outcomes:
 ${list(input.targetSummary)}
+
+Integrated/run-level verification output (not implementation targets):
+${list(input.runVerificationOutput)}
 
 Engineer work packages:
 ${input.engineers.map((e) => `- [${e.workPackageId}] ${e.summary}`).join("\n") || "(none)"}
@@ -291,6 +298,7 @@ export function conformanceArchitectPrompt(input: {
   targetOutcomes: string[];
   engineers: EngineerPacket[];
   verificationEvidence: string[];
+  runVerificationEvidence: string[];
   repairs: string[];
   limitations: string[];
   contract: ExecutionContractPacket;
@@ -311,8 +319,10 @@ Target outcomes:
 ${list(input.targetOutcomes)}
 Engineer packets (latest):
 ${JSON.stringify(input.engineers)}
-Deterministic verification evidence (commands and observed output):
+Target verification evidence (commands and observed output):
 ${list(input.verificationEvidence)}
+Integrated/run-level verification evidence:
+${list(input.runVerificationEvidence)}
 Repairs applied or required:
 ${list(input.repairs)}
 Known limitations:
@@ -417,6 +427,7 @@ export function finalReportPrompt(input: {
   roleTargets: string[];
   missionRequirements?: string[];
   warningEvidence: ReportWarningEvidence[];
+  runVerificationOutput?: string[];
   ownerPendingAcceptance?: string[];
 }): string {
   const iso = (ms?: number): string => (ms === undefined ? "(unknown)" : new Date(ms).toISOString());
@@ -476,6 +487,8 @@ Deterministic orchestration facts: repair rounds ${input.repairRounds}, remediat
 
 Execution mission/report metadata (reporting obligations only; do not treat these as implementation targets or dependencies):
 ${list(input.missionRequirements)}
+Integrated/run-level verification (distinct from target verification):
+${list(input.runVerificationOutput)}
 Owner-pending acceptance after technical completion (not a Factory gate; do not claim it has passed):
 ${list(input.ownerPendingAcceptance)}
 
@@ -497,6 +510,7 @@ export function leanFinalReportPrompt(input: {
   review: IntegratedReviewPacket;
   engineers: EngineerPacket[];
   verification: string[];
+  runVerificationOutput?: string[];
   warningEvidence: ReportWarningEvidence[];
 }): string {
   return `You are the Technical Lead writing the final report for a LEAN Factory run. The integrated Reviewer PASSED the latest integrated state, and Integration Lead completed. No Architect was invoked; do not invent an initial or final Architect verdict.
@@ -507,7 +521,8 @@ Original authoritative request: ${input.task}
 Execution contract: ${JSON.stringify(input.contract)}
 Mission/report requirements are metadata for this synthesis, not implementation targets. A conditional request to report incomplete/manual/owner-pending verification "if any" means report only actual recorded evidence; it does not create owner sign-off. The Integrated Reviewer verdict is an LLM workflow result, never owner/manual verification. The contract's ownerAcceptance checks remain pending after Factory technical acceptance and do not block the integrated PASS; never claim they passed.
 Implemented targets: ${JSON.stringify(input.engineers)}
-Deterministic and manual verification: ${list(input.verification)}
+Target verification: ${list(input.verification)}
+Integrated/run-level verification: ${list(input.runVerificationOutput)}
 Integrated Reviewer: ${JSON.stringify(input.review)}
 Integration Lead: ${JSON.stringify(input.integration)}
 Controller-owned warning evidence (IDs, source, scope and target ownership are authoritative): ${JSON.stringify(input.warningEvidence)}
