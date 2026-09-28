@@ -207,6 +207,8 @@ export interface LeadIntegrationPacket {
   reviewerFindingsResolved: string[];
   reviewerFindingsAcceptedRisk: string[];
   reviewerFindingsUnresolved: string[];
+  /** Findings explicitly classified as blocking progression to the final gate. */
+  blockingReviewerFindings?: string[];
   selectedFiles: string[];
   factualAssessment: string;
 }

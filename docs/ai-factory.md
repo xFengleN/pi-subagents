@@ -65,9 +65,13 @@ A manual check that remains after technical implementation is recorded separatel
 A verified implementation is not independently reviewed until integrated review
 PASS on the latest integrated state. In VERIFIED EXECUTION, non-blocking findings
 or test concerns from that PASS may remain unresolved in the Lead integration
-packet: they are presented to the final Architect rather than stopping before
-its audit. Unknown or blocking unresolved findings still stop. LEAN keeps its
-existing integration stop rule and never invokes a final Architect. VERIFIED
+packet: they remain visible to the final Architect rather than stopping before
+its audit. Pre-Architect blockers are explicit Integrated Reviewer
+`blockingFindings`, `requiredRepairs`, `architecturalIssue`, or the integration
+packet's `blockingReviewerFindings`; unresolved disposition prose alone does not
+establish a blocker. The Lead's blocking list is a subset of its unresolved
+findings. LEAN keeps its existing integration stop rule and never invokes a
+final Architect. VERIFIED
 EXECUTION's final Architect audits conformance with the owner's contract, not
 architectural taste. Model presets
 remain unchanged, including role models for stages a workflow does not invoke.

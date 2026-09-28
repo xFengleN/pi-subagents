@@ -102,6 +102,45 @@ describe("AI Factory — final report as a normal message", () => {
     expect(stopped.results.finalRecheck?.packet.verdict).toBe("NEEDS_REMEDIATION");
   });
 
+  it("does not report stale contradiction metadata when the persisted Reviewer packet explicitly says no issue", () => {
+    const contradiction = {
+      assumption: "No contradiction applies; the text is explanatory only.",
+      repositoryEvidence: "Continuation is not blocked.",
+      affectedTargetIds: [],
+      cannotContinueBecause: "Not applicable.",
+      ownerDecisionNeeded: "None.",
+    };
+    const historical: FactoryRunState = {
+      ...makeDoneState("factory_historical_false_contradiction"),
+      workflow: { mode: "verified_execution" },
+      state: "STOPPED",
+      stoppedReason: "Integration left unresolved Reviewer findings",
+      architectureContradiction: contradiction,
+      results: {
+        engineers: [],
+        reviewers: [],
+        integratedReview: {
+          packet: {
+            verdict: "PASS",
+            affectedTargetIds: [],
+            blockingFindings: [],
+            nonBlockingFindings: [],
+            requiredRepairs: [],
+            testConcerns: [],
+            architecturalIssue: false,
+            architectureContradiction: contradiction,
+          },
+          agentId: "reviewer",
+        },
+        integration: { packet: packets.integration, agentId: "lead" },
+      },
+    };
+
+    const report = formatFactoryReport(historical);
+    expect(report).toContain("Integrated Reviewer verdict: PASS");
+    expect(report).not.toContain("Architecture contradiction");
+  });
+
   it("durable delivery evidence prevents a duplicate after process-local state is lost", () => {
     const fixture = tempStore();
     try {

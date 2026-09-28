@@ -77,7 +77,7 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "integration.lead": {
     required: ["goal", "approvedArchitecture", "completedWorkPackages", "importantDecisions", "deviations", "systemVerification", "reviewerFindingsResolved", "reviewerFindingsAcceptedRisk", "reviewerFindingsUnresolved", "selectedFiles", "factualAssessment"],
-    optional: [],
+    optional: ["blockingReviewerFindings"],
     kinds: ["integration"],
   },
   "final.architect": {

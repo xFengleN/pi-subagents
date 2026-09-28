@@ -94,6 +94,12 @@ async function completeTwoTargets(m: ReturnType<typeof make>): Promise<void> {
   await complete(m, engineer("wp-2"));
 }
 
+async function reachIntegratedReview(m: ReturnType<typeof make>, packet: unknown = integratedPass): Promise<void> {
+  await start(m);
+  await completeTwoTargets(m);
+  await complete(m, packet);
+}
+
 describe("execution workflows", () => {
   it.each(["lean", "verified_execution"] as const)("accepts live-drill lifecycle metadata without targets or owner dependencies in %s", async (mode) => {
     const m = make(mode);
@@ -466,6 +472,127 @@ describe("execution workflows", () => {
     m.store.cleanup();
   });
 
+  it("routes a VERIFIED PASS with only informational concerns to the Final Architect", async () => {
+    const m = make("verified_execution");
+    const testConcerns = [
+      "Headless browser evidence is not real iPad Safari; physical-device acceptance remains owner-pending.",
+      "The Final Architect gate has not run yet and is the next expected gate.",
+    ];
+    const contradiction = {
+      assumption: "No authoritative assumption was disproved; no architecture contradiction applies.",
+      repositoryEvidence: "All checks passed; continuation is not blocked.",
+      affectedTargetIds: ["wp-1"],
+      cannotContinueBecause: "Not applicable; continuation is not blocked.",
+      ownerDecisionNeeded: "None.",
+    };
+    await start(m);
+    await complete(m, contract);
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    await complete(m, { ...integratedPass, testConcerns, architectureContradiction: contradiction });
+    expect(m.controller.getState().state).toBe("INTEGRATION");
+    expect(m.controller.getState().results.integratedReview?.packet.architectureContradiction).toBeUndefined();
+
+    await complete(m, {
+      ...packets.integration,
+      reviewerFindingsAcceptedRisk: ["Owner acceptance remains pending; not a blocking issue."],
+      reviewerFindingsUnresolved: [
+        "Physical iPad Safari acceptance remains owner-pending.",
+        "Final Architect has not run and is the next gate.",
+      ],
+    });
+    expect(m.controller.getState().state).toBe("FINAL_ARCHITECT");
+    expect(m.controller.getState().results.integratedReview?.packet.architectureContradiction).toBeUndefined();
+    expect(m.controller.getState().architectureContradiction).toBeUndefined();
+    expect(m.controller.getState().results.integration?.packet.reviewerFindingsUnresolved.length).toBeGreaterThan(0);
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m).at(-1)).toBe("conformance.architect");
+    const architectPrompt = m.transport.spawned.at(-1)?.prompt ?? "";
+    expect(architectPrompt).toContain(testConcerns[0]);
+    expect(architectPrompt).toContain(testConcerns[1]);
+    expect(architectPrompt).not.toContain("No authoritative assumption was disproved");
+    m.store.cleanup();
+  });
+
+  it.each([
+    ["blocking findings", { ...integratedPass, blockingFindings: ["unresolved regression defect"] }],
+    ["required repairs", { ...integratedPass, requiredRepairs: ["repair the broken target"] }],
+  ] as const)("stops VERIFIED EXECUTION on PASS with %s", async (_label, review) => {
+    const m = make("verified_execution");
+    await reachIntegratedReview(m, review);
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().results.integration).toBeUndefined();
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m)).not.toContain("conformance.architect");
+    m.store.cleanup();
+  });
+
+  it("stops VERIFIED EXECUTION on an explicit architectural issue despite PASS", async () => {
+    const m = make("verified_execution");
+    const contradiction = {
+      assumption: "The implementation must use the shared storage model.",
+      repositoryEvidence: "The repository prohibits that storage model for this feature.",
+      affectedTargetIds: ["wp-1"],
+      cannotContinueBecause: "The contract cannot safely be implemented as approved.",
+      ownerDecisionNeeded: "Choose a supported storage model.",
+    };
+    await reachIntegratedReview(m, { ...integratedPass, architecturalIssue: true, architectureContradiction: contradiction });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().architectureContradiction).toEqual(contradiction);
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m)).not.toContain("integration.lead");
+    m.store.cleanup();
+  });
+
+  it("stops VERIFIED EXECUTION on an explicit blocking integration disposition", async () => {
+    const m = make("verified_execution");
+    await reachIntegratedReview(m);
+    await complete(m, {
+      ...packets.integration,
+      reviewerFindingsUnresolved: ["unresolved contract violation"],
+      blockingReviewerFindings: ["unresolved contract violation"],
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("explicit blocking Reviewer condition");
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m)).not.toContain("conformance.architect");
+    m.store.cleanup();
+  });
+
+  it("stops on the Integrated Reviewer's explicit architecture-contradiction verdict", async () => {
+    const m = make("verified_execution");
+    const contradiction = {
+      assumption: "The approved architecture requires the unsupported backend.",
+      repositoryEvidence: "The backend does not exist in this repository.",
+      affectedTargetIds: ["wp-1"],
+      cannotContinueBecause: "The approved design cannot be implemented safely.",
+      ownerDecisionNeeded: "Choose a supported backend.",
+    };
+    await reachIntegratedReview(m, {
+      ...integratedPass,
+      verdict: "ARCHITECTURE_CONTRADICTION",
+      architectureContradiction: contradiction,
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m)).not.toContain("conformance.architect");
+    m.store.cleanup();
+  });
+
+  it("stops on a non-PASS Reviewer outcome with an unresolved blocking repair", async () => {
+    const m = make("verified_execution");
+    await reachIntegratedReview(m, {
+      ...integratedRepairT2,
+      affectedTargetIds: [],
+      blockingFindings: ["unresolved contract defect"],
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("repair scope is invalid");
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(phases(m)).not.toContain("conformance.architect");
+    m.store.cleanup();
+  });
+
   it("stops before integrated review when an explicit run-level check fails", async () => {
     const m = make("verified_execution", (id) => id === "Live preview" ? "failed" : "passed");
     await start(m);
@@ -704,8 +831,8 @@ describe("execution workflows", () => {
     m.store.cleanup();
   });
 
-  it.each(["lean", "verified_execution"] as const)("stops %s on a genuinely unresolved integration finding without adding an Architect gate", async (mode) => {
-    const m = make(mode);
+  it("keeps LEAN's existing stop rule for genuinely unresolved integration findings", async () => {
+    const m = make("lean");
     await start(m);
     await completeTwoTargets(m);
     await complete(m, integratedPass);

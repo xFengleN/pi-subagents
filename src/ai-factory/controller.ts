@@ -916,7 +916,13 @@ export class FactoryController {
           }
           return { kind: "spawn", phase: "integrated.review" };
         }
-        if (review.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer found an architecture contradiction" };
+        if (review.packet.verdict === "ARCHITECTURE_CONTRADICTION" || review.packet.architecturalIssue) {
+          return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer found an architecture contradiction" };
+        }
+        if (review.packet.verdict === "PASS"
+          && (review.packet.blockingFindings.length > 0 || review.packet.requiredRepairs.length > 0)) {
+          return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer PASS contains blocking findings or required repairs" };
+        }
         if (review.packet.verdict === "PASS") {
           const declared = review.packet.affectedTargetIds;
           if (declared.length > 0 && (declared.length !== s.targetPlan?.targets.length || s.targetPlan.targets.some((target) => !declared.includes(target.id)))) return { kind: "transition", to: "STOPPED", note: "Integrated PASS declared only a partial target scope" };
@@ -948,10 +954,22 @@ export class FactoryController {
       }
       case "INTEGRATION": {
         if (!s.results.integration) return { kind: "spawn", phase: "integration.lead" };
-        const unresolved = s.results.integration.packet.reviewerFindingsUnresolved;
+        const integration = s.results.integration.packet;
+        const unresolved = integration.reviewerFindingsUnresolved;
         const review = s.results.integratedReview?.packet;
-        const nonBlocking = new Set([...(review?.nonBlockingFindings ?? []), ...(review?.testConcerns ?? [])]);
-        if (unresolved.some((finding) => this.workflow !== "verified_execution" || !review || review.blockingFindings.includes(finding) || review.requiredRepairs.includes(finding) || !nonBlocking.has(finding))) {
+        if (this.workflow === "verified_execution") {
+          if (!review || review.verdict !== "PASS" || review.architecturalIssue
+            || review.blockingFindings.length > 0 || review.requiredRepairs.length > 0
+            || (integration.blockingReviewerFindings?.length ?? 0) > 0) {
+            return { kind: "transition", to: "STOPPED", note: "Integrated review or integration identified an explicit blocking Reviewer condition" };
+          }
+          // The unresolved bucket is preserved for the Final Architect, but it
+          // does not override the Integrated Reviewer's explicit PASS and
+          // finding classifications. Informational/test concerns may remain
+          // visible here without becoming pre-Architect blockers.
+          return { kind: "transition", to: "FINAL_ARCHITECT" };
+        }
+        if (unresolved.length > 0) {
           return { kind: "transition", to: "STOPPED", note: "Integration left unresolved Reviewer findings" };
         }
         return { kind: "transition", to: policy.finalArchitect ? "FINAL_ARCHITECT" : "FINAL_SYNTHESIS" };
@@ -1761,7 +1779,9 @@ export class FactoryController {
         const review = outcome as { packet: IntegratedReviewPacket; agentId: string; target?: string };
         s.results.integratedReview = review;
         s.results.integratedReviews = [...(s.results.integratedReviews ?? []), review];
-        if (review.packet.architectureContradiction) s.architectureContradiction = review.packet.architectureContradiction;
+        if (review.packet.architecturalIssue && review.packet.architectureContradiction) {
+          s.architectureContradiction = review.packet.architectureContradiction;
+        }
         break;
       }
       case "integration.lead": {

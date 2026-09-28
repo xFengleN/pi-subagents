@@ -5,6 +5,7 @@ import {
   executionContractPrompt,
   finalReportPrompt,
   integratedReviewPrompt,
+  leadIntegrationPrompt,
 } from "../../src/ai-factory/prompts.js";
 import type { ExecutionContractPacket, IntegratedReviewPacket } from "../../src/ai-factory/types.js";
 import { packets } from "./fakes.js";
@@ -221,6 +222,37 @@ describe("execution workflow packets and prompts", () => {
     const parsed = parsePacketTyped("integrated_review", JSON.stringify(packet), undefined);
     expect(parsed?.verdict).toBe("ARCHITECTURE_CONTRADICTION");
     expect(parsed?.architectureContradiction?.ownerDecisionNeeded).toBe("Choose a supported module");
+    expect(parsed?.architecturalIssue).toBe(true);
+  });
+
+  it("omits contradiction-shaped explanatory text when the Reviewer says no architecture issue exists", () => {
+    const parsed = parsePacketTyped("integrated_review", JSON.stringify({
+      ...review,
+      verdict: "PASS",
+      architectureContradiction: {
+        assumption: "No architecture assumption was disproved; no contradiction applies.",
+        repositoryEvidence: "Continuation is not blocked.",
+        affectedTargetIds: ["target-a"],
+        cannotContinueBecause: "Not applicable; continuation is not blocked.",
+        ownerDecisionNeeded: "None.",
+      },
+    }), undefined) as IntegratedReviewPacket | undefined;
+    expect(parsed?.architecturalIssue).toBe(false);
+    expect(parsed?.architectureContradiction).toBeUndefined();
+  });
+
+  it("parses explicit blocking Reviewer classification on integration packets", () => {
+    const parsed = parsePacketTyped("integration", JSON.stringify({
+      goal: "goal",
+      approvedArchitecture: "architecture",
+      systemVerification: "passed",
+      factualAssessment: "complete",
+      reviewerFindingsResolved: [],
+      reviewerFindingsAcceptedRisk: [],
+      reviewerFindingsUnresolved: ["blocker"],
+      blockingReviewerFindings: ["blocker"],
+    }), undefined) as { blockingReviewerFindings?: string[] } | undefined;
+    expect(parsed?.blockingReviewerFindings).toEqual(["blocker"]);
   });
 
   it("makes authority, scoped commands, diff evidence, and defect distinction explicit", () => {
@@ -260,6 +292,12 @@ describe("execution workflow packets and prompts", () => {
     expect(integrated).toContain("Live preview: passed");
     expect(integrated).toContain("REPAIR_REQUIRED");
     expect(integrated).toContain("ARCHITECTURE_CONTRADICTION");
+    expect(integrated).toContain("Omit architectureContradiction when architecturalIssue is false");
+    const integrationPrompt = leadIntegrationPrompt({
+      task: "TASK", architecture: "ARCH", targetSummary: [], runVerificationOutput: [], engineers: [], reviewers: [],
+    });
+    expect(integrationPrompt).toContain("blockingReviewerFindings");
+    expect(integrationPrompt).toContain("pre-Architect blockers by themselves");
     const conformance = conformanceArchitectPrompt({
       task: "TASK",
       architecture: "ARCH",

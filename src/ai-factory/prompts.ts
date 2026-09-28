@@ -236,7 +236,7 @@ ${list(input.runVerificationOutput)}
 Owner-pending acceptance (not a Factory gate):
 ${list(input.pendingOwnerVerification)}
 
-Examine the final integrated state every time, including the current workspace and global diff after all target work. Do not rely on earlier target PASS packets or status-only summaries. Produce an integrated_review packet. Verdict must be PASS when the implementation conforms, REPAIR_REQUIRED for a coding, test, integration, or evidence defect, and ARCHITECTURE_CONTRADICTION only when repository evidence disproves an authoritative architecture assumption and continuation is impossible. For every finding cite real diff/workspace evidence, affectedTargetIds, and a concrete repair or verification. Do not turn a defect into a contradiction and do not redesign architecture. If contradiction applies, fill every architectureContradiction field, including the owner decision needed.
+Examine the final integrated state every time, including the current workspace and global diff after all target work. Do not rely on earlier target PASS packets or status-only summaries. Produce an integrated_review packet. Verdict must be PASS when the implementation conforms, REPAIR_REQUIRED for a coding, test, integration, or evidence defect, and ARCHITECTURE_CONTRADICTION only when repository evidence disproves an authoritative architecture assumption and continuation is impossible. For every finding cite real diff/workspace evidence, affectedTargetIds, and a concrete repair or verification. Do not turn a defect into a contradiction and do not redesign architecture. If contradiction applies, fill every architectureContradiction field, including the owner decision needed. Omit architectureContradiction when architecturalIssue is false; explanatory text that says no contradiction applies must not be encoded as an active contradiction object.
 
 ${STRUCTURED}`;
 }
@@ -266,7 +266,12 @@ ${input.engineers.map((e) => `- [${e.workPackageId}] ${e.summary}`).join("\n") |
 
 Reviewer findings — EVERY finding listed below must appear in exactly one of
 reviewerFindingsResolved, reviewerFindingsAcceptedRisk or reviewerFindingsUnresolved.
-Do not write "None" while a finding is listed, and do not summarize a finding away:
+Do not write "None" while a finding is listed, and do not summarize a finding away.
+Always provide blockingReviewerFindings (an empty array when none). It is only
+for an unresolved finding that must stop the run before its scheduled Final
+Architect gate; it must be a subset of reviewerFindingsUnresolved. Test concerns,
+informational notes, owner-pending acceptance, and later-gate status are not
+pre-Architect blockers by themselves:
 ${reviewerFindingsBlock(input.reviewers)}
 
 Verify the integrated system after all target-specific Engineer/Reviewer checks have passed. Run the requested mission-level tests/checks (including explicit sample or behavior probes from the original request) here; do not delegate this lifecycle phase to an extra implementation target. Then report the acceptance packet: goal, approved architecture, completed implementation work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment. This integration packet precedes any final Architect gate: do not claim an Architect verdict or final acceptance. Only a persisted Architect packet can establish that verdict. An unresolved non-blocking finding or test concern remains visible for that gate; do not portray it as an implementation blocker unless it actually is one.

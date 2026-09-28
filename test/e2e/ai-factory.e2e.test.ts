@@ -62,6 +62,7 @@ const PACKETS = {
     reviewerFindingsResolved: [],
     reviewerFindingsAcceptedRisk: [],
     reviewerFindingsUnresolved: [],
+    blockingReviewerFindings: [],
     selectedFiles: ["src/widgets.ts"],
     factualAssessment: "complete",
   },

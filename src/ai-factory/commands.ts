@@ -673,11 +673,13 @@ function formatWorkflowReport(state: FactoryRunState): string {
   const lines = ["Factory final report", `Run: ${state.runId}`, `Terminal state: ${state.state}`];
   const finalArchitect = authoritativeArchitectOutcome(state);
   const integratedReview = state.results.integratedReview?.packet;
+  const integratedArchitectureIssue = integratedReview?.architecturalIssue === true
+    || integratedReview?.verdict === "ARCHITECTURE_CONTRADICTION";
   const targetPlan = state.targetPlan;
-  const contradiction = state.architectureContradiction
-    ?? state.results.executionProposal?.packet.architectureContradiction
-    ?? integratedReview?.architectureContradiction
-    ?? finalArchitect?.packet.architectureContradiction;
+  const contradiction = state.results.executionProposal?.packet.architectureContradiction
+    ?? (integratedArchitectureIssue ? integratedReview?.architectureContradiction : undefined)
+    ?? finalArchitect?.packet.architectureContradiction
+    ?? (!integratedReview || integratedArchitectureIssue ? state.architectureContradiction : undefined);
 
   lines.push("", "Workflow gates");
   lines.push(`- Initial Architect: ${policy.initialArchitect ? (state.results.initialArchitect?.packet.verdict ?? "not recorded") : "Not part of this workflow."}`);
@@ -790,6 +792,7 @@ function formatWorkflowReport(state: FactoryRunState): string {
     section(lines, historicalIntegration ? "Pre-remediation integration evidence (historical)" : "Integration evidence", [
       `System verification${historicalIntegration ? " at the earlier checkpoint" : ""}: ${integration.systemVerification}`,
       `Factual assessment${historicalIntegration ? " at the earlier checkpoint" : ""}: ${integration.factualAssessment}`,
+      ...(integration.blockingReviewerFindings ?? []).map((finding) => `Blocking Reviewer finding: ${finding}`),
       ...integration.reviewerFindingsUnresolved.map((finding) => `${historicalIntegration ? "Then-unresolved" : "Unresolved"} reviewer finding: ${finding}`),
     ]);
   }

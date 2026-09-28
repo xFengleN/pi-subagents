@@ -255,7 +255,7 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
   integration: {
     type: "object",
     additionalProperties: false,
-    required: ["goal", "approvedArchitecture", "systemVerification", "factualAssessment"],
+    required: ["goal", "approvedArchitecture", "systemVerification", "factualAssessment", "blockingReviewerFindings"],
     properties: {
       goal: { type: "string" },
       approvedArchitecture: { type: "string" },
@@ -266,6 +266,7 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
       reviewerFindingsResolved: strArr,
       reviewerFindingsAcceptedRisk: strArr,
       reviewerFindingsUnresolved: strArr,
+      blockingReviewerFindings: strArr,
       selectedFiles: strArr,
       factualAssessment: { type: "string" },
     },
@@ -563,11 +564,12 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       const contradiction = raw.architectureContradiction === undefined ? undefined : architectureContradiction(raw.architectureContradiction);
       if (raw.architectureContradiction !== undefined && contradiction === undefined) return undefined;
       if (verdict === "ARCHITECTURE_CONTRADICTION" && contradiction === undefined) return undefined;
+      const architecturalIssue = bool(raw.architecturalIssue) || verdict === "ARCHITECTURE_CONTRADICTION";
       return {
         verdict, affectedTargetIds: raw.affectedTargetIds as string[], blockingFindings: strList(raw.blockingFindings),
         nonBlockingFindings: strList(raw.nonBlockingFindings), requiredRepairs: strList(raw.requiredRepairs),
-        testConcerns: strList(raw.testConcerns), architecturalIssue: bool(raw.architecturalIssue),
-        ...(contradiction === undefined ? {} : { architectureContradiction: contradiction }),
+        testConcerns: strList(raw.testConcerns), architecturalIssue,
+        ...(architecturalIssue && contradiction !== undefined ? { architectureContradiction: contradiction } : {}),
       } satisfies IntegratedReviewPacket;
     }
     case "architect_initial": {
@@ -611,6 +613,7 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
         importantDecisions: strList(raw.importantDecisions), deviations: strList(raw.deviations),
         systemVerification: raw.systemVerification, reviewerFindingsResolved: strList(raw.reviewerFindingsResolved),
         reviewerFindingsAcceptedRisk: strList(raw.reviewerFindingsAcceptedRisk), reviewerFindingsUnresolved: strList(raw.reviewerFindingsUnresolved),
+        blockingReviewerFindings: strList(raw.blockingReviewerFindings),
         selectedFiles: strList(raw.selectedFiles), factualAssessment: raw.factualAssessment,
       };
       return p;
