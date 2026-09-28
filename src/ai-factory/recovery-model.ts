@@ -912,6 +912,21 @@ export function latestAttemptForPhase(state: FactoryRunState, phase: string): Fa
   return latestAttempt(state, phase);
 }
 
+/** Count only child invocations that actually settled successfully without a valid packet.
+ * A persisted retry marker on a failed spawn is not an unusable child response.
+ */
+export function invalidPacketAttemptCount(state: FactoryRunState, phase: string): number {
+  const targetId = targetForPhase(state, phase);
+  return (state.attempts ?? []).filter((attempt) => {
+    if (attempt.phase !== phase || attempt.round !== state.repairRound
+      || (targetId !== undefined && attempt.targetId !== targetId)
+      || attempt.agentId === undefined || attempt.provenance !== "settled_without_valid_packet"
+      || attempt.packetValidated !== false) return false;
+    const call = state.metrics.calls?.find((item) => item.agentId === attempt.agentId);
+    return call?.ok === true || (call === undefined && attempt.role !== "engineer");
+  }).length;
+}
+
 /** Whether a settled Engineer packet is present alongside its provenance. */
 export function hasPersistedAttemptPacket(state: FactoryRunState, attempt: FactoryAttempt): boolean {
   if (attempt.phase === "execution.engineer") {
@@ -996,41 +1011,40 @@ export function planFactoryRecovery(state: FactoryRunState): RecoveryPlan {
   const attempt = latestAttempt(state, phase);
   const provenance = attempt?.provenance ?? "not_started";
   const recoveryRisk = attempt?.recoveryRisk ?? "none";
+  if (state.state === "WAITING_CAPACITY") {
+    return { decision: "automatic", reason: "Parked waiting for capacity; automatic recovery at the preserved retry deadline", phase, checkpoint, provenance, recoveryRisk, legacy };
+  }
   if (provenance === "settled_without_valid_packet") {
-    if (state.state === "INTEGRATED_REVIEW"
-      && phase === "integrated.review"
-      && attempt?.role === "reviewer"
-      && state.inFlight === undefined
-      && state.waiting === undefined
-      && state.results.integratedReview === undefined) {
-      const retryCall = attempt.agentId === undefined ? undefined : state.metrics.calls?.find((call) => call.agentId === attempt.agentId);
-      const retryExhausted = attempt.noPacketRetry === true
-        && attempt.agentId !== undefined
-        && attempt.packetValidated === false
-        && (retryCall === undefined || retryCall.ok);
-      return {
-        decision: "automatic",
-        ...(retryExhausted ? { terminal: true } : {}),
-        reason: retryExhausted
-          ? "The bounded Integrated Reviewer retry settled without a valid packet; automatically recording terminal failure"
-          : "The Integrated Reviewer settled without a valid packet; retrying this read-only review is safe",
-        phase,
-        checkpoint,
-        provenance,
-        recoveryRisk,
-        legacy,
-      };
+    const reviewer = state.state === "INTEGRATED_REVIEW" && phase === "integrated.review"
+      && attempt?.role === "reviewer" && state.results.integratedReview === undefined;
+    const engineer = (state.state === "EXECUTION" || state.state === "REMEDIATION")
+      && engineerPhase(phase) && attempt?.role === "engineer";
+    if ((reviewer || engineer) && state.inFlight === undefined && state.waiting === undefined) {
+      const invalidSettlements = invalidPacketAttemptCount(state, phase);
+      if (invalidSettlements > 0 && attempt?.agentId !== undefined
+        && (reviewer || state.metrics.calls?.find((call) => call.agentId === attempt.agentId)?.ok === true)) {
+        const retryExhausted = invalidSettlements >= 2;
+        return {
+          decision: "automatic",
+          ...(retryExhausted ? { terminal: true } : {}),
+          reason: reviewer
+            ? retryExhausted
+              ? "The bounded Integrated Reviewer retry settled without a valid packet; automatically recording terminal failure"
+              : "The Integrated Reviewer settled without a valid packet; retrying this read-only review is safe"
+            : retryExhausted
+              ? "The bounded Engineer recovery retry settled without a valid packet; recording a target/run failure"
+              : "The Engineer settled without a valid packet; retrying with workspace inspection and preservation instructions",
+          phase, checkpoint, provenance, recoveryRisk, legacy,
+        };
+      }
+      if (attempt?.agentId === undefined && (reviewer || attempt?.recoveryRisk === "none")) {
+        return { decision: "automatic", reason: "The retry spawn was rejected before a child started; the settled-invalid budget remains available", phase, checkpoint, provenance, recoveryRisk, legacy };
+      }
     }
-    return { decision: "blocked", reason: "The latest attempt settled without a valid packet; replay is not safe", phase, checkpoint, provenance, recoveryRisk, legacy };
+    return { decision: "approval_required", reason: "The attempt settled without a valid packet and its workspace outcome is uncertain; inspect the workspace before approving recovery", phase, checkpoint, provenance, recoveryRisk, legacy };
   }
   if (provenance === "settled_validated_packet" && attempt && engineerPhase(phase) && !hasPersistedAttemptPacket(state, attempt)) {
     return { decision: "approval_required", reason: "Validated Engineer provenance has no matching persisted packet; explicit approval is required before replay", phase, checkpoint, provenance, recoveryRisk: "workspace_may_have_changed", legacy };
-  }
-  // WAITING_CAPACITY is reached only through definitive pre-spawn rejections
-  // (quota or "no eligible target") that preserved the retry deadline, so
-  // automatic capacity recovery is safe.
-  if (state.state === "WAITING_CAPACITY") {
-    return { decision: "automatic", reason: "Parked waiting for capacity; automatic recovery at the preserved retry deadline", phase, checkpoint, provenance, recoveryRisk, legacy };
   }
   if (provenance === "settled_validated_packet") return { decision: "automatic", reason: "A validated packet is durably settled at this checkpoint", phase, checkpoint, provenance, recoveryRisk, legacy };
   if (state.version === 3 && state.targetPlan && state.state === "EXECUTION" && !state.targetPlan.currentTargetId && !state.inFlight && !state.parked)

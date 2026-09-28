@@ -32,7 +32,7 @@ import {
   reviewerPrompt,
   roleDescription,
 } from "./prompts.js";
-import { createFactoryCheckpoint, hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
+import { createFactoryCheckpoint, hasPersistedAttemptPacket, invalidPacketAttemptCount, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
 import { sanitizeIntegrationAssessment } from "./report-truth.js";
 import { applyReportWarningDecisions, collectReportWarningEvidence } from "./report-warnings.js";
 import { assertTransition, assessRecoveryEligibility, isTerminal } from "./state.js";
@@ -90,6 +90,8 @@ interface PendingSpawn {
   targetIndex: number;
   retriesOnTarget: number;
   noPacketRetries: number;
+  /** A workspace-aware retry/re-dispatch whose spawn has not yet produced a packet. */
+  workspaceRecovery?: boolean;
   nextRetryAt?: number;
   attemptedTargets: string[];
   reasons: string[];
@@ -573,9 +575,8 @@ export class FactoryController {
     const packet = parsePacketTyped(kind, info.structuredJson, info.result);
     if (!packet) {
       this.commit();
-      // Completed but no usable packet: one same-target retry to absorb a
-      // single model glitch, then surface as a hard failure. Engineer phases
-      // never take that retry — the child started and may have changed files.
+      // A known settled invalid packet gets one bounded same-target retry.
+      // Engineer retries inspect and preserve the possibly modified workspace.
       this.handlePhaseFailure(phase, role, "agent completed but produced no usable packet", "hard", { noPacketRetry: true, childStarted: true });
       return;
     }
@@ -691,12 +692,11 @@ export class FactoryController {
   private nextAction(): Action | undefined {
     const s = this.state;
     if (this.disposed || this.ownershipLost) return undefined;
-    // A failed Engineer attempt with possible workspace impact never auto-
-    // replays: the run stays in the phase awaiting explicit approval. An
-    // explicitly approved resume bypasses this once (resumeApproved is
-    // consumed by the next performSpawn).
-    if (engineerSpawnBlocked(s) && !this.resumeApproved) return undefined;
     if (isTerminal(s.state) || s.inFlight) return undefined;
+    // A settled invalid Engineer packet has a bounded recovery path; an
+    // uncertain/lost Engineer still requires explicit workspace approval.
+    if (engineerSpawnBlocked(s) && !this.resumeApproved) return undefined;
+    if (s.state === "REMEDIATION" && invalidPacketAttemptCount(s, "remediation.engineer") >= 2) return this.engineerPacketFailure("remediation.engineer");
     if (s.parked) return this.parkedAction();
     if (this.workflow !== "full") return this.nextExecutionWorkflowAction();
 
@@ -727,6 +727,7 @@ export class FactoryController {
             s.results.escalationArchitect = undefined;
           }
         }
+        if (invalidPacketAttemptCount(s, "execution.engineer") >= 2) return this.engineerPacketFailure("execution.engineer");
         if (s.repairExhausted) {
           if (s.leadEscalations < this.config.maxLeadEscalations) return { kind: "spawn", phase: "escalation.lead" };
           return this.failTargetOrStop("repair loop exhausted after the Lead escalation budget");
@@ -882,6 +883,7 @@ export class FactoryController {
           // not reset the global repair budget while consuming a repair queue.
           if (!queuedId) s.repairRound = 0;
         }
+        if (invalidPacketAttemptCount(s, "execution.engineer") >= 2) return this.engineerPacketFailure("execution.engineer");
         const engineer = lastExecutionEngineer(s);
         const outcome = plan.outcomes[plan.currentTargetId];
         if (!engineer || engineer.round !== s.repairRound || engineer.outcome.agentId !== outcome.engineerAgentId) return { kind: "spawn", phase: "execution.engineer" };
@@ -1039,6 +1041,14 @@ export class FactoryController {
       default:
         return undefined;
     }
+  }
+
+  private engineerPacketFailure(phase: string): Action | undefined {
+    const id = this.state.targetPlan?.currentTargetId ?? this.state.results.finalArchitect?.packet.affectedTargetIds?.[0] ?? "the current target";
+    const reason = `Engineer did not produce a valid packet for ${id} after the single workspace-aware recovery retry; completion and verification were not recorded.`;
+    if (phase === "execution.engineer" && this.workflow === "full") return this.failTargetOrStop(reason);
+    this.failRun(`[${phase}] ${reason}`);
+    return undefined;
   }
 
   /** Mark a single exhausted target without discarding independent work. */
@@ -1392,8 +1402,12 @@ export class FactoryController {
     // implementation.
     const resumeApproved = this.resumeApproved;
     this.resumeApproved = false;
-    const resumeNote = resumeApproved
-      ? `An earlier attempt at this work package was interrupted. Inspect the existing files, keep the original goal (${s.task}) and the approved architecture, and finish ONLY the missing work — do not blindly repeat or revert the previous implementation. The saved completion evidence and reviewer findings above are preserved.`
+    const previousAttempt = latestAttemptForPhase(s, phase);
+    const workspaceRecovery = (phase === "execution.engineer" || phase === "remediation.engineer")
+      && (invalidPacketAttemptCount(s, phase) > 0
+        || (previousAttempt?.noPacketRetry === true && previousAttempt.agentId === undefined && previousAttempt.recoveryRisk === "none"));
+    const resumeNote = resumeApproved || workspaceRecovery
+      ? `An earlier attempt at this work package ${workspaceRecovery ? "settled without a valid completion packet" : "was interrupted"}; the workspace may have changed. Inspect the existing files and diff within this work package first, determine what is already implemented, and run relevant checks before editing. Preserve existing and unrelated work; do not clean, reset, revert, or blindly repeat potentially destructive edits. Keep the original goal (${s.task}) and approved architecture; finish ONLY missing work and return a validated completion packet. Earlier completed targets and evidence remain historical.`
       : undefined;
     const spec = this.phaseSpec(phase, resumeNote);
     // B1: never replay a phase whose latest attempt has unresolved spawn
@@ -1413,7 +1427,8 @@ export class FactoryController {
         phase,
         targetIndex: 0,
         retriesOnTarget: 0,
-        noPacketRetries: noPacketRetryCount(s, phase),
+        noPacketRetries: invalidPacketAttemptCount(s, phase),
+        workspaceRecovery: resumeApproved || workspaceRecovery,
         attemptedTargets: [],
         reasons: [],
       };
@@ -1463,7 +1478,7 @@ export class FactoryController {
       recoveryRisk: spec.role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome",
       preparedAt: this.clock.now(),
       packetKind: spec.kind,
-      ...(pending.noPacketRetries > 0 && !s.attempts?.some((item) => item.phase === phase && item.noPacketRetry === true)
+      ...((pending.noPacketRetries > 0 || pending.workspaceRecovery) && (spec.role === "engineer" || !s.attempts?.some((item) => item.phase === phase && item.noPacketRetry === true))
         ? { noPacketRetry: true as const }
         : {}),
       configRevision: configRevision(this.config),
@@ -1555,7 +1570,7 @@ export class FactoryController {
       return;
     }
     pending.retriesOnTarget = 0;
-    pending.noPacketRetries = 0;
+    pending.noPacketRetries = invalidPacketAttemptCount(this.state, pending.phase);
     rm.fallbacks++;
     this.state.metrics.totalFallbacks++;
     this.commit();
@@ -1614,17 +1629,23 @@ export class FactoryController {
       if (retryAfter !== undefined) pending.retryAfterMs = retryAfter;
     }
 
-    // Engineer phases never auto-replay after a failure that may have touched
-    // the workspace: a child that started (settled, aborted, or stopped), an
-    // invalid or missing packet, or an uncertain spawn outcome (a transient
-    // RPC failure that may have dispatched a child). The run stays in the
-    // phase with the failed attempt recorded and requires explicit approval;
-    // it is never converted into a generic auto-recoverable parked or
-    // WAITING_CAPACITY state. Definite pre-spawn quota rejections (recoveryRisk
-    // "none") still take the normal fallback/capacity path below.
-    if (role === "engineer" && (opts.childStarted || klass === "transient")) {
-      s.parked = false;
+    // A failed/uncertain Engineer child still requires explicit approval;
+    // a known successful settlement with an invalid packet uses the shared
+    // bounded no-packet retry below, with workspace-aware prompt context.
+    if (role === "engineer" && !opts.noPacketRetry && (opts.childStarted || klass === "transient")) {
+      // Persist an explicit approval-pending recovery marker. The settled
+      // workspace outcome is uncertain; a wake or restart cannot replay it.
+      s.parked = true;
       this.pending = undefined;
+      this.commit();
+      return;
+    }
+
+    // A rejected recovery spawn did not return an unusable child packet. Keep
+    // the pending recovery in the existing capacity wait rather than treating
+    // an unavailable model as a consumed packet retry or a target failure.
+    if (role === "engineer" && !opts.childStarted && pending && (pending.noPacketRetries > 0 || pending.workspaceRecovery) && klass === "hard") {
+      this.enterWaitingCapacity(role, phase, `Engineer recovery spawn rejected: ${message}`);
       return;
     }
 
@@ -1635,6 +1656,11 @@ export class FactoryController {
     }
     if (opts.noPacketRetry && phase === "integrated.review" && role === "reviewer") {
       this.failRun(integratedReviewerPacketFailure());
+      return;
+    }
+    if (opts.noPacketRetry && role === "engineer") {
+      const action = this.engineerPacketFailure(phase);
+      if (action?.kind === "transition") this.applyTransition(action.to, action.note);
       return;
     }
     if (klass === "transient" && pending && pending.retriesOnTarget < roleConfig.maxTransientRetries) {
@@ -2057,6 +2083,17 @@ export class FactoryController {
       return;
     }
 
+    // Older settled/uncertain Engineer checkpoints may predate the durable
+    // approval-pending marker. Reconcile them without dispatching or touching
+    // the workspace; approval remains bound to the new checkpoint revision.
+    if (!this.resumeApproved && engineerSpawnBlocked(s) && assessRecoveryEligibility(s).requiresApproval) {
+      if (!s.parked) {
+        s.parked = true;
+        this.commit();
+      }
+      return;
+    }
+
     // A run parked on an in-memory transient backoff (parked, but not
     // WAITING_CAPACITY) lost its retry bookkeeping with the process. Clear the
     // park so the state's own next action re-attempts the phase from a fresh
@@ -2077,31 +2114,10 @@ function lastExecutionEngineer(s: FactoryRunState) {
 }
 
 /**
- * Whether the current Engineer phase must never auto-replay (Task 3): its
- * latest attempt settled without a valid packet AND either a child started
- * (agentId recorded) or the outcome was uncertain (workspace risk). Only an
- * explicit approval may authorize a replay; the run stays in the phase.
+ * Block replay for uncertain Engineer outcomes and validated provenance with
+ * missing packets. A known successful invalid-packet settlement instead uses
+ * the bounded, workspace-aware recovery path.
  */
-function attemptMatchesPhaseScope(s: FactoryRunState, attempt: FactoryAttempt, phase: string): boolean {
-  if (attempt.phase !== phase || attempt.round !== s.repairRound) return false;
-  return phase !== "review.reviewer" || attempt.targetId === s.targetPlan?.currentTargetId;
-}
-
-function invalidPacketAttemptCount(s: FactoryRunState, phase: string): number {
-  const attempts = s.attempts ?? [];
-  return attempts.filter((attempt) => {
-    if (!attemptMatchesPhaseScope(s, attempt, phase) || attempt.agentId === undefined
-      || attempt.provenance !== "settled_without_valid_packet" || attempt.packetValidated !== false) return false;
-    const call = s.metrics.calls?.find((item) => item.agentId === attempt.agentId);
-    return call === undefined || call.ok;
-  }).length;
-}
-
-function noPacketRetryCount(s: FactoryRunState, phase: string): number {
-  const retryInvocations = (s.attempts ?? []).filter((attempt) => attemptMatchesPhaseScope(s, attempt, phase) && attempt.noPacketRetry === true).length;
-  return Math.max(retryInvocations, invalidPacketAttemptCount(s, phase));
-}
-
 function integratedReviewerRetryExhausted(s: FactoryRunState): boolean {
   return invalidPacketAttemptCount(s, "integrated.review") >= 2;
 }
@@ -2121,7 +2137,10 @@ function engineerSpawnBlocked(s: FactoryRunState): boolean {
   if (attempt === undefined) return false;
   if (attempt.provenance === "settled_validated_packet") return !hasPersistedAttemptPacket(s, attempt);
   if (attempt.provenance !== "settled_without_valid_packet") return false;
-  return attempt.agentId !== undefined || attempt.recoveryRisk === "workspace_may_have_changed";
+  if (attempt.agentId !== undefined && attempt.packetValidated === false
+    && s.metrics.calls?.find((call) => call.agentId === attempt.agentId)?.ok === true
+    && invalidPacketAttemptCount(s, phase) > 0) return false;
+  return attempt.agentId !== undefined || attempt.recoveryRisk !== "none";
 }
 
 function lastReviewer(s: FactoryRunState) {

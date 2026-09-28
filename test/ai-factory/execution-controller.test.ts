@@ -65,13 +65,13 @@ const integratedRepairT2 = { verdict: "REPAIR_REQUIRED", affectedTargetIds: ["wp
 const conformanceAccept = { verdict: "ACCEPT", blockingIssues: [], requiredChanges: [], doNotChange: [], requiredEvidence: [] };
 const conformanceRejectT2 = { verdict: "NEEDS_REMEDIATION", affectedTargetIds: ["wp-2"], integrationOnly: false, blockingIssues: ["wp-2 needs repair"], requiredChanges: ["repair wp-2"], doNotChange: [], requiredEvidence: [] };
 
-function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" | ((id: string) => "passed" | "failed" | "owner_pending" | "unavailable") = "passed") {
+function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" | ((id: string) => "passed" | "failed" | "owner_pending" | "unavailable") = "passed", config = defaultFactoryConfig()) {
   const transport = new FakeTransport();
   const clock = new FakeClock();
   const store = tempStore();
   const verified: string[] = [];
   const controller = FactoryController.create({
-    transport, clock, store: store.store, config: defaultFactoryConfig(),
+    transport, clock, store: store.store, config,
     verifyTarget: async (_cwd, id) => { verified.push(id); return { status: typeof verificationStatus === "function" ? verificationStatus(id) : verificationStatus, evidence: `verified ${id}`, command: "true" }; },
   }, `execution-${mode}`, "Implement the widget", store.dir, mode);
   return { transport, controller, store, verified, clock };
@@ -840,6 +840,270 @@ describe("execution workflows", () => {
     expect(m.controller.getState().state).toBe("STOPPED");
     expect(phases(m)).not.toContain("conformance.architect");
     expect(phases(m)).not.toContain("final_synthesis.lead");
+    m.store.cleanup();
+  });
+
+  it("retries a settled invalid P20-A Engineer packet once with workspace context and resumes automatically", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    const independentTargets = ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] }));
+    await start(m);
+    await complete(m, {
+      ...contract,
+      targets: independentTargets,
+      workPackages: ids,
+      verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])),
+    });
+    await complete(m, engineer("P19D3-A"));
+    expect(m.controller.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
+    await complete(m, { workPackageId: "P20-A" });
+    expect(m.transport.spawned.filter((item) => item.phase === "execution.engineer")).toHaveLength(2);
+    m.clock.advance(1_000);
+    await flush();
+
+    const retrySpawn = m.transport.spawned.filter((item) => item.phase === "execution.engineer").at(-1);
+    expect(m.transport.spawned.filter((item) => item.phase === "execution.engineer")).toHaveLength(3);
+    expect(m.controller.getState().targetPlan?.currentTargetId).toBe("P20-A");
+    expect(m.controller.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
+    expect(m.controller.getState().attempts?.at(-1)).toMatchObject({
+      phase: "execution.engineer", targetId: "P20-A", noPacketRetry: true, provenance: "spawned",
+    });
+    expect(retrySpawn?.prompt).toMatch(/inspect|inspection/i);
+    expect(retrySpawn?.prompt).toMatch(/workspace|files/i);
+
+    await complete(m, engineer("P20-A"));
+    expect(m.controller.getState().targetPlan?.outcomes["P20-A"].status).toBe("passed");
+    expect(m.controller.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
+    m.controller.dispose();
+    m.store.cleanup();
+  });
+
+  it("automatically restores a settled-invalid P20-A retry without replaying prior targets", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    await start(m);
+    await complete(m, { ...contract, targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })), workPackages: ids, verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])) });
+    await complete(m, engineer("P19D3-A"));
+    await complete(m, { workPackageId: "P20-A" });
+    expect(m.controller.getState().targetPlan?.currentTargetId).toBe("P20-A");
+    m.controller.dispose();
+
+    const interrupted = m.store.store.load(m.controller.getRunId());
+    expect(interrupted).toBeDefined();
+    if (!interrupted) throw new Error("Expected persisted settled-invalid Engineer run");
+    interrupted.parked = false;
+    interrupted.stateRevision = (interrupted.stateRevision ?? 0) + 1;
+    interrupted.checkpoint = createFactoryCheckpoint(interrupted, interrupted.stateRevision);
+    expect(interrupted.checkpoint).toHaveProperty("targetId", "P20-A");
+    expect(interrupted).not.toHaveProperty("targetId");
+    m.store.store.save(interrupted);
+
+    const transport = new FakeTransport();
+    const restored = FactoryController.restore({ transport, clock: new FakeClock(), store: m.store.store, config: defaultFactoryConfig() }, interrupted.runId, { resume: false });
+    expect(restored).toBeDefined();
+    if (!restored) throw new Error("Expected settled-invalid Engineer run to restore");
+    expect(restored.getRecoveryEligibility()).toMatchObject({ eligible: true, requiresApproval: false });
+    expect(restored.resume()).toMatchObject({ kind: "ok", state: "EXECUTION" });
+    await flush();
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["execution.engineer"]);
+    expect(transport.spawned[0].prompt).toContain("P20-A");
+    expect(restored.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
+    expect(restored.getState().targetPlan?.currentTargetId).toBe("P20-A");
+    restored.dispose();
+    m.store.cleanup();
+  });
+
+  it("recovers historical P20-A without reopening failed P19D3-A", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    await start(m);
+    await complete(m, { ...contract, targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })), workPackages: ids, verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])) });
+    await complete(m, engineer("P19D3-A"));
+    await complete(m, { workPackageId: "P20-A" });
+    m.controller.dispose();
+    const saved = m.store.store.load(m.controller.getRunId())!;
+    saved.targetPlan!.outcomes["P19D3-A"] = { status: "failed", reason: "repair loop exhausted after the Lead escalation budget" };
+    saved.parked = false;
+    saved.stateRevision = (saved.stateRevision ?? 0) + 1;
+    saved.checkpoint = createFactoryCheckpoint(saved, saved.stateRevision);
+    m.store.store.save(saved);
+
+    const transport = new FakeTransport();
+    const restored = FactoryController.restore({ transport, clock: new FakeClock(), store: m.store.store, config: defaultFactoryConfig(), verifyTarget: async () => ({ status: "passed", evidence: "P20-A verified", command: "true" }) }, saved.runId, { resume: false })!;
+    expect(planFactoryRecovery(restored.getState())).toMatchObject({ decision: "automatic", phase: "execution.engineer", checkpoint: { targetId: "P20-A" } });
+    expect(restored.resume().kind).toBe("ok");
+    await flush();
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["execution.engineer"]);
+    expect(transport.spawned[0].prompt).toContain("P20-A");
+    expect(restored.getState().targetPlan?.outcomes["P19D3-A"]).toMatchObject({ status: "failed", reason: "repair loop exhausted after the Lead escalation budget" });
+    transport.completeLastPacket(engineer("P20-A"));
+    await flush();
+    await flush();
+    expect(restored.getState().targetPlan?.outcomes["P20-A"].status).toBe("passed");
+    expect(restored.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("failed");
+    expect(transport.spawned.some((item) => item.prompt.includes("Work package: P19D3-A"))).toBe(false);
+    restored.dispose();
+    m.store.cleanup();
+  });
+
+  it("requires workspace approval for the exact failed-settlement P20-A shape, then dispatches recovery only for P20-A", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    await start(m);
+    await complete(m, { ...contract, targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })), workPackages: ids, verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])) });
+    await complete(m, engineer("P19D3-A"));
+    const agentId = m.transport.failLast("agent failed after changing the workspace");
+    await flush();
+    expect(m.controller.getState().parked).toBe(true); // new runs record pending approval
+    m.controller.dispose();
+    const saved = m.store.store.load(m.controller.getRunId())!;
+    saved.parked = false; // historical P20-A orphan had no persisted pending marker
+    saved.targetPlan!.outcomes["P19D3-A"] = { status: "failed", reason: "repair loop exhausted after the Lead escalation budget" };
+    saved.stateRevision = (saved.stateRevision ?? 0) + 1;
+    saved.checkpoint = createFactoryCheckpoint(saved, saved.stateRevision);
+    m.store.store.save(saved);
+    expect(saved.attempts?.at(-1)).toMatchObject({ agentId, targetId: "P20-A", provenance: "settled_without_valid_packet", packetValidated: false, recoveryRisk: "workspace_may_have_changed" });
+    expect(saved.metrics.calls?.at(-1)).toMatchObject({ agentId, ok: false });
+
+    const transport = new FakeTransport();
+    const restored = FactoryController.restore({ transport, clock: new FakeClock(), store: m.store.store, config: defaultFactoryConfig(), verifyTarget: async () => ({ status: "passed", evidence: "P20-A verified", command: "true" }) }, saved.runId)!;
+    await flush();
+    expect(planFactoryRecovery(saved)).toMatchObject({ decision: "approval_required", checkpoint: { targetId: "P20-A" } });
+    expect(restored.getState().parked).toBe(true); // historical orphan reconciled as pending approval
+    expect(m.store.store.load(saved.runId)?.parked).toBe(true);
+    expect(restored.getRecoveryEligibility()).toMatchObject({ eligible: true, requiresApproval: true });
+    expect(restored.resume().kind).toBe("approvalRequired");
+    expect(transport.spawned).toHaveLength(0);
+    const checkpoint = restored.getRecoveryEligibility().checkpointId;
+    expect(restored.resumeWithApproval(checkpoint).kind).toBe("ok");
+    await flush();
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["execution.engineer"]);
+    expect(transport.spawned[0].prompt).toContain("Inspect the existing files and diff");
+    expect(transport.spawned[0].prompt).toContain("Work package: P20-A");
+    expect(restored.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("failed");
+    transport.completeLastPacket(engineer("P20-A"));
+    await flush();
+    await flush();
+    expect(restored.getState().targetPlan?.outcomes["P20-A"].status).toBe("passed");
+    expect(restored.getState().targetPlan?.outcomes["P19D3-A"].reason).toBe("repair loop exhausted after the Lead escalation budget");
+    restored.dispose();
+    m.store.cleanup();
+  });
+
+  it("keeps an approved workspace recovery pending when its Engineer spawn is rejected", async () => {
+    const m = make("lean");
+    await start(m);
+    await complete(m, contract);
+    m.transport.failLast("agent failed after workspace edits");
+    await flush();
+    const original = m.transport.spawnHandler;
+    m.transport.spawnHandler = () => ({ ok: false, error: "simulated recovery spawn rejection" });
+    expect(m.controller.resumeWithApproval(m.controller.getRecoveryEligibility().checkpointId).kind).toBe("ok");
+    await flush();
+    expect(m.controller.getState().state).toBe("WAITING_CAPACITY");
+    expect(m.controller.getState().attempts?.at(-1)).toMatchObject({ noPacketRetry: true, recoveryRisk: "none" });
+    expect(m.controller.getState().metrics.calls?.filter((call) => call.role === "engineer" && call.ok)).toHaveLength(0);
+    m.transport.spawnHandler = original;
+    m.clock.advance(m.controller.getState().waiting!.nextRetryAt + 1);
+    await flush();
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Inspect the existing files and diff");
+    await complete(m, engineer("wp-1"));
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].status).toBe("passed");
+    m.controller.dispose();
+    m.store.cleanup();
+  });
+
+  it("does not consume the settled-invalid retry budget when its spawn is rejected", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    await start(m);
+    await complete(m, { ...contract, targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })), workPackages: ids, verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])) });
+    await complete(m, engineer("P19D3-A"));
+    await complete(m, { workPackageId: "P20-A" });
+    const original = m.transport.spawnHandler;
+    m.transport.spawnHandler = () => ({ ok: false, error: "simulated retry spawn rejection" });
+    m.clock.advance(1_000);
+    await flush();
+    expect(m.controller.getState().state).toBe("WAITING_CAPACITY");
+    expect(m.controller.getState().waiting?.reasons).toContain("Engineer recovery spawn rejected: simulated retry spawn rejection");
+    expect(m.controller.getState().attempts?.at(-1)).toMatchObject({ noPacketRetry: true, recoveryRisk: "none" });
+    expect(m.controller.getState().attempts?.filter((attempt) => attempt.targetId === "P20-A" && attempt.agentId && attempt.packetValidated === false)).toHaveLength(1);
+    expect(m.transport.spawned.filter((item) => item.phase === "execution.engineer")).toHaveLength(3);
+    m.transport.spawnHandler = original;
+    m.clock.advance(m.controller.getState().waiting!.nextRetryAt + 1);
+    await flush();
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    expect(m.transport.spawned.filter((item) => item.phase === "execution.engineer")).toHaveLength(4);
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Inspect the existing files and diff");
+    m.controller.dispose();
+    m.store.cleanup();
+  });
+
+  it("uses a configured fallback after a definitive rejected Engineer recovery retry without another packet budget", async () => {
+    const config = defaultFactoryConfig();
+    config.roles.engineer.targets.fallbacks = ["provider/fallback-engineer"];
+    const m = make("lean", "passed", config);
+    await start(m);
+    await complete(m, contract);
+    await complete(m, { workPackageId: "wp-1" });
+    const original = m.transport.spawnHandler;
+    m.transport.spawnHandler = (request) => request.model === config.roles.engineer.targets.primary
+      ? { ok: false, error: "quota exhausted" }
+      : original(request);
+    m.clock.advance(1_000);
+    await flush();
+    expect(m.transport.spawned.at(-1)?.model).toBe("provider/fallback-engineer");
+    expect(m.controller.getState().attempts?.at(-1)).toMatchObject({ noPacketRetry: true, provenance: "spawned", targetId: "wp-1" });
+    expect(m.controller.getState().metrics.totalFallbacks).toBe(1);
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Inspect the existing files and diff");
+    await complete(m, engineer("wp-1"));
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].status).toBe("passed");
+    m.controller.dispose();
+    m.store.cleanup();
+  });
+
+  it("requires approval after an ambiguous Engineer recovery spawn and preserves its packet budget", async () => {
+    const m = make("lean");
+    await start(m);
+    await complete(m, contract);
+    await complete(m, { workPackageId: "wp-1" });
+    const original = m.transport.spawnHandler;
+    m.transport.spawnHandler = () => ({ ok: false, error: "network timeout" });
+    m.clock.advance(1_000);
+    await flush();
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    expect(m.controller.getState().attempts?.at(-1)).toMatchObject({ noPacketRetry: true, recoveryRisk: "workspace_may_have_changed" });
+    expect(m.controller.getRecoveryEligibility()).toMatchObject({ eligible: true, requiresApproval: true });
+    expect(planFactoryRecovery(m.controller.getState()).decision).toBe("approval_required");
+    expect(m.controller.resume().kind).toBe("approvalRequired");
+    const checkpoint = m.controller.getRecoveryEligibility().checkpointId;
+    m.transport.spawnHandler = original;
+    expect(m.controller.resumeWithApproval(checkpoint).kind).toBe("ok");
+    await flush();
+    expect(m.transport.spawned.at(-1)?.prompt).toContain("Inspect the existing files and diff");
+    await complete(m, engineer("wp-1"));
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].status).toBe("passed");
+    m.controller.dispose();
+    m.store.cleanup();
+  });
+
+  it("fails precisely when the bounded same-target Engineer packet retry is invalid", async () => {
+    const m = make("verified_execution");
+    const ids = ["P19D3-A", "P20-A"];
+    await start(m);
+    await complete(m, { ...contract, targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })), workPackages: ids, verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])) });
+    await complete(m, engineer("P19D3-A"));
+    await complete(m, { workPackageId: "P20-A" });
+    expect(m.controller.getState().targetPlan?.currentTargetId).toBe("P20-A");
+    m.clock.advance(1_000);
+    await flush();
+    await complete(m, { workPackageId: "P20-A" });
+    expect(m.controller.getState().state).toBe("FAILED");
+    expect(m.controller.getState().errors.at(-1)?.message).toContain("Engineer");
+    expect(m.controller.getState().errors.at(-1)?.message).toContain("P20-A");
+    expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(3);
+    expect(m.controller.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
+    expect(m.controller.getState().targetPlan?.outcomes["P20-A"].status).not.toBe("passed");
     m.store.cleanup();
   });
 

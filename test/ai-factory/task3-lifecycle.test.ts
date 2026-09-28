@@ -201,7 +201,7 @@ describe("Task 3 — persist-before-spawn and attempt journaling", () => {
     m.controller.dispose();
   });
 
-  it("6. a failed/invalid-packet Engineer blocks on restart — never auto-replays", async () => {
+  it("6. a known settled invalid Engineer packet resumes one workspace-aware retry", async () => {
     const dir = makeDir();
     const store = new FactoryStore(dir);
     const m = make(store, "run-6", dir);
@@ -212,10 +212,11 @@ describe("Task 3 — persist-before-spawn and attempt journaling", () => {
     m.transport.completeLastPacket({ summary: "not a real engineer packet" });
     await flush();
     expect(m.controller.getState().state).toBe("EXECUTION");
-    // No same-target retry for an Engineer that already started.
+    // The bounded retry is parked on backoff, not blindly replayed.
     expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(1);
+    expect(m.controller.getState().parked).toBe(true);
 
-    // Restart: the engineer is NOT replayed; the run requires approval.
+    // Restart: a known settled invalid packet can retry with workspace context.
     const m2Transport = new FakeTransport();
     const restored = FactoryController.restore(
       { transport: m2Transport, clock: new FakeClock(), store: new FactoryStore(dir), config: defaultFactoryConfig() },
@@ -223,10 +224,12 @@ describe("Task 3 — persist-before-spawn and attempt journaling", () => {
     );
     expect(restored).toBeDefined();
     await flush();
-    expect(m2Transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(0);
+    expect(m2Transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(1);
+    expect(m2Transport.spawned.at(-1)?.prompt).toContain("Inspect the existing files and diff");
     expect(restored!.getState().state).toBe("EXECUTION");
-    expect(restored!.getRecoveryEligibility().requiresApproval).toBe(true);
+    expect(restored!.getRecoveryEligibility().requiresApproval).toBe(true); // live child, not another replay
     m.controller.dispose();
+    restored!.dispose();
   });
 
   it("7. a definitive pre-spawn quota rejection preserves automatic capacity recovery with the deadline", async () => {
@@ -272,7 +275,7 @@ describe("Task 3 — persist-before-spawn and attempt journaling", () => {
     m.transport.fireFailed({ agentId: engineerId, ok: false, status: "error", error: "network timeout" });
     await flush();
     expect(m.controller.getState().state).toBe("EXECUTION");
-    expect(m.controller.getState().parked).toBe(false);
+    expect(m.controller.getState().parked).toBe(true); // persisted approval-pending recovery
     // Not retried, not fallen back, not capacity-waited: exactly one spawn.
     expect(m.transport.spawned.filter((s) => s.role === "engineer")).toHaveLength(1);
     // The failed attempt carries workspace risk and the agent identity.

@@ -7,7 +7,7 @@
  * mandatory checkpoint.
  */
 
-import { hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedSpawnAttempt } from "./recovery-model.js";
+import { hasPersistedAttemptPacket, invalidPacketAttemptCount, latestAttemptForPhase, unresolvedSpawnAttempt } from "./recovery-model.js";
 import { type FactoryRecoveryEligibility, type FactoryRunState, type FactoryState, TERMINAL_STATES } from "./types.js";
 import type { FactoryWorkflowMode } from "./workflow-policy.js";
 
@@ -259,6 +259,25 @@ export function assessRecoveryEligibility(state: FactoryRunState): FactoryRecove
       reason: `Validated Engineer provenance for ${currentPhase} has no matching persisted packet`,
       requiresApproval: true,
       notes: ["The run will not replay this Engineer automatically.", "Explicit approval is required before retrying the uncertain workspace operation."],
+      checkpointId: computeCheckpointId(state),
+    };
+  }
+
+  if ((currentPhase === "execution.engineer" || currentPhase === "remediation.engineer")
+    && currentAttempt?.provenance === "settled_without_valid_packet") {
+    const call = currentAttempt.agentId === undefined ? undefined : state.metrics.calls?.find((item) => item.agentId === currentAttempt.agentId);
+    const invalidSettlements = invalidPacketAttemptCount(state, currentPhase);
+    const automatic = currentAttempt.agentId !== undefined && currentAttempt.packetValidated === false
+      && call?.ok === true && invalidSettlements > 0;
+    return {
+      eligible: true,
+      reason: automatic
+        ? invalidSettlements >= 2 ? "Engineer packet recovery budget exhausted; terminalizing the target/run" : "Engineer packet missing; bounded workspace-aware retry pending"
+        : "Engineer outcome is uncertain; inspect the workspace before approving another attempt",
+      requiresApproval: !automatic && (currentAttempt.agentId !== undefined || currentAttempt.recoveryRisk !== "none"),
+      notes: automatic
+        ? ["Inspect existing changes before editing; preserve prior work and completed targets.", "Only a settled unusable retry consumes the packet-retry budget."]
+        : ["Do not replay uncertain Engineer workspace operations without inspection and approval."],
       checkpointId: computeCheckpointId(state),
     };
   }
