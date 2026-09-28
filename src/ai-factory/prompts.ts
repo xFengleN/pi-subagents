@@ -219,7 +219,7 @@ ${input.architecture}
 Execution contract (canonical requirement IDs were assigned by Factory; missionRequirements are lifecycle/report metadata, not target obligations):
 ${JSON.stringify(input.contract)}
 Owner acceptance text is informational and not a gate. Do not require its completion for an integrated PASS; state clearly that it remains pending until the owner performs it.
-Independently compare the original task against every implementation requirement and hard constraint in humanRequirements/constraints. Do not demand a code target for missionRequirements; the Factory lifecycle/synthesis fulfills those instructions. Your Integrated Reviewer verdict is this LLM workflow gate, not owner/manual sign-off. If any explicit requirement or constraint was omitted, merged so it loses an independently testable obligation, or weakened, do not PASS; report the missing coverage as a concrete finding.
+Independently compare the original task against every implementation requirement and hard constraint in humanRequirements/constraints. Do not demand a code target for missionRequirements; the Factory lifecycle/synthesis fulfills those instructions. Your Integrated Reviewer verdict is this LLM workflow gate, not owner/manual sign-off or final Architect acceptance. Never claim a final Architect verdict; that gate has not run. If any explicit requirement or constraint was omitted, merged so it loses an independently testable obligation, or weakened, do not PASS; report the missing coverage as a concrete finding.
 
 Engineer packets:
 ${JSON.stringify(input.engineers)}
@@ -269,7 +269,7 @@ reviewerFindingsResolved, reviewerFindingsAcceptedRisk or reviewerFindingsUnreso
 Do not write "None" while a finding is listed, and do not summarize a finding away:
 ${reviewerFindingsBlock(input.reviewers)}
 
-Verify the integrated system after all target-specific Engineer/Reviewer checks have passed. Run the requested mission-level tests/checks (including explicit sample or behavior probes from the original request) here; do not delegate this lifecycle phase to an extra implementation target. Then report the acceptance packet: goal, approved architecture, completed implementation work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment.
+Verify the integrated system after all target-specific Engineer/Reviewer checks have passed. Run the requested mission-level tests/checks (including explicit sample or behavior probes from the original request) here; do not delegate this lifecycle phase to an extra implementation target. Then report the acceptance packet: goal, approved architecture, completed implementation work packages, important implementation decisions, deviations from plan, system-level verification, reviewer findings (resolved / accepted risk / unresolved — one explicit disposition per finding listed above), relevant selected files/diffs, and your factual assessment. This integration packet precedes any final Architect gate: do not claim an Architect verdict or final acceptance. Only a persisted Architect packet can establish that verdict. An unresolved non-blocking finding or test concern remains visible for that gate; do not portray it as an implementation blocker unless it actually is one.
 
 ${STRUCTURED}`;
 }

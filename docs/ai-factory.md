@@ -63,8 +63,13 @@ Execution contracts keep the legacy flat `verification` map target-only: it must
 
 A manual check that remains after technical implementation is recorded separately as `verification.ownerAcceptance`; it is reported as pending but does not block engineering, integrated review, integration, or Factory acceptance. For legacy packets, `ownerPending` with no command remains non-passing; when a command is present, deterministic machine verification takes precedence and runs. Genuine external prerequisites that must be resolved before implementation belong in `blockingHumanDependencies` and stop the run before Engineers start. `humanDependencies` records user-mandated target ordering only; do not encode post-implementation owner acceptance there. Verification commands run in the workspace with a two-minute limit; they are not sandboxed, proven read-only, or held for pre-execution approval. Run only in a workspace where model-proposed shell commands are trusted. A contract STOPPED before engineering reports proposal status, stop reason, planned targets/checks, and blocking prerequisites separately from completed evidence.
 A verified implementation is not independently reviewed until integrated review
-PASS on the latest integrated state. VERIFIED EXECUTION's final Architect audits
-conformance with the owner's contract, not architectural taste. Model presets
+PASS on the latest integrated state. In VERIFIED EXECUTION, non-blocking findings
+or test concerns from that PASS may remain unresolved in the Lead integration
+packet: they are presented to the final Architect rather than stopping before
+its audit. Unknown or blocking unresolved findings still stop. LEAN keeps its
+existing integration stop rule and never invokes a final Architect. VERIFIED
+EXECUTION's final Architect audits conformance with the owner's contract, not
+architectural taste. Model presets
 remain unchanged, including role models for stages a workflow does not invoke.
 The target-level requiresArchitectAcceptance metadata is honored only by FULL;
 execution proposals normalize it away because VERIFIED EXECUTION and LEAN do
@@ -394,8 +399,12 @@ and Engineer evidence IDs, the active target and revalidation queue. On restart:
 `results.finalReport` is the final Lead synthesis for the actual accepted
 state; `results.integration`, `results.finalArchitect` and
 `results.finalRecheck` are never overwritten by it, so the full acceptance
-history survives. Older run files that predate these fields stay readable: the
-commands degrade gracefully (and `/factory-report` labels a legacy fallback).
+history survives. Integration assessments cannot confer final acceptance: the
+final Architect verdict in a report comes only from a persisted final Architect
+packet (or recheck). Until that gate runs, it reads `not recorded`/pending;
+legacy free-form integration claims of acceptance are not rendered as verdicts.
+Older run files that predate these fields stay readable: the commands degrade
+gracefully (and `/factory-report` labels a legacy fallback).
 
 **`.pi/` ownership.** `<cwd>/.pi/factory.json` is project configuration — it is
 hand-edited (or written by `/factory-config`) and may be committed. Everything

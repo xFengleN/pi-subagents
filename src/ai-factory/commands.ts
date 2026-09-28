@@ -22,6 +22,7 @@ import type { FactoryController } from "./controller.js";
 import { formatDuration, formatRunMetrics } from "./metrics.js";
 import { parseVisibilityArg, type VisibilityMode } from "./panel.js";
 import type { RecoveryPlan } from "./recovery-model.js";
+import { alignReportedArchitectClaims } from "./report-truth.js";
 import { collectReportWarningEvidence } from "./report-warnings.js";
 import { assessRecoveryEligibility, isTerminal } from "./state.js";
 import { FACTORY_DIR } from "./store.js";
@@ -837,7 +838,10 @@ function formatWorkflowReport(state: FactoryRunState): string {
 
 /** The workflow-aware report preserves the historical FULL format byte-for-byte. */
 export function formatFactoryReport(state: FactoryRunState): string {
-  return workflowMode(state) === "full" ? formatFactoryReportFull(state) : formatWorkflowReport(state);
+  const mode = workflowMode(state);
+  const report = mode === "full" ? formatFactoryReportFull(state) : formatWorkflowReport(state);
+  const verdict = authoritativeArchitectOutcome(state)?.packet.verdict;
+  return alignReportedArchitectClaims(report, verdict, workflowPolicy(mode).finalArchitect);
 }
 
 /** Automatic post-run rendering uses the same report for every terminal state. */

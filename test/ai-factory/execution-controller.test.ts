@@ -470,13 +470,85 @@ describe("execution workflows", () => {
     m.store.cleanup();
   });
 
-  it("does not accept an integration packet with unresolved Reviewer findings", async () => {
-    const m = make("lean");
+  it("sends benign unresolved non-blocking findings through VERIFIED final Architect acceptance", async () => {
+    const m = make("verified_execution");
+    const finding = "Consider extracting the widget helper for readability.";
+    const review = {
+      ...integratedPass,
+      nonBlockingFindings: [finding],
+      testConcerns: ["The helper name could be clearer."],
+    };
+    const integration = {
+      ...packets.integration,
+      reviewerFindingsUnresolved: [finding, "The helper name could be clearer."],
+      factualAssessment: "Final Acceptance Architect verdict: ACCEPT",
+    };
+    const ids = ["R1", "R2", "R3"];
+    await start(m);
+    await complete(m, {
+      ...contract,
+      targets: ids.map((id) => ({ id, description: id, dependsOn: [], acceptanceCriteria: ["works"] })),
+      workPackages: ids,
+      verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} verified` }])),
+      runVerification: [{ name: "Live preview", command: "true", evidence: "served artifact identity" }],
+    });
+    for (const id of ids) await complete(m, engineer(id));
+    expect(m.controller.getState().results.runVerification?.[0]?.status).toBe("passed");
+    await complete(m, review);
+    expect(m.controller.getState().results.integratedReview?.packet.verdict).toBe("PASS");
+    await complete(m, integration);
+    expect(m.controller.getState().state).toBe("FINAL_ARCHITECT");
+    expect(phases(m).at(-1)).toBe("conformance.architect");
+    expect(m.controller.getState().results.finalArchitect).toBeUndefined();
+    expect(m.store.store.load(m.controller.getRunId())?.results.integration?.packet.factualAssessment).not.toContain("Final Acceptance Architect verdict: ACCEPT");
+    const preGateReport = formatFactoryReport(m.controller.getState());
+    expect(preGateReport).toContain("Final Architect: not recorded");
+    expect(preGateReport).not.toContain("Final Acceptance Architect verdict: ACCEPT");
+    const historical = m.controller.getSnapshot();
+    historical.results.integration!.packet.factualAssessment = "VERDICT: ACCEPT (technically). Final Acceptance Architect verdict: ACCEPT";
+    expect(formatFactoryReport(historical)).not.toContain("Final Acceptance Architect verdict: ACCEPT");
+    expect(formatFactoryReport(historical)).not.toContain("VERDICT: ACCEPT");
+    await complete(m, conformanceAccept);
+    expect(m.controller.getState().results.finalArchitect?.packet.verdict).toBe("ACCEPT");
+    await complete(m, packets.finalReport);
+    expect(m.controller.getState().state).toBe("DONE");
+    expect(formatFactoryReport(m.controller.getState())).toContain("Final Architect: ACCEPT");
+    m.store.cleanup();
+  });
+
+  it("reports a final Architect rejection accurately after benign unresolved findings", async () => {
+    const m = make("verified_execution");
+    const finding = "Consider extracting the widget helper for readability.";
+    await start(m);
+    await completeTwoTargets(m);
+    await complete(m, { ...integratedPass, nonBlockingFindings: [finding] });
+    await complete(m, { ...packets.integration, reviewerFindingsUnresolved: [finding], factualAssessment: "Final Acceptance Architect verdict: ACCEPT" });
+    await complete(m, {
+      ...conformanceRejectT2,
+      verdict: "ARCHITECTURE_CONTRADICTION",
+      architectureContradiction: {
+        assumption: "The widget can remain in one module",
+        repositoryEvidence: "The repository requires isolated widget modules",
+        affectedTargetIds: ["wp-2"],
+        cannotContinueBecause: "The accepted design violates a repository invariant",
+        ownerDecisionNeeded: "Choose a compatible module boundary",
+      },
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("architecture contradiction");
+    expect(formatFactoryReport(m.controller.getState())).toContain("Final Architect: ARCHITECTURE_CONTRADICTION");
+    expect(formatFactoryReport(m.controller.getState())).not.toContain("Final Acceptance Architect verdict: ACCEPT");
+    m.store.cleanup();
+  });
+
+  it.each(["lean", "verified_execution"] as const)("stops %s on a genuinely unresolved integration finding without adding an Architect gate", async (mode) => {
+    const m = make(mode);
     await start(m);
     await completeTwoTargets(m);
     await complete(m, integratedPass);
     await complete(m, { ...packets.integration, reviewerFindingsUnresolved: ["unresolved contract violation"] });
     expect(m.controller.getState().state).toBe("STOPPED");
+    expect(phases(m)).not.toContain("conformance.architect");
     expect(phases(m)).not.toContain("final_synthesis.lead");
     m.store.cleanup();
   });

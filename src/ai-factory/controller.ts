@@ -33,6 +33,7 @@ import {
   roleDescription,
 } from "./prompts.js";
 import { createFactoryCheckpoint, hasPersistedAttemptPacket, latestAttemptForPhase, unresolvedAttemptForPhase } from "./recovery-model.js";
+import { sanitizeIntegrationAssessment } from "./report-truth.js";
 import { applyReportWarningDecisions, collectReportWarningEvidence } from "./report-warnings.js";
 import { assertTransition, assessRecoveryEligibility, isTerminal } from "./state.js";
 import type { FactoryStore } from "./store.js";
@@ -939,10 +940,16 @@ export class FactoryController {
         }
         return { kind: "transition", to: "INTEGRATION" };
       }
-      case "INTEGRATION":
+      case "INTEGRATION": {
         if (!s.results.integration) return { kind: "spawn", phase: "integration.lead" };
-        if (s.results.integration.packet.reviewerFindingsUnresolved.length > 0) return { kind: "transition", to: "STOPPED", note: "Integration left unresolved Reviewer findings" };
+        const unresolved = s.results.integration.packet.reviewerFindingsUnresolved;
+        const review = s.results.integratedReview?.packet;
+        const nonBlocking = new Set([...(review?.nonBlockingFindings ?? []), ...(review?.testConcerns ?? [])]);
+        if (unresolved.some((finding) => this.workflow !== "verified_execution" || !review || review.blockingFindings.includes(finding) || review.requiredRepairs.includes(finding) || !nonBlocking.has(finding))) {
+          return { kind: "transition", to: "STOPPED", note: "Integration left unresolved Reviewer findings" };
+        }
         return { kind: "transition", to: policy.finalArchitect ? "FINAL_ARCHITECT" : "FINAL_SYNTHESIS" };
+      }
       case "FINAL_ARCHITECT_RECHECK":
         if (!s.results.finalRecheck) return { kind: "spawn", phase: "conformance.recheck" };
         if (s.results.finalRecheck.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Conformance recheck found an architecture contradiction" };
@@ -1745,7 +1752,7 @@ export class FactoryController {
           reviewerOutcomesForIntegration(s),
         );
         s.results.integration = {
-          packet: integration,
+          packet: { ...integration, factualAssessment: sanitizeIntegrationAssessment(integration.factualAssessment, workflowPolicy(this.workflow).finalArchitect) },
           agentId: info.agentId,
           ...(info.modelName !== undefined ? { target: info.modelName } : {}),
         };
