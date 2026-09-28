@@ -280,7 +280,7 @@ model plays no part in starting, inspecting, stopping or configuring a run:
 | `/factory-report [runId]` | Prints the human-readable final report again for the latest terminal run, or for an explicit run id. Reads persisted state only — no model call — and is not suppressed by the automatic-delivery marker. Reports include the same persisted Run statistics as automatic terminal delivery. Legacy runs without a final Lead synthesis use the latest authoritative Architect outcome first, then the integration fallback where valid, all clearly labelled. |
 | `/factory-metrics [runId]` | Appends operational metrics for the latest run, or an explicit run id, as a normal message at the current bottom of the conversation: per-role calls and tokens, cost, context sizes, slowest call, and orchestration counters. Reads persisted state only. |
 | `/factory-stop` | Stops the latest active run using the controller lifecycle. Restores without resuming, so stopping an orphaned run cannot spawn an agent first. |
-| `/factory-resume <runId> [--preset <name>]` | Inspects an interrupted run read-only (state, phase, completed vs incomplete work, recovery checkpoint, next-action classification) and resumes it after confirmation where necessary. Preserves all completed packets and never replays a finished phase. Safe automatic continuation (clean checkpoints, WAITING_CAPACITY) proceeds directly; an interrupted Engineer whose workspace outcome is uncertain requires explicit approval (acknowledging the workspace is used as-is) before exactly one new attempt. `--preset <name>` swaps ONLY future children's model targets/fallbacks/retry/turn limits to a saved preset — workflow budgets, isolation, and the original config history are preserved. DONE/STOPPED/FAILED runs are not resumed. |
+| `/factory-resume <runId> [--preset <name>]` | Inspects an interrupted run read-only (state, phase, completed vs incomplete work, recovery checkpoint, next-action classification) and resumes it after confirmation where necessary. Preserves all completed packets and never replays a finished phase. Safe automatic recovery (clean checkpoints, WAITING_CAPACITY, or a settled Integrated Reviewer without a valid packet) proceeds directly; an interrupted Engineer whose workspace outcome is uncertain requires explicit approval (acknowledging the workspace is used as-is) before exactly one new attempt. `--preset <name>` swaps ONLY future children's model targets/fallbacks/retry/turn limits to a saved preset — workflow budgets, isolation, and the original config history are preserved. DONE/STOPPED/FAILED runs are not resumed. |
 | `/factory-config` | Interactive menu: per-role primary/fallback models (chosen from Pi's available-model registry), transient retries/delay/max-turns, limits, and preset management. |
 
 The config menus render on Pi's `SettingsList`, so navigation **wraps** (down on
@@ -378,6 +378,13 @@ difficulty.
 - `quota` / capacity exhaustion: advance to the next fallback immediately.
 - `hard` (model not found, auth, unknown agent type): do not hop — surface
   through `FAILED` with a structured error.
+- A Reviewer settlement without a valid packet gets one same-target retry,
+  separate from transient retries and model fallback. For Integrated Review,
+  that retry budget survives restart: the read-only review can be resumed
+  automatically without replaying completed targets or verification. If the
+  retry also yields no valid packet, the run fails with the Reviewer verdict
+  marked not recorded; it is reported as an orchestration failure, not a
+  product-target verification failure.
 - all targets exhausted: **WAITING_CAPACITY** — park, persist `nextRetryAt`
   (provider retry-after when parseable, else `defaultRetryAfterMs`), resume
   with no LLM call. `WAITING_CAPACITY` is purely timer/clock driven.

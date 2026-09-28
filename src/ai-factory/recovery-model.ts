@@ -647,7 +647,7 @@ function validateAttempt(value: unknown, index: number, issues: string[]): void 
     issues.push(`${path} must be an object`);
     return;
   }
-  exactKeys(value, ["attemptId", "role", "phase", "round", "target", "provenance", "recoveryRisk", "preparedAt"], ["spawnRequestedAt", "spawnedAt", "settledAt", "agentId", "packetKind", "packetValidated", "configRevision", "targetId"], path, issues);
+  exactKeys(value, ["attemptId", "role", "phase", "round", "target", "provenance", "recoveryRisk", "preparedAt"], ["spawnRequestedAt", "spawnedAt", "settledAt", "agentId", "packetKind", "packetValidated", "noPacketRetry", "configRevision", "targetId"], path, issues);
   if (typeof value.attemptId !== "string" || value.attemptId === "") issues.push(`${path}.attemptId must be non-empty`);
   if (!ROLE_NAMES.includes(value.role as RoleName)) issues.push(`${path}.role is invalid`);
   if (typeof value.phase !== "string" || PHASE_ROLES[value.phase] === undefined) issues.push(`${path}.phase is invalid`);
@@ -659,6 +659,7 @@ function validateAttempt(value: unknown, index: number, issues: string[]): void 
   for (const key of ["preparedAt", "spawnRequestedAt", "spawnedAt", "settledAt"]) if (value[key] !== undefined && !finite(value[key])) issues.push(`${path}.${key} must be finite`);
   if (value.agentId !== undefined && (typeof value.agentId !== "string" || value.agentId === "")) issues.push(`${path}.agentId must be non-empty when present`);
   if (value.packetValidated !== undefined && typeof value.packetValidated !== "boolean") issues.push(`${path}.packetValidated must be boolean`);
+  if (value.noPacketRetry !== undefined && value.noPacketRetry !== true) issues.push(`${path}.noPacketRetry must be true when present`);
   if (value.configRevision !== undefined && typeof value.configRevision !== "string") issues.push(`${path}.configRevision must be a string`);
   if (value.targetId !== undefined && (typeof value.targetId !== "string" || value.targetId === "")) issues.push(`${path}.targetId must be a non-empty string`);
 }
@@ -901,7 +902,9 @@ function targetForPhase(state: FactoryRunState, phase: string): string | undefin
 function latestAttempt(state: FactoryRunState, phase: string): FactoryAttempt | undefined {
   const targetId = targetForPhase(state, phase);
   if (state.version === 3 && state.targetPlan && !targetId && (phase === "execution.engineer" || phase === "review.reviewer")) return undefined;
-  return [...(state.attempts ?? [])].reverse().find((attempt) => attempt.phase === phase && (targetId === undefined || attempt.targetId === targetId));
+  return [...(state.attempts ?? [])].reverse().find((attempt) => attempt.phase === phase
+    && (phase !== "integrated.review" || attempt.round === state.repairRound)
+    && (targetId === undefined || attempt.targetId === targetId));
 }
 
 /** The latest attempt recorded for a phase. */
@@ -964,6 +967,8 @@ export type RecoveryDecision = "automatic" | "approval_required" | "blocked";
 
 export interface RecoveryPlan {
   decision: RecoveryDecision;
+  /** True when automatic recovery records a terminal failure instead of spawning. */
+  terminal?: boolean;
   reason: string;
   phase: string;
   checkpoint: FactoryCheckpoint;
@@ -991,7 +996,33 @@ export function planFactoryRecovery(state: FactoryRunState): RecoveryPlan {
   const attempt = latestAttempt(state, phase);
   const provenance = attempt?.provenance ?? "not_started";
   const recoveryRisk = attempt?.recoveryRisk ?? "none";
-  if (provenance === "settled_without_valid_packet") return { decision: "blocked", reason: "The latest attempt settled without a valid packet; replay is not safe", phase, checkpoint, provenance, recoveryRisk, legacy };
+  if (provenance === "settled_without_valid_packet") {
+    if (state.state === "INTEGRATED_REVIEW"
+      && phase === "integrated.review"
+      && attempt?.role === "reviewer"
+      && state.inFlight === undefined
+      && state.waiting === undefined
+      && state.results.integratedReview === undefined) {
+      const retryCall = attempt.agentId === undefined ? undefined : state.metrics.calls?.find((call) => call.agentId === attempt.agentId);
+      const retryExhausted = attempt.noPacketRetry === true
+        && attempt.agentId !== undefined
+        && attempt.packetValidated === false
+        && (retryCall === undefined || retryCall.ok);
+      return {
+        decision: "automatic",
+        ...(retryExhausted ? { terminal: true } : {}),
+        reason: retryExhausted
+          ? "The bounded Integrated Reviewer retry settled without a valid packet; automatically recording terminal failure"
+          : "The Integrated Reviewer settled without a valid packet; retrying this read-only review is safe",
+        phase,
+        checkpoint,
+        provenance,
+        recoveryRisk,
+        legacy,
+      };
+    }
+    return { decision: "blocked", reason: "The latest attempt settled without a valid packet; replay is not safe", phase, checkpoint, provenance, recoveryRisk, legacy };
+  }
   if (provenance === "settled_validated_packet" && attempt && engineerPhase(phase) && !hasPersistedAttemptPacket(state, attempt)) {
     return { decision: "approval_required", reason: "Validated Engineer provenance has no matching persisted packet; explicit approval is required before replay", phase, checkpoint, provenance, recoveryRisk: "workspace_may_have_changed", legacy };
   }

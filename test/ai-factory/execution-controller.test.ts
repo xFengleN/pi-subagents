@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { formatFactoryReport } from "../../src/ai-factory/commands.js";
+import { formatFactoryReport, formatResumePreview } from "../../src/ai-factory/commands.js";
 import { defaultFactoryConfig } from "../../src/ai-factory/config.js";
 import { FactoryController } from "../../src/ai-factory/controller.js";
+import { createFactoryCheckpoint, planFactoryRecovery } from "../../src/ai-factory/recovery-model.js";
 import { createRequirementCatalog } from "../../src/ai-factory/targets.js";
 import { FakeClock, FakeTransport, flush, packets, tempStore } from "./fakes.js";
 
@@ -73,7 +74,7 @@ function make(mode: "lean" | "verified_execution", verificationStatus: "passed" 
     transport, clock, store: store.store, config: defaultFactoryConfig(),
     verifyTarget: async (_cwd, id) => { verified.push(id); return { status: typeof verificationStatus === "function" ? verificationStatus(id) : verificationStatus, evidence: `verified ${id}`, command: "true" }; },
   }, `execution-${mode}`, "Implement the widget", store.dir, mode);
-  return { transport, controller, store, verified };
+  return { transport, controller, store, verified, clock };
 }
 
 async function start(m: ReturnType<typeof make>): Promise<void> {
@@ -300,6 +301,168 @@ describe("execution workflows", () => {
     expect(report).toContain("Deployment exposure: passed");
     expect(report).toContain("Owner-pending acceptance");
     expect(report).toContain("Owner verifies the real iPad workflow");
+    m.store.cleanup();
+  });
+
+  it("retries an invalid integrated-review packet, then continues after a valid PASS", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, contract);
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    expect(phases(m).at(-1)).toBe("integrated.review");
+
+    await complete(m, { verdict: "PASS" });
+    expect(m.controller.getState().results.integratedReview).toBeUndefined();
+    expect(phases(m).filter((phase) => phase === "integrated.review")).toHaveLength(1);
+    expect(m.controller.getState().state).toBe("INTEGRATED_REVIEW");
+    expect(m.clock.pendingTimerCount()).toBe(1);
+    m.clock.advance(1_000);
+    await flush();
+    expect(phases(m).filter((phase) => phase === "integrated.review")).toHaveLength(2);
+    expect(phases(m).at(-1)).toBe("integrated.review");
+    expect(m.controller.getState().attempts?.at(-1)?.noPacketRetry).toBe(true);
+    await complete(m, integratedPass);
+    expect(phases(m).at(-1)).toBe("integration.lead");
+    expect(m.controller.getState().state).not.toBe("STOPPED");
+    m.store.cleanup();
+  });
+
+  it("keeps transient retries separate from the persisted no-packet retry", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, contract);
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    await complete(m, { verdict: "PASS" });
+    m.clock.advance(1_000);
+    await flush();
+    expect(m.controller.getState().attempts?.at(-1)?.noPacketRetry).toBe(true);
+    m.transport.failLast("timeout");
+    await flush();
+    m.clock.advance(1_000);
+    await flush();
+    expect(phases(m).filter((phase) => phase === "integrated.review")).toHaveLength(3);
+    expect(m.controller.getState().attempts?.at(-1)?.noPacketRetry).toBeUndefined();
+    await complete(m, integratedPass);
+    expect(phases(m).at(-1)).toBe("integration.lead");
+    m.store.cleanup();
+  });
+
+  it("fails after the integrated-review packet retry is exhausted without spawning an orphan", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, contract);
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    await complete(m, { verdict: "PASS" });
+    expect(m.controller.getState().state).toBe("INTEGRATED_REVIEW");
+    expect(m.clock.pendingTimerCount()).toBe(1);
+    m.clock.advance(1_000);
+    await flush();
+    expect(phases(m).filter((phase) => phase === "integrated.review")).toHaveLength(2);
+    await complete(m, null);
+    expect(m.controller.getState().state).toBe("FAILED");
+    expect(m.controller.getState().errors.at(-1)?.message).toContain("Integrated Reviewer did not produce a valid packet");
+    expect(formatFactoryReport(m.controller.getState())).toContain("Failure class: reviewer packet/runtime validation");
+    expect(phases(m).filter((phase) => phase === "integrated.review")).toHaveLength(2);
+    expect(m.transport.stopped).toEqual([]);
+    m.store.cleanup();
+  });
+
+  it("recovers a settled invalid Integrated Reviewer checkpoint without replaying passed targets", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, { ...contract, runVerification: [{ name: "integration check", command: "true", evidence: "integration passes" }] });
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    await complete(m, { verdict: "PASS" });
+    expect(m.controller.getState().state).toBe("INTEGRATED_REVIEW");
+    expect(m.controller.getState().inFlight).toBeUndefined();
+    expect(m.controller.getState().results.integratedReview).toBeUndefined();
+
+    m.controller.dispose();
+    const interrupted = m.store.store.load(m.controller.getState().runId);
+    expect(interrupted).toBeDefined();
+    if (!interrupted) throw new Error("Expected persisted interrupted run");
+    interrupted.parked = false;
+    interrupted.metrics.roles.reviewer.retries = 0;
+    interrupted.metrics.totalRetries = 0;
+    interrupted.stateRevision = (interrupted.stateRevision ?? 0) + 1;
+    interrupted.checkpoint = createFactoryCheckpoint(interrupted, interrupted.stateRevision);
+    m.store.store.save(interrupted);
+    const recoveryPlan = planFactoryRecovery(interrupted);
+    expect(recoveryPlan).toMatchObject({ decision: "automatic", phase: "integrated.review" });
+    expect(formatResumePreview(interrupted, recoveryPlan)).toContain("next action: safe automatic continuation");
+
+    const transport = new FakeTransport();
+    const clock = new FakeClock();
+    const restored = FactoryController.restore({
+      transport, clock, store: m.store.store, config: defaultFactoryConfig(),
+      verifyTarget: async (_cwd, id) => { m.verified.push(id); return { status: "passed", evidence: `verified ${id}`, command: "true" }; },
+    }, interrupted.runId, { resume: false });
+    expect(restored).toBeDefined();
+    if (!restored) throw new Error("Expected interrupted run to restore");
+    expect(restored.getRecoveryEligibility()).toMatchObject({ eligible: true, requiresApproval: false });
+    expect(restored.resume()).toMatchObject({ kind: "ok", state: "INTEGRATED_REVIEW" });
+    await flush();
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["integrated.review"]);
+    expect(restored.getState().attempts?.at(-1)?.noPacketRetry).toBe(true);
+    expect(m.verified.filter((id) => id === "wp-1" || id === "wp-2")).toHaveLength(2);
+    expect(m.verified.filter((id) => id === "integration check")).toHaveLength(1);
+    transport.completeLastPacket(integratedPass);
+    await flush();
+    await flush();
+    expect(restored.getState().state).toBe("INTEGRATION");
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["integrated.review", "integration.lead"]);
+    restored.dispose();
+    m.store.cleanup();
+  });
+
+  it("does not spend the packet retry budget when the retry fails to spawn", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, contract);
+    await complete(m, engineer("wp-1"));
+    await complete(m, engineer("wp-2"));
+    await complete(m, { verdict: "PASS" });
+    m.clock.advance(1_000);
+    await flush();
+    expect(m.transport.spawned.filter((item) => item.phase === "integrated.review")).toHaveLength(2);
+    expect(m.controller.getState().attempts?.at(-1)?.noPacketRetry).toBe(true);
+
+    m.controller.dispose();
+    const interrupted = m.store.store.load(m.controller.getState().runId);
+    expect(interrupted).toBeDefined();
+    if (!interrupted) throw new Error("Expected persisted reviewer retry");
+    interrupted.inFlight = undefined;
+    interrupted.parked = false;
+    const retry = interrupted.attempts?.at(-1);
+    expect(retry?.noPacketRetry).toBe(true);
+    if (!retry) throw new Error("Expected retry attempt");
+    retry.provenance = "settled_without_valid_packet";
+    retry.recoveryRisk = "uncertain_outcome";
+    retry.agentId = undefined;
+    retry.packetValidated = undefined;
+    retry.settledAt = m.clock.now();
+    interrupted.stateRevision = (interrupted.stateRevision ?? 0) + 1;
+    interrupted.checkpoint = createFactoryCheckpoint(interrupted, interrupted.stateRevision);
+    m.store.store.save(interrupted);
+    const recoveryPlan = planFactoryRecovery(interrupted);
+    expect(recoveryPlan).toMatchObject({ decision: "automatic", phase: "integrated.review" });
+    expect(recoveryPlan.terminal).toBeUndefined();
+    expect(formatResumePreview(interrupted, recoveryPlan)).toContain("next action: safe automatic continuation");
+
+    const transport = new FakeTransport();
+    const restored = FactoryController.restore({
+      transport, clock: new FakeClock(), store: m.store.store, config: defaultFactoryConfig(),
+    }, interrupted.runId, { resume: false });
+    expect(restored).toBeDefined();
+    if (!restored) throw new Error("Expected reviewer retry to restore");
+    expect(restored.resume()).toMatchObject({ kind: "ok", state: "INTEGRATED_REVIEW" });
+    expect(transport.spawned.map((item) => item.phase)).toEqual(["integrated.review"]);
+    expect(restored.getState().attempts?.at(-1)?.noPacketRetry).toBeUndefined();
+    restored.dispose();
     m.store.cleanup();
   });
 

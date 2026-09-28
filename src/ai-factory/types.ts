@@ -514,6 +514,8 @@ export interface FactoryAttempt {
   agentId?: string;
   packetKind?: string;
   packetValidated?: boolean;
+  /** This invocation consumes the bounded same-target retry for an unusable packet. */
+  noPacketRetry?: true;
   /** Identity of the effective run configuration at attempt time (Task 3). */
   configRevision?: string;
 }

@@ -909,7 +909,13 @@ export class FactoryController {
         const failedRunCheck = runResults.find((item) => item.status !== "passed");
         if (failedRunCheck) return { kind: "transition", to: "STOPPED", note: `Run-level verification ${failedRunCheck.name} failed: ${failedRunCheck.evidence}` };
         const review = s.results.integratedReview;
-        if (!review || s.results.integratedReviews?.at(-1)?.agentId !== review.agentId) return { kind: "spawn", phase: "integrated.review" };
+        if (!review || s.results.integratedReviews?.at(-1)?.agentId !== review.agentId) {
+          if (integratedReviewerRetryExhausted(s)) {
+            this.failRun(integratedReviewerPacketFailure());
+            return undefined;
+          }
+          return { kind: "spawn", phase: "integrated.review" };
+        }
         if (review.packet.verdict === "ARCHITECTURE_CONTRADICTION") return { kind: "transition", to: "STOPPED", note: "Integrated Reviewer found an architecture contradiction" };
         if (review.packet.verdict === "PASS") {
           const declared = review.packet.affectedTargetIds;
@@ -1384,7 +1390,15 @@ export class FactoryController {
     }
     const targets = targetsForRole(this.config, spec.role);
     if (this.pending === undefined || this.pending.phase !== phase || this.pending.role !== spec.role) {
-      this.pending = { role: spec.role, phase, targetIndex: 0, retriesOnTarget: 0, noPacketRetries: 0, attemptedTargets: [], reasons: [] };
+      this.pending = {
+        role: spec.role,
+        phase,
+        targetIndex: 0,
+        retriesOnTarget: 0,
+        noPacketRetries: noPacketRetryCount(s, phase),
+        attemptedTargets: [],
+        reasons: [],
+      };
     }
     const pending = this.pending;
     const target = targets[pending.targetIndex];
@@ -1431,6 +1445,9 @@ export class FactoryController {
       recoveryRisk: spec.role === "engineer" ? "workspace_may_have_changed" : "uncertain_outcome",
       preparedAt: this.clock.now(),
       packetKind: spec.kind,
+      ...(pending.noPacketRetries > 0 && !s.attempts?.some((item) => item.phase === phase && item.noPacketRetry === true)
+        ? { noPacketRetry: true as const }
+        : {}),
       configRevision: configRevision(this.config),
     };
     s.attempts = [...(s.attempts ?? []), attempt];
@@ -1596,6 +1613,10 @@ export class FactoryController {
     if (opts.noPacketRetry && pending && pending.noPacketRetries < 1) {
       pending.noPacketRetries++;
       this.scheduleRetry(role, this.clock.now() + roleConfig.retryDelayMs);
+      return;
+    }
+    if (opts.noPacketRetry && phase === "integrated.review" && role === "reviewer") {
+      this.failRun(integratedReviewerPacketFailure());
       return;
     }
     if (klass === "transient" && pending && pending.retriesOnTarget < roleConfig.maxTransientRetries) {
@@ -2041,6 +2062,34 @@ function lastExecutionEngineer(s: FactoryRunState) {
  * (agentId recorded) or the outcome was uncertain (workspace risk). Only an
  * explicit approval may authorize a replay; the run stays in the phase.
  */
+function attemptMatchesPhaseScope(s: FactoryRunState, attempt: FactoryAttempt, phase: string): boolean {
+  if (attempt.phase !== phase || attempt.round !== s.repairRound) return false;
+  return phase !== "review.reviewer" || attempt.targetId === s.targetPlan?.currentTargetId;
+}
+
+function invalidPacketAttemptCount(s: FactoryRunState, phase: string): number {
+  const attempts = s.attempts ?? [];
+  return attempts.filter((attempt) => {
+    if (!attemptMatchesPhaseScope(s, attempt, phase) || attempt.agentId === undefined
+      || attempt.provenance !== "settled_without_valid_packet" || attempt.packetValidated !== false) return false;
+    const call = s.metrics.calls?.find((item) => item.agentId === attempt.agentId);
+    return call === undefined || call.ok;
+  }).length;
+}
+
+function noPacketRetryCount(s: FactoryRunState, phase: string): number {
+  const retryInvocations = (s.attempts ?? []).filter((attempt) => attemptMatchesPhaseScope(s, attempt, phase) && attempt.noPacketRetry === true).length;
+  return Math.max(retryInvocations, invalidPacketAttemptCount(s, phase));
+}
+
+function integratedReviewerRetryExhausted(s: FactoryRunState): boolean {
+  return invalidPacketAttemptCount(s, "integrated.review") >= 2;
+}
+
+function integratedReviewerPacketFailure(): string {
+  return "Integrated Reviewer did not produce a valid packet after the single same-target retry; reviewer verdict not recorded. Failure class: reviewer packet/runtime validation.";
+}
+
 function engineerSpawnBlocked(s: FactoryRunState): boolean {
   const phase = s.state === "EXECUTION"
     ? "execution.engineer"

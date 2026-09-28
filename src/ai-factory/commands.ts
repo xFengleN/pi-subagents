@@ -80,7 +80,7 @@ export function formatResumePreview(
   lines.push(`completed: ${done.length > 0 ? done.join(", ") : "none"}`);
   if (state.targetPlan) lines.push(`targets: ${state.targetPlan.targets.map((target) => `${target.id}=${targetDisplayStatus(state.targetPlan!, target.id)}`).join(", ")}; active: ${state.targetPlan.currentTargetId ?? "none"}`);
   const decision = plan.decision === "automatic"
-    ? "safe automatic continuation"
+    ? (plan.terminal ? "safe automatic terminalization" : "safe automatic continuation")
     : plan.decision === "approval_required"
       ? "approval required (workspace-risking recovery)"
       : "blocked";
@@ -710,6 +710,13 @@ function formatWorkflowReport(state: FactoryRunState): string {
           : "completed";
   lines.push(`Result: ${result}`);
   lines.push("", "Run statistics", ...runStatistics(state));
+  if (state.stoppedReason?.startsWith("Integrated Reviewer did not produce a valid packet")) {
+    section(lines, "Reviewer evidence", [
+      `Failure class: reviewer packet/runtime validation; ${state.stoppedReason}`,
+      "Reviewer verdict: not recorded.",
+      "This is a Reviewer orchestration failure, not evidence that passed product targets failed verification.",
+    ]);
+  }
 
   if (isPreExecutionContractStop(state)) {
     renderPreExecutionContractStop(lines, state);
