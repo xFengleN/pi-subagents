@@ -66,6 +66,15 @@ A verified implementation is not independently reviewed until integrated review
 PASS on the latest integrated state. VERIFIED EXECUTION's final Architect audits
 conformance with the owner's contract, not architectural taste. Model presets
 remain unchanged, including role models for stages a workflow does not invoke.
+The target-level requiresArchitectAcceptance metadata is honored only by FULL;
+execution proposals normalize it away because VERIFIED EXECUTION and LEAN do
+not run per-target Architects. Their target completion requires Engineer
+completion and deterministic verification, with the integrated reviewer and
+(optional) final Architect gates afterward. A genuine Engineer-reported
+architectural escalation in an execution profile stops the run with the
+workspace preserved rather than inventing a per-target Architect phase. Older
+persisted execution runs containing the metadata remain readable under their
+workflow's policy.
 
 ## Architecture
 
@@ -212,8 +221,7 @@ transitively blocks dependents, and does not prevent independent targets from
 running. Integration and mission-level acceptance require *every* target to
 pass; a partial result remains STOPPED. A per-target Architect check runs only
 when explicitly required or escalated; unsafe amendments of accepted target
-contracts are rejected rather than quietly replayed. Reviewer PASS is the
-normal per-target acceptance gate; the final Architect remains the mission gate.
+contracts are rejected rather than quietly replayed. Reviewer PASS is the normal FULL per-target acceptance gate; the final Architect remains the FULL mission gate. This scheduler and its explicit per-target Architect checks are FULL-only.
 
 For multi-target final rejections the Architect must specify exactly one
 `affectedTargetIds` entry, or `integrationOnly: true`. Remediation is restricted

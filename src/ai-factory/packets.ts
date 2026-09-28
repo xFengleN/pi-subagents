@@ -82,7 +82,7 @@ const targetArr = {
       description: { type: "string" },
       dependsOn: strArr,
       acceptanceCriteria: strArr,
-      requiresArchitectAcceptance: { type: "boolean" },
+      requiresArchitectAcceptance: { type: "boolean", description: "A target-level Architect gate is supported only by FULL; execution workflows normalize this metadata away." },
     },
   },
 } as const;

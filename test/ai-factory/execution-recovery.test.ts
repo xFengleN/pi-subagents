@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { defaultFactoryConfig } from "../../src/ai-factory/config.js";
-import { validatePersistedFactoryRunState } from "../../src/ai-factory/recovery-model.js";
+import { createFactoryCheckpoint, validatePersistedFactoryRunState } from "../../src/ai-factory/recovery-model.js";
 import { createRequirementCatalog, createTargetPlan } from "../../src/ai-factory/targets.js";
 import type { FactoryRunState } from "../../src/ai-factory/types.js";
+import { packets } from "./fakes.js";
 
 function baseState(): FactoryRunState {
   return {
@@ -59,6 +60,48 @@ describe("execution workflow persisted recovery", () => {
     state.workflow = { mode };
     state.results.executionProposal = { packet: proposal, agentId: "lead-1" };
     expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
+  });
+
+  it("reads a historical VERIFIED target with requiresArchitectAcceptance after Engineer and verification pass", () => {
+    const state = baseState();
+    const target = { id: "T1-TAB-FOCUS-ROUTING", description: "Tab focus", dependsOn: [], acceptanceCriteria: ["Focus routes correctly"], requiresArchitectAcceptance: true };
+    state.workflow = { mode: "verified_execution" };
+    state.state = "EXECUTION";
+    state.results.executionProposal = {
+      packet: { ...proposal, workPackages: [target.id], targets: [target], verification: { [target.id]: { command: "npm test", evidence: "target verification passed" } } },
+      agentId: "lead-1",
+    };
+    state.results.engineers = [{
+      targetId: target.id,
+      round: 0,
+      outcome: { packet: { ...packets.engineer, workPackageId: target.id }, agentId: "engineer-1" },
+    }];
+    state.targetPlan = createTargetPlan([target]);
+    state.targetPlan.outcomes[target.id] = {
+      status: "passed",
+      engineerAgentId: "engineer-1",
+      verification: { status: "passed", command: "npm test", evidence: "target verification passed" },
+    };
+    state.stateRevision = 2;
+    state.checkpoint = createFactoryCheckpoint(state, state.stateRevision);
+    expect(validatePersistedFactoryRunState(state).issues).toEqual([]);
+  });
+
+  it("still rejects a passed FULL target that lacks its configured Architect acceptance", () => {
+    const state = baseState();
+    const target = { id: "WP0", description: "Target", dependsOn: [], acceptanceCriteria: ["criterion"], requiresArchitectAcceptance: true };
+    state.workflow = { mode: "full" };
+    state.state = "EXECUTION";
+    state.results.engineers = [{ targetId: target.id, round: 0, outcome: { packet: { ...packets.engineer, workPackageId: target.id }, agentId: "engineer-1" } }];
+    state.results.reviewers = [{ targetId: target.id, round: 0, outcome: { packet: packets.reviewerPass, agentId: "reviewer-1" } }];
+    state.targetPlan = createTargetPlan([target]);
+    state.targetPlan.outcomes[target.id] = {
+      status: "passed", engineerAgentId: "engineer-1", reviewerAgentId: "reviewer-1",
+      verification: { status: "passed", command: "npm test", evidence: "target verification passed" },
+    };
+    state.stateRevision = 2;
+    state.checkpoint = createFactoryCheckpoint(state, state.stateRevision);
+    expect(validatePersistedFactoryRunState(state).issues).toContain("targetPlan.outcomes.WP0 requires target Architect acceptance");
   });
 
   it("continues to read the historical stopped flat-map contract with a live-preview pseudo-target", () => {

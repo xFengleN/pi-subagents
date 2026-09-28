@@ -8,9 +8,9 @@ describe("Factory workflow policies", () => {
     expect(parseWorkflowSelection("verified")).toBe("verified_execution");
     expect(parseWorkflowSelection("lean")).toBe("lean");
     expect(parseWorkflowSelection("other")).toBeUndefined();
-    expect(workflowPolicy("full")).toMatchObject({ initialArchitect: true, perTargetReviewer: true, finalArchitect: true });
-    expect(workflowPolicy("verified_execution")).toMatchObject({ initialArchitect: false, perTargetReviewer: false, finalArchitect: true });
-    expect(workflowPolicy("lean")).toMatchObject({ initialArchitect: false, perTargetReviewer: false, finalArchitect: false });
+    expect(workflowPolicy("full")).toMatchObject({ initialArchitect: true, perTargetReviewer: true, perTargetArchitect: true, finalArchitect: true });
+    expect(workflowPolicy("verified_execution")).toMatchObject({ initialArchitect: false, perTargetReviewer: false, perTargetArchitect: false, finalArchitect: true });
+    expect(workflowPolicy("lean")).toMatchObject({ initialArchitect: false, perTargetReviewer: false, perTargetArchitect: false, finalArchitect: false });
   });
 
   it("treats historical runs without a workflow as FULL", () => {

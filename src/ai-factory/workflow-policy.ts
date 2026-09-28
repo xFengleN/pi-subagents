@@ -8,13 +8,14 @@ export interface FactoryWorkflowPolicy {
   displayName: string;
   initialArchitect: boolean;
   perTargetReviewer: boolean;
+  perTargetArchitect: boolean;
   finalArchitect: boolean;
 }
 
 const POLICIES: Record<FactoryWorkflowMode, FactoryWorkflowPolicy> = {
-  full: { mode: "full", displayName: "FULL", initialArchitect: true, perTargetReviewer: true, finalArchitect: true },
-  verified_execution: { mode: "verified_execution", displayName: "VERIFIED EXECUTION", initialArchitect: false, perTargetReviewer: false, finalArchitect: true },
-  lean: { mode: "lean", displayName: "LEAN", initialArchitect: false, perTargetReviewer: false, finalArchitect: false },
+  full: { mode: "full", displayName: "FULL", initialArchitect: true, perTargetReviewer: true, perTargetArchitect: true, finalArchitect: true },
+  verified_execution: { mode: "verified_execution", displayName: "VERIFIED EXECUTION", initialArchitect: false, perTargetReviewer: false, perTargetArchitect: false, finalArchitect: true },
+  lean: { mode: "lean", displayName: "LEAN", initialArchitect: false, perTargetReviewer: false, perTargetArchitect: false, finalArchitect: false },
 };
 
 export function workflowPolicy(mode: FactoryWorkflowMode): FactoryWorkflowPolicy {

@@ -237,6 +237,9 @@ describe("execution workflow packets and prompts", () => {
     expect(execution).toContain("Integrated Reviewer is a configured LLM gate, not owner/manual sign-off");
     expect(execution).toContain("missionRequirements");
     expect(execution).toContain("scoped to their target");
+    expect(execution).toContain("no initial or per-target Architect gate");
+    expect(execution).toContain("Final integrated acceptance belongs to the configured final Architect");
+    expect(execution).toContain("report architectureContradiction and stop");
     const integrated = integratedReviewPrompt({
       task: "TASK",
       architecture: "ARCH",
@@ -284,6 +287,8 @@ describe("execution workflow packets and prompts", () => {
     });
     expect(conformance).toContain("Do not redesign");
     expect(conformance).toContain("latest actual integrated workspace/state");
+    expect(conformance).toContain("not a per-target Architect gate");
+    expect(conformance).toContain("must not be treated as a missing per-target acceptance packet");
     expect(conformance).toContain("Integrated/run-level verification evidence");
     expect(conformance).toContain("Live preview: passed");
     expect(conformance).toContain("manual deployment check pending");

@@ -592,7 +592,8 @@ export class FactoryController {
     this.commit();
     if (this.workflow !== "full" && (phase === "execution.engineer" || phase === "remediation.engineer")) {
       if ((packet as { architecturalEscalationRequired: boolean }).architecturalEscalationRequired) {
-        this.stop("Engineer requested architectural escalation. Execution workflows stop for an owner decision; no Architect redesign is automatic.");
+        const targetId = this.state.targetPlan?.currentTargetId ?? "the target";
+        this.stop(`Engineer requested architectural escalation for ${targetId}; ${workflowPolicy(this.workflow).displayName} has no per-target Architect gate. Execution stopped for an owner decision with the workspace preserved; no Architect redesign is automatic.`);
         return;
       }
       if ((packet as { status: string }).status !== "completed") {
@@ -765,7 +766,7 @@ export class FactoryController {
           }
           const target = s.targetPlan.targets.find((item) => item.id === id)!;
           s.targetPlan.outcomes[id] = { status: "passed", engineerAgentId: engineer.outcome.agentId, reviewerAgentId: reviewer.outcome.agentId };
-          if (target.requiresArchitectAcceptance || engineer.outcome.packet.architecturalEscalationRequired) {
+          if (workflowPolicy(this.workflow).perTargetArchitect && (target.requiresArchitectAcceptance || engineer.outcome.packet.architecturalEscalationRequired)) {
             if (s.architectEscalations >= this.config.maxArchitectEscalations) return this.failTargetOrStop(`Architect assessment allowance exhausted for ${id}`);
             s.targetPlan.awaitingArchitectAcceptance = true;
             return { kind: "transition", to: "ARCHITECT_ESCALATION", note: `Target ${id} requires Architect assessment` };
@@ -884,6 +885,7 @@ export class FactoryController {
         const outcome = plan.outcomes[plan.currentTargetId];
         if (!engineer || engineer.round !== s.repairRound || engineer.outcome.agentId !== outcome.engineerAgentId) return { kind: "spawn", phase: "execution.engineer" };
         if (engineer.outcome.packet.status !== "completed") return { kind: "transition", to: "STOPPED", note: `Engineer did not complete target ${plan.currentTargetId}` };
+        if (engineer.outcome.packet.architecturalEscalationRequired) return { kind: "transition", to: "STOPPED", note: `Engineer flagged an architectural escalation for ${plan.currentTargetId}; ${workflowPolicy(this.workflow).displayName} has no per-target Architect gate, so execution stopped with the workspace preserved` };
         const verification = plan.outcomes[plan.currentTargetId].verification;
         if (!verification && !this.verificationPending) {
           void this.verifyCompletedTarget();
@@ -1638,8 +1640,18 @@ export class FactoryController {
         break;
       case "execution.proposal": {
         const contract = packet as ExecutionContractPacket;
-        s.results.executionProposal = outcome;
-        const targets = contract.targets ?? [];
+        const targetPolicy = workflowPolicy(this.workflow);
+        const proposedTargets = contract.targets ?? [];
+        const targets = targetPolicy.perTargetArchitect ? proposedTargets : proposedTargets.map((target) => {
+          if (!target.requiresArchitectAcceptance) return target;
+          return { id: target.id, description: target.description, dependsOn: target.dependsOn, acceptanceCriteria: target.acceptanceCriteria };
+        });
+        if (contract.targets !== undefined && !targetPolicy.perTargetArchitect) contract.targets = targets;
+        s.results.executionProposal = {
+          packet: contract,
+          agentId: info.agentId,
+          ...(info.modelName !== undefined ? { target: info.modelName } : {}),
+        };
         const errors = validateTargets(targets);
         const ids = new Set(targets.map((target) => target.id));
         if (targets.length === 0) errors.push("Execution contract must contain a structured target graph");

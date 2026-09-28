@@ -22,6 +22,7 @@ import {
   type RoleName,
   TERMINAL_STATES,
 } from "./types.js";
+import { type FactoryWorkflowMode, workflowPolicy } from "./workflow-policy.js";
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PHASE_ROLES: Record<string, RoleName> = {
@@ -278,6 +279,10 @@ function validateTargetArray(value: unknown, path: string, issues: string[]): va
 
 function validateTargetPlan(value: unknown, state: Record<string, unknown>, issues: string[]): void {
   if (!record(value)) { issues.push("targetPlan must be an object"); return; }
+  const workflowMode = record(state.workflow) && ["full", "verified_execution", "lean"].includes(String(state.workflow.mode))
+    ? state.workflow.mode as FactoryWorkflowMode
+    : "full";
+  const policy = workflowPolicy(workflowMode);
   exactKeys(value, ["targets", "outcomes", "revision", "rationale"], ["currentTargetId", "awaitingArchitectAcceptance", "revalidationIds"], "targetPlan", issues);
   const before = issues.length;
   validateTargetArray(value.targets, "targetPlan.targets", issues);
@@ -340,7 +345,7 @@ function validateTargetPlan(value: unknown, state: Record<string, unknown>, issu
         return !record(dependency) || (dependency.status !== "passed"
           && !(strings(value.revalidationIds) && value.revalidationIds.includes(id) && value.revalidationIds.includes(dep)));
       })) issues.push(`targetPlan.outcomes.${id} passed while a dependency is not accepted`);
-      if (target?.requiresArchitectAcceptance && typeof outcome.architectAgentId !== "string" && !(value.awaitingArchitectAcceptance === true && value.currentTargetId === id)) issues.push(`targetPlan.outcomes.${id} requires target Architect acceptance`);
+      if (policy.perTargetArchitect && target?.requiresArchitectAcceptance && typeof outcome.architectAgentId !== "string" && !(value.awaitingArchitectAcceptance === true && value.currentTargetId === id)) issues.push(`targetPlan.outcomes.${id} requires target Architect acceptance`);
     }
   }
   const activeIds = Object.entries(value.outcomes).filter(([, outcome]) => record(outcome) && outcome.status === "active").map(([id]) => id);
@@ -349,7 +354,7 @@ function validateTargetPlan(value: unknown, state: Record<string, unknown>, issu
     const active = typeof value.currentTargetId === "string" ? value.outcomes[value.currentTargetId] : undefined;
     if (typeof value.currentTargetId !== "string" || !ids.has(value.currentTargetId)
       || !record(active) || !["active", "passed"].includes(String(active.status))) issues.push("targetPlan.currentTargetId must identify the active target");
-    if (record(active) && active.status === "passed" && value.awaitingArchitectAcceptance !== true) issues.push("passed current target must be awaiting Architect acceptance");
+    if (policy.perTargetArchitect && record(active) && active.status === "passed" && value.awaitingArchitectAcceptance !== true) issues.push("passed current target must be awaiting Architect acceptance");
   }
   if (!(record(state.workflow) && state.workflow.mode !== "full") && ["INTEGRATION", "FINAL_ARCHITECT", "FINAL_ARCHITECT_RECHECK", "FINAL_SYNTHESIS", "DONE"].includes(String(state.state))
     && (Object.values(value.outcomes).some((outcome) => !record(outcome) || outcome.status !== "passed") || value.revalidationIds !== undefined)) issues.push(`${state.state} requires every target to be Reviewer-approved`);

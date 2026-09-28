@@ -178,6 +178,53 @@ describe("execution workflows", () => {
     }
   });
 
+  it("normalizes the reproduced VERIFIED EXECUTION per-target Architect gate and continues", async () => {
+    const m = make("verified_execution");
+    const ids = ["T1-TAB-FOCUS-ROUTING", "T2-ANCHORED-VIRTUAL-PAGING", "T3-REGRESSION-EXPECTATION-UPDATE"];
+    const gatedTargets = ids.map((id, index) => ({
+      id,
+      description: `${id} implementation`,
+      dependsOn: [],
+      acceptanceCriteria: [`${id} works`],
+      requiresArchitectAcceptance: index < 2,
+    }));
+    try {
+      await start(m);
+      await complete(m, {
+        ...contract,
+        workPackages: ids,
+        targets: gatedTargets,
+        verification: Object.fromEntries(ids.map((id) => [id, { command: "true", evidence: `${id} passes` }])),
+      });
+      const accepted = m.controller.getState();
+      expect(accepted.results.executionProposal?.packet.targets?.every((target) => target.requiresArchitectAcceptance !== true)).toBe(true);
+      expect(accepted.targetPlan?.targets.every((target) => target.requiresArchitectAcceptance !== true)).toBe(true);
+      await complete(m, engineer(ids[0]));
+      const saved = m.store.store.load("execution-verified_execution");
+      expect(saved?.targetPlan?.outcomes[ids[0]]).toMatchObject({ status: "passed", verification: { status: "passed" } });
+      expect(saved?.targetPlan?.currentTargetId).toBe(ids[1]);
+      expect(phases(m)).toContain("execution.engineer");
+      expect(phases(m)).not.toContain("escalation.architect");
+    } finally {
+      m.store.cleanup();
+    }
+  });
+
+  it("stops clearly when an Engineer reports a genuine architecture escalation in VERIFIED EXECUTION", async () => {
+    const m = make("verified_execution");
+    try {
+      await start(m);
+      await complete(m, { ...contract, targets: [{ ...contract.targets[0], id: "T1" }], workPackages: ["T1"], verification: { T1: { command: "true", evidence: "T1 check" } } });
+      await complete(m, { ...engineer("T1"), architecturalEscalationRequired: true });
+      expect(m.controller.getState().state).toBe("STOPPED");
+      expect(m.controller.getState().stoppedReason).toContain("VERIFIED EXECUTION has no per-target Architect gate");
+      expect(m.verified).toEqual([]);
+      expect(phases(m)).not.toContain("escalation.architect");
+    } finally {
+      m.store.cleanup();
+    }
+  });
+
   it("reproduces and rejects the legacy pseudo-target live-preview verification entry", async () => {
     const m = make("verified_execution");
     const targets = ["T1", "T2", "T3"].map((id) => ({ id, description: `${id} implementation`, dependsOn: [], acceptanceCriteria: [`${id} works`] }));
@@ -215,7 +262,7 @@ describe("execution workflows", () => {
       { name: "Artifact identity", command: "shasum -a 256 dist/app.js", evidence: "Artifact hash matches expected identity" },
       { name: "Deployment exposure", command: "node verify-exposure.mjs", evidence: "Service remains tailnet-only" },
     ];
-    const targets = ["T1", "T2", "T3"].map((id) => ({ id, description: `${id} implementation`, dependsOn: [], acceptanceCriteria: [`${id} works`] }));
+    const targets = ["T1", "T2", "T3"].map((id) => ({ id, description: `${id} implementation`, dependsOn: [], acceptanceCriteria: [`${id} works`], requiresArchitectAcceptance: true }));
     const targetVerification = {
       T1: { command: "npm test -- T1", evidence: "T1 focused test passes" },
       T2: { command: "npm test -- T2", evidence: "T2 paging tests pass" },
@@ -225,18 +272,22 @@ describe("execution workflows", () => {
     await complete(m, { ...contract, workPackages: targets.map((target) => target.id), targets, verification: targetVerification, runVerification });
     expect(m.controller.getState().state).toBe("EXECUTION");
     expect(m.controller.getState().results.executionProposal?.packet.runVerification).toEqual(runVerification);
+    expect(m.controller.getState().results.executionProposal?.packet.targets?.every((target) => target.requiresArchitectAcceptance !== true)).toBe(true);
     await complete(m, engineer("T1"));
     await complete(m, engineer("T2"));
     await complete(m, engineer("T3"));
     expect(m.verified).toEqual(["T1", "T2", "T3", "Live preview", "Whole-run regression", "Artifact identity", "Deployment exposure"]);
     expect(m.controller.getState().results.runVerification?.map((item) => item.status)).toEqual(["passed", "passed", "passed", "passed"]);
     expect(phases(m).at(-1)).toBe("integrated.review");
+    expect(phases(m)).not.toContain("escalation.architect");
     expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification output (never target outcomes)");
     expect(m.transport.spawned.at(-1)?.prompt).toContain("Live preview");
     await complete(m, integratedPass);
     await complete(m, packets.integration);
     expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification evidence");
     await complete(m, conformanceAccept);
+    expect(m.controller.getState().state).toBe("FINAL_SYNTHESIS");
+    expect(phases(m)).toContain("conformance.architect");
     expect(m.transport.spawned.at(-1)?.prompt).toContain("Integrated/run-level verification");
     await complete(m, packets.finalReport);
     expect(m.controller.getState().state).toBe("DONE");
