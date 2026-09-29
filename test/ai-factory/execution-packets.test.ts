@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { packetSchema, parsePacketTyped } from "../../src/ai-factory/packets.js";
 import {
   conformanceArchitectPrompt,
+  engineerPrompt,
   executionContractPrompt,
   finalReportPrompt,
   integratedReviewPrompt,
@@ -39,6 +40,20 @@ const review: IntegratedReviewPacket = {
 };
 
 describe("execution workflow packets and prompts", () => {
+  it("keeps Engineer completion scoped to implementation and Engineer-side checks", () => {
+    const prompt = engineerPrompt({
+      workPackageId: "P20-A2-BOUNDARY-VERIFY",
+      architecture: "approved architecture",
+      task: "Complete the boundary verification",
+      acceptanceCriteria: ["Boundary test passes"],
+      constraints: [],
+    });
+    expect(prompt).toContain("completed does NOT claim Reviewer or Architect approval");
+    expect(prompt).toContain("partially_completed only when concrete assigned-package work still remains");
+    expect(prompt).toContain("Do NOT use it because Reviewer, Architect, Integrated Reviewer, Final Architect");
+    expect(prompt).toContain("List each concrete unfinished assigned-package item in remainingWork");
+  });
+
   it("parses execution contracts with per-target verification", () => {
     const parsed = parsePacketTyped("execution_proposal", JSON.stringify(contract), undefined);
     expect(parsed?.verification["target-a"].evidence).toBe("Target test passes");

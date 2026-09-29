@@ -354,6 +354,56 @@ describe("AI Factory — persisted serial targets", () => {
     expect(m.transport.spawned.filter((spawn) => spawn.phase === "final_recheck.architect")).toHaveLength(0);
   });
 
+  it("accepts implementation-complete Engineer work marked partial only while waiting for Reviewer PASS", async () => {
+    const m = make([target("WP0")]);
+    await approve(m);
+    expect(m.transport.spawned.at(-1)?.phase).toBe("execution.engineer");
+    m.transport.completeLastPacket({
+      ...packets.engineer,
+      status: "partially_completed",
+      remainingWork: undefined, // legacy packet predating the explicit remainingWork field
+      workPackageId: "WP0",
+      summary: "Implementation and tests are complete; waiting for Reviewer PASS.",
+      unresolvedQuestions: ["Will the required independent Reviewer accept WP0?"],
+      changedFiles: ["WP0.ts"],
+      testsRun: ["npm test -- WP0"],
+      testResults: "pass",
+    });
+    await flush();
+    expect(m.transport.spawned.at(-1)?.phase).toBe("review.reviewer");
+
+    m.transport.completeLastPacket(packets.reviewerPass);
+    await flush();
+
+    expect(m.controller.getState().targetPlan?.outcomes.WP0.status).toBe("passed");
+    expect(m.controller.getState().targetPlan?.outcomes.WP0.engineerAgentId).toBeDefined();
+    expect(m.controller.getState().targetPlan?.outcomes.WP0.reviewerAgentId).toBeDefined();
+    expect(m.controller.getState().state).toBe("INTEGRATION");
+    expect(m.transport.spawned.at(-1)?.phase).toBe("integration.lead");
+  });
+
+  it("does not let Reviewer PASS complete a package with actual Engineer work remaining", async () => {
+    const m = make([target("WP0")]);
+    await approve(m);
+    m.transport.completeLastPacket({
+      ...packets.engineer,
+      status: "partially_completed",
+      remainingWork: ["finish the required implementation"],
+      workPackageId: "WP0",
+      testsRun: ["npm test -- WP0"],
+      testResults: "pass",
+      unresolvedQuestions: ["Will the Reviewer accept the unfinished implementation?"],
+    });
+    await flush();
+    expect(m.transport.spawned.at(-1)?.phase).toBe("review.reviewer");
+    m.transport.completeLastPacket(packets.reviewerPass);
+    await flush();
+    expect(m.controller.getState().targetPlan?.outcomes.WP0).toMatchObject({
+      status: "failed", reason: "Engineer reported partially_completed",
+    });
+    expect(m.controller.getState().state).toBe("STOPPED");
+  });
+
   it("marks scoped remediation and its dependents failed when Engineer work is partial and Reviewer rejects", async () => {
     const m = make([target("WP0"), target("WP1", ["WP0"])]);
     await approve(m);
@@ -363,7 +413,7 @@ describe("AI Factory — persisted serial targets", () => {
     await flush();
     m.transport.completeLastPacket({ ...packets.remediate, affectedTargetIds: ["WP0"] });
     await flush();
-    m.transport.completeLastPacket({ ...packets.engineer, status: "partially_completed", workPackageId: "WP0" });
+    m.transport.completeLastPacket({ ...packets.engineer, status: "partially_completed", remainingWork: ["finish implementing the required behavior"], workPackageId: "WP0" });
     await flush();
     m.transport.completeLastPacket(packets.reviewerNeedsFix);
     await flush();

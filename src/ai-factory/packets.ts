@@ -226,7 +226,12 @@ const PACKET_SCHEMAS: Record<PacketKind, Record<string, unknown>> = {
     additionalProperties: false,
     required: ["status", "workPackageId", "summary"],
     properties: {
-      status: { type: "string", enum: ["completed", "partially_completed", "failed"] },
+      status: {
+        type: "string",
+        enum: ["completed", "partially_completed", "failed"],
+        description: "Implementation-assignment status only. completed means assigned work and required Engineer-side verification are done; it does not claim Reviewer or Architect approval, downstream targets, or mission acceptance. partially_completed means remainingWork contains actual unfinished assigned work.",
+      },
+      remainingWork: { ...strArr, description: "Concrete assigned-package implementation, defect, blocked subtask, or required test work still outstanding. Empty when the Engineer assignment is complete; never include future Reviewer/Architect or downstream gates." },
       workPackageId: { type: "string" },
       summary: { type: "string" },
       changedFiles: strArr,
@@ -591,8 +596,9 @@ function normalize(kind: PacketKind, raw: Record<string, unknown>): Packet | und
       const status = raw.status;
       if (status !== "completed" && status !== "partially_completed" && status !== "failed") return undefined;
       return {
-        status, workPackageId: str(raw.workPackageId), summary: str(raw.summary), changedFiles: strList(raw.changedFiles),
-        importantDecisions: strList(raw.importantDecisions), testsRun: strList(raw.testsRun), testResults: str(raw.testResults),
+        status, workPackageId: str(raw.workPackageId), summary: str(raw.summary),
+        ...(Array.isArray(raw.remainingWork) ? { remainingWork: strList(raw.remainingWork) } : {}),
+        changedFiles: strList(raw.changedFiles), importantDecisions: strList(raw.importantDecisions), testsRun: strList(raw.testsRun), testResults: str(raw.testResults),
         deviations: strList(raw.deviations), knownLimitations: strList(raw.knownLimitations),
         unresolvedQuestions: strList(raw.unresolvedQuestions), architecturalEscalationRequired: bool(raw.architecturalEscalationRequired),
       } satisfies EngineerPacket;

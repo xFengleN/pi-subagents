@@ -67,7 +67,7 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "execution.engineer": {
     required: ["status", "workPackageId", "summary", "changedFiles", "importantDecisions", "testsRun", "testResults", "deviations", "knownLimitations", "unresolvedQuestions", "architecturalEscalationRequired"],
-    optional: [],
+    optional: ["remainingWork"],
     kinds: ["engineer"],
   },
   "review.reviewer": {
@@ -107,7 +107,7 @@ const PHASE_PACKET_KEYS: Record<string, { required: string[]; optional: string[]
   },
   "remediation.engineer": {
     required: ["status", "workPackageId", "summary", "changedFiles", "importantDecisions", "testsRun", "testResults", "deviations", "knownLimitations", "unresolvedQuestions", "architecturalEscalationRequired"],
-    optional: [],
+    optional: ["remainingWork"],
     kinds: ["engineer"],
   },
   "remediation.reviewer": {
@@ -515,6 +515,7 @@ function validatePacket(value: unknown, phase: string, path: string, issues: str
   }
   if (value.constraints !== undefined && (!strings(value.constraints) || value.constraints.some((item) => item.trim() === ""))) issues.push(`${path}.constraints must be an array of non-empty strings`);
   if (value.requirementCatalog !== undefined && !spec.required.includes("requirementCatalog")) validateRequirementCatalog(value.requirementCatalog, value, `${path}.requirementCatalog`, issues);
+  if (value.remainingWork !== undefined && !strings(value.remainingWork)) issues.push(`${path}.remainingWork must be an array of strings`);
   if (value.warningFindings !== undefined) validateReportWarningFindings(value.warningFindings, `${path}.warningFindings`, issues);
   if (value.warningFindings !== undefined && Array.isArray(value.warningFindings) && strings(value.warnings)) {
     const expectedWarnings = value.warningFindings.filter(record).filter((item) => item.scope === "mission" && item.disposition === "active").map((item) => item.text);

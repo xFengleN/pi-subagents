@@ -1111,7 +1111,7 @@ describe("execution workflows", () => {
     const m = make("lean");
     await start(m);
     await complete(m, contract);
-    await complete(m, { ...engineer("wp-1"), status: "partially_completed" });
+    await complete(m, { ...engineer("wp-1"), status: "partially_completed", remainingWork: ["finish implementation"] });
     expect(m.controller.getState().state).toBe("STOPPED");
     expect(m.verified).toEqual([]);
     expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(1);

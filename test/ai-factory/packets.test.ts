@@ -51,9 +51,18 @@ describe("AI Factory — packets", () => {
     expect(parsePacket("final_report", JSON.stringify({ result: "PASS", summary: "Complete" }), undefined)).toBeUndefined();
   });
 
+  it("documents Engineer assignment-completion semantics in its output schema", () => {
+    const schema = packetSchema("engineer").schema;
+    expect(schema.properties).toHaveProperty("remainingWork");
+    expect(schema.required).not.toContain("remainingWork"); // old persisted/live packets remain parseable
+    expect(schema.properties.status.description).toContain("does not claim Reviewer or Architect approval");
+    expect(schema.properties.remainingWork.description).toContain("Empty when the Engineer assignment is complete");
+  });
+
   it("normalizes engineer packets including the escalation flag", () => {
     const packet = parsePacket("engineer", JSON.stringify({
       status: "completed",
+      remainingWork: [],
       workPackageId: "wp-1",
       summary: "done",
       architecturalEscalationRequired: true,

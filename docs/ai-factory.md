@@ -124,6 +124,13 @@ reaches into pi-subagents internals and never spawns through the model-mediated
 | Engineer | implements one work package, runs fundamental tests, returns a completion packet | yes, per run/repair | configured primary + permissive fallback chain |
 | Reviewer | independent implementation-correctness verdict (never architecture) | yes, per review | configured primary; quality-floor targets |
 
+Engineer packet status describes only its assigned implementation: `completed`
+means the implementation and required Engineer-side checks are done; it does not
+claim Reviewer/Architect approval, downstream target completion, or mission
+acceptance. `partially_completed` means concrete assigned-package work remains
+and must be itemized in `remainingWork`. Waiting for any later Factory gate is
+not implementation work and belongs in `unresolvedQuestions` instead.
+
 Child agents are spawned **isolated** (no parent extensions/skills/nested
 tools) with **fresh contexts** (`inheritContext` is never set). Each child must
 report through a `StructuredOutput` tool whose schema is the packet type it is
@@ -223,7 +230,15 @@ validation/recovery semantics and are never rewritten; new multi-target plans
 require the identity-aware assessment.
 
 The scheduler considers targets in declaration order, choosing the first whose
-prerequisites have Reviewer PASS evidence. One Engineer/Reviewer pair runs at a
+prerequisites have Reviewer PASS evidence. In FULL, an implementation-complete
+Engineer result proceeds to Reviewer; that Reviewer PASS finalizes the target.
+The controller narrowly normalizes a `partially_completed` packet only when
+its Engineer tests pass, it has no architectural escalation, and unresolved
+questions are exclusively future Factory gates. New packets must explicitly
+report an empty `remainingWork` list; legacy packets omitting that field are
+normalized only after Reviewer PASS and only with affirmative implementation
+summary evidence. Actual itemized remaining work is never cleared by Reviewer
+PASS. One Engineer/Reviewer pair runs at a
 time in the **same working tree**; there are no parallel worktrees or automatic
 integration merges. A target that exhausts its correction allowance fails,
 transitively blocks dependents, and does not prevent independent targets from

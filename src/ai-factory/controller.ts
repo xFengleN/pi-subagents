@@ -41,6 +41,7 @@ import { blockFailedDependencies, createTargetPlan, dependentsInOrder, nextEligi
 import { type AgentSettleInfo, classifyError, type FactoryTransport, type SpawnRequest } from "./transport.js";
 import {
   type ArchitectInitialResult,
+  type EngineerPacket,
   type ExecutionContractPacket,
   FACTORY_STATE_VERSION,
   type FactoryAttempt,
@@ -54,6 +55,7 @@ import {
   type IntegratedReviewPacket,
   type LeadEscalationPacket,
   type LeadIntegrationPacket,
+  type Packet,
   type ReviewerOutcome,
   type ReviewerPacket,
   ROLE_NAMES,
@@ -572,14 +574,15 @@ export class FactoryController {
     }
 
     const kind = this.kindForPhase(phase);
-    const packet = parsePacketTyped(kind, info.structuredJson, info.result);
-    if (!packet) {
+    const parsedPacket = parsePacketTyped(kind, info.structuredJson, info.result);
+    if (!parsedPacket) {
       this.commit();
       // A known settled invalid packet gets one bounded same-target retry.
       // Engineer retries inspect and preserve the possibly modified workspace.
       this.handlePhaseFailure(phase, role, "agent completed but produced no usable packet", "hard", { noPacketRetry: true, childStarted: true });
       return;
     }
+    const packet = normalizeEngineerPacketStatus(phase, parsedPacket);
 
     // Store the packet before marking the attempt validated. If packet storage
     // itself terminally rejects the result, its commit retains the fail-closed
@@ -760,6 +763,12 @@ export class FactoryController {
         }
         if (s.targetPlan && reviewer.outcome.packet.verdict === "PASS") {
           const engineer = lastExecutionEngineer(s);
+          if (engineer?.outcome.packet.status === "partially_completed"
+            && reviewer.outcome.packet.blockingFindings.length === 0
+            && reviewer.outcome.packet.requiredRepairs.length === 0
+            && !reviewer.outcome.packet.architecturalIssue) {
+            engineer.outcome.packet = normalizeEngineerPacketStatus("execution.engineer", engineer.outcome.packet, true) as EngineerPacket;
+          }
           const id = s.targetPlan.currentTargetId!;
           if (engineer?.outcome.packet.status !== "completed") {
             s.targetPlan.outcomes[id] = { status: "failed", reason: `Engineer reported ${engineer?.outcome.packet.status ?? "no result"}`, engineerAgentId: engineer?.outcome.agentId, reviewerAgentId: reviewer.outcome.agentId };
@@ -808,6 +817,11 @@ export class FactoryController {
         const rem = s.results.remediation;
         if (!rem?.engineer) return { kind: "spawn", phase: "remediation.engineer" };
         if (!rem?.reviewer) return { kind: "spawn", phase: "remediation.reviewer" };
+        if (rem.engineer.packet.status === "partially_completed" && rem.reviewer.packet.verdict === "PASS"
+          && rem.reviewer.packet.blockingFindings.length === 0 && rem.reviewer.packet.requiredRepairs.length === 0
+          && !rem.reviewer.packet.architecturalIssue) {
+          rem.engineer.packet = normalizeEngineerPacketStatus("remediation.engineer", rem.engineer.packet, true) as EngineerPacket;
+        }
         if (rem.engineer.packet.status !== "completed" || rem.reviewer.packet.verdict !== "PASS") {
           return this.failRemediation("Remediation was not completed and Reviewer-approved");
         }
@@ -2108,6 +2122,21 @@ export class FactoryController {
 }
 
 /* ------------------------------------------------------------------ */
+
+function normalizeEngineerPacketStatus(phase: string, packet: Packet, reviewerPassed = false): Packet {
+  if (phase !== "execution.engineer" && phase !== "remediation.engineer") return packet;
+  const engineer = packet as EngineerPacket;
+  if (engineer.status !== "partially_completed" || engineer.remainingWork?.length || engineer.architecturalEscalationRequired
+    || engineer.testsRun.length === 0 || (engineer.remainingWork === undefined && !reviewerPassed)) return packet;
+  const testResults = engineer.testResults.trim().toLowerCase();
+  if (!/\b(?:pass(?:ed)?|success(?:ful)?)\b/.test(testResults)
+    || /\b(?:fail(?:ed|ure)?|error|not pass|did not pass)\b/.test(testResults)) return packet;
+  const gateOnlyQuestion = /(?:review(?:er)?|architect|approval|acceptance|downstream|integration|mission)/i;
+  const futureGate = /(?:pending|wait(?:ing)?|not yet|has not|will .* accept|await)/i;
+  if (!engineer.unresolvedQuestions.every((question) => gateOnlyQuestion.test(question) && futureGate.test(question))) return packet;
+  if (engineer.remainingWork === undefined && !/\b(?:complete(?:d)?|finished|implemented|done|added|verified)\b/i.test(engineer.summary)) return packet;
+  return { ...engineer, status: "completed" };
+}
 
 function lastExecutionEngineer(s: FactoryRunState) {
   return [...s.results.engineers].reverse().find((item) => !s.targetPlan || item.targetId === s.targetPlan.currentTargetId);

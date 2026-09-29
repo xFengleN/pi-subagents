@@ -167,7 +167,10 @@ export interface FactoryVerificationResult {
 }
 
 export interface EngineerPacket {
+  /** Completion of this implementation assignment only, not downstream approval gates. */
   status: "completed" | "partially_completed" | "failed";
+  /** Actual assigned-package work that remains; empty means implementation work is complete. Optional for historical packets. */
+  remainingWork?: string[];
   workPackageId: string;
   summary: string;
   changedFiles: string[];

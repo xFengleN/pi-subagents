@@ -155,7 +155,11 @@ export function engineerPrompt(input: {
   }
   parts.push(
     ``,
-    `Implement the work package, run the fundamental tests, and report a compact completion packet: status, workPackageId, summary, changedFiles, importantDecisions, testsRun, testResults, deviations, knownLimitations, unresolvedQuestions, and architecturalEscalationRequired (true only if the architecture itself is wrong).`,
+    `Engineer status describes ONLY this assigned implementation work package. Use completed when the assigned implementation is complete, required Engineer-side verification has been performed, and no known blocking implementation work remains. completed does NOT claim Reviewer or Architect approval, completion of downstream targets, or mission acceptance; those are later Factory gates. Use partially_completed only when concrete assigned-package work still remains (unfinished implementation, missing required test, known defect, or blocked subtask). Do NOT use it because Reviewer, Architect, Integrated Reviewer, Final Architect, downstream work, or mission acceptance is pending. Use failed only when the assignment could not be performed.`,
+    ``,
+    `List each concrete unfinished assigned-package item in remainingWork; use [] when none remains. Run required Engineer-side checks before declaring completion, and report their actual outcomes. Put future-gate questions in unresolvedQuestions without changing implementation status. Set architecturalEscalationRequired only when the approved architecture itself is wrong.`,
+    ``,
+    `Implement the work package, run the fundamental tests, and report a compact completion packet: status, remainingWork, workPackageId, summary, changedFiles, importantDecisions, testsRun, testResults, deviations, knownLimitations, unresolvedQuestions, and architecturalEscalationRequired.`,
     ``,
     STRUCTURED,
   );

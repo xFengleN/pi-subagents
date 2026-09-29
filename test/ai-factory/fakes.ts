@@ -216,6 +216,7 @@ export const packets = {
   correct: { verdict: "CORRECT", approvedArchitecture: "corrected architecture: two modules", constraints: [], correctedWorkPackages: ["wp-1"], importantRisks: [] },
   engineer: {
     status: "completed",
+    remainingWork: [],
     workPackageId: "wp-1",
     summary: "implemented widgets",
     changedFiles: ["src/widgets.ts"],
