@@ -20,6 +20,14 @@ describe("deterministic target verification", () => {
     expect(await verifyFactoryTarget(dir, "T1", { command: "exit 7", evidence: "check" })).toMatchObject({ status: "failed", evidence: expect.stringContaining("exit=7") });
   });
 
+  it("preserves shell environment assignments, including quoted paths, when executing checks", async () => {
+    const dir = cwd();
+    const command = "FOO='/path with spaces/runtime' node -e 'process.stdout.write(process.env.FOO)'";
+    expect(await verifyFactoryTarget(dir, "T1", { command, evidence: "runtime check" })).toMatchObject({
+      status: "passed", command, evidence: expect.stringContaining("/path with spaces/runtime"),
+    });
+  });
+
   it("runs deterministic checks despite separate post-implementation owner acceptance", async () => {
     const dir = cwd();
     expect(await verifyFactoryTarget(dir, "T1", {

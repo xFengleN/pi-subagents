@@ -318,10 +318,11 @@ describe("AI Factory — persisted serial targets", () => {
     expect(m.transport.spawned.at(-1)?.prompt).toContain("Work package: WP1");
     m.controller.stop("Operator stopped before dependent revalidation");
     const report = formatFactoryReport(m.controller.getState());
-    expect(report).toContain("WP1: revalidating");
-    expect(report).toContain("WP2: awaiting revalidation");
+    expect(report).toContain("WP1: failed");
+    expect(report).toContain("WP2: blocked");
     expect(report).toContain("completed and reviewed: 1");
-    expect(report).toContain("awaiting revalidation: 2");
+    expect(report).toContain("awaiting revalidation: 0");
+    expect(m.controller.getState().targetPlan?.currentTargetId).toBeUndefined();
     expect(report).not.toContain("WP2: passed");
   });
 

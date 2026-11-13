@@ -65,15 +65,15 @@ const integratedRepairT2 = { verdict: "REPAIR_REQUIRED", affectedTargetIds: ["wp
 const conformanceAccept = { verdict: "ACCEPT", blockingIssues: [], requiredChanges: [], doNotChange: [], requiredEvidence: [] };
 const conformanceRejectT2 = { verdict: "NEEDS_REMEDIATION", affectedTargetIds: ["wp-2"], integrationOnly: false, blockingIssues: ["wp-2 needs repair"], requiredChanges: ["repair wp-2"], doNotChange: [], requiredEvidence: [] };
 
-function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" | ((id: string) => "passed" | "failed" | "owner_pending" | "unavailable") = "passed", config = defaultFactoryConfig()) {
+function make(mode: "lean" | "verified_execution", verificationStatus: "passed" | "failed" | "owner_pending" | "unavailable" | ((id: string) => "passed" | "failed" | "owner_pending" | "unavailable") = "passed", config = defaultFactoryConfig(), task = "Implement the widget") {
   const transport = new FakeTransport();
   const clock = new FakeClock();
   const store = tempStore();
   const verified: string[] = [];
   const controller = FactoryController.create({
     transport, clock, store: store.store, config,
-    verifyTarget: async (_cwd, id) => { verified.push(id); return { status: typeof verificationStatus === "function" ? verificationStatus(id) : verificationStatus, evidence: `verified ${id}`, command: "true" }; },
-  }, `execution-${mode}`, "Implement the widget", store.dir, mode);
+    verifyTarget: async (_cwd, id, instruction) => { verified.push(id); return { status: typeof verificationStatus === "function" ? verificationStatus(id) : verificationStatus, evidence: `verified ${id}`, command: instruction.command }; },
+  }, `execution-${mode}`, task, store.dir, mode);
   return { transport, controller, store, verified, clock };
 }
 
@@ -172,17 +172,127 @@ describe("execution workflows", () => {
     m.controller.dispose();
     m.store.cleanup();
   });
-  it("does not advance a dependent target after failed or unavailable deterministic verification", async () => {
-    for (const status of ["failed", "unavailable"] as const) {
-      const m = make("lean", status);
-      await start(m);
-      await complete(m, contract);
-      await complete(m, engineer("wp-1"));
-      expect(m.controller.getState().state).toBe("STOPPED");
-      expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(1);
-      expect(phases(m)).not.toContain("integrated.review");
-      m.store.cleanup();
-    }
+  it.each(["lean", "verified_execution"] as const)("fails and blocks dependent targets after %s target verification fails", async (mode) => {
+    const m = make(mode, "failed");
+    await start(m);
+    await complete(m, contract);
+    const agentId = m.controller.getState().inFlight?.agentId;
+    await complete(m, engineer("wp-1"));
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toContain("Target wp-1 verification failed: verified wp-1");
+    expect(state.targetPlan?.currentTargetId).toBeUndefined();
+    expect(state.targetPlan?.outcomes["wp-1"]).toMatchObject({ status: "failed", engineerAgentId: agentId, verification: { status: "failed", evidence: "verified wp-1", command: "true" } });
+    expect(state.targetPlan?.outcomes["wp-2"]).toMatchObject({ status: "blocked", blockedBy: ["wp-1"] });
+    expect(m.store.store.load(state.runId)?.targetPlan).toEqual(state.targetPlan);
+    expect(formatFactoryReport(state)).toContain("1 failed · 1 blocked");
+    expect(formatFactoryReport(state)).toContain("verified wp-1");
+    expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(1);
+    expect(phases(m)).not.toContain("integrated.review");
+    expect(phases(m)).not.toContain("conformance.architect");
+    m.store.cleanup();
+  });
+
+  it("retains thrown verification evidence and fails the target without retrying an Engineer", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await complete(m, contract);
+    const state = m.controller.getState();
+    // Exercise the verifier rejection branch with a dedicated restored controller below.
+    m.controller.dispose();
+    const transport = new FakeTransport();
+    const restored = FactoryController.restore({ transport, clock: new FakeClock(), store: m.store.store, config: defaultFactoryConfig(), verifyTarget: async () => { throw new Error("runtime unavailable"); } }, state.runId, { resume: false })!;
+    expect(restored.resumeWithApproval(restored.getRecoveryEligibility().checkpointId).kind).toBe("ok");
+    await flush();
+    transport.completeLastPacket(engineer("wp-1"));
+    await flush();
+    await flush();
+    const stopped = restored.getState();
+    expect(stopped.state).toBe("STOPPED");
+    expect(stopped.stoppedReason).toContain("runtime unavailable");
+    expect(stopped.targetPlan?.outcomes["wp-1"].verification).toMatchObject({ status: "failed", evidence: "Verification failed: runtime unavailable" });
+    expect(stopped.targetPlan?.outcomes["wp-2"].status).toBe("blocked");
+    expect(transport.spawned.filter((item) => item.phase === "execution.engineer")).toHaveLength(1);
+    restored.dispose();
+    m.store.cleanup();
+  });
+
+  it("preserves an explicit environment-prefixed owner verification command through execution", async () => {
+    const command = "FOO=/path/to/runtime npm run test:specific";
+    const m = make("verified_execution", "passed", defaultFactoryConfig(), `Implement the widget. Verify with \`${command}\`.`);
+    await start(m);
+    await complete(m, { ...contract, verification: { ...contract.verification, "wp-1": { command, evidence: "specific check" } } });
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    await complete(m, engineer("wp-1"));
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].verification?.command).toBe(command);
+    expect(m.controller.getState().results.executionProposal?.packet.verification["wp-1"].command).toBe(command);
+    m.store.cleanup();
+  });
+
+  it("rejects generic repo checks replacing a concrete owner command before Engineer dispatch", async () => {
+    const command = "FOO=/path/to/runtime npm run test:specific";
+    const m = make("verified_execution", "passed", defaultFactoryConfig(), `Verify using \`${command}\` rather than a generic repo test.`);
+    await start(m);
+    await complete(m, { ...contract, verification: { "wp-1": { command: "npm test", evidence: "generic test" }, "wp-2": contract.verification["wp-2"] } });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain(command);
+    expect(m.verified).toEqual([]);
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
+  it("does not replace a specific owner command without an environment prefix with npm test", async () => {
+    const m = make("lean", "passed", defaultFactoryConfig(), "Verify with `npm run test:specific` after implementation.");
+    await start(m);
+    await complete(m, { ...contract, verification: { ...contract.verification, "wp-1": { command: "npm test", evidence: "generic check" } } });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("npm run test:specific");
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
+  it("retains concrete verification commands supplied in a shell block", async () => {
+    const command = "FOO='/path with spaces/runtime' npm run test:specific";
+    const m = make("lean", "passed", defaultFactoryConfig(), `Verify with:\n\`\`\`sh\n${command}\n\`\`\``);
+    await start(m);
+    await complete(m, { ...contract, verification: { ...contract.verification, "wp-1": { command: "npm test", evidence: "generic check" } } });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain(command);
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
+  it("does not require a command the owner explicitly ruled out", async () => {
+    const command = "npm run test:specific";
+    const m = make("lean", "passed", defaultFactoryConfig(), `Verify with \`${command}\`, not \`npm test\`.`);
+    await start(m);
+    await complete(m, { ...contract, verification: { ...contract.verification, "wp-1": { command, evidence: "specific check" } } });
+    expect(m.controller.getState().state).toBe("EXECUTION");
+    m.store.cleanup();
+  });
+
+  it("requires separately specified verification environment on applicable commands", async () => {
+    const m = make("verified_execution", "passed", defaultFactoryConfig(), "Required for browser verification: `RUNTIME_PATH=\"/path with spaces/runtime\"`. Run browser tests after implementation.");
+    await start(m);
+    await complete(m, { ...contract, verification: { "wp-1": { command: "npm test", evidence: "browser check" }, "wp-2": { command: "npm test", evidence: "browser check" } } });
+    expect(m.controller.getState().state).toBe("STOPPED");
+    expect(m.controller.getState().stoppedReason).toContain("RUNTIME_PATH=\"/path with spaces/runtime\"");
+    expect(phases(m)).not.toContain("execution.engineer");
+    m.store.cleanup();
+  });
+
+  it("accepts a separate required environment when all applicable checks retain it", async () => {
+    const prefix = "RUNTIME_PATH=\"/path with spaces/runtime\"";
+    const m = make("lean", "passed", defaultFactoryConfig(), `Required for verification: \`${prefix}\`.`);
+    await start(m);
+    await complete(m, { ...contract, verification: {
+      "wp-1": { command: `${prefix} npm test -- foundation`, evidence: "foundation check" },
+      "wp-2": { command: `${prefix} npm test -- integration`, evidence: "integration check" },
+    } });
+    await complete(m, engineer("wp-1"));
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].verification?.command).toBe(`${prefix} npm test -- foundation`);
+    expect(m.controller.getState().targetPlan?.outcomes["wp-1"].status).toBe("passed");
+    m.store.cleanup();
   });
 
   it("normalizes the reproduced VERIFIED EXECUTION per-target Architect gate and continues", async () => {
@@ -1103,20 +1213,47 @@ describe("execution workflows", () => {
     expect(m.controller.getState().errors.at(-1)?.message).toContain("P20-A");
     expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(3);
     expect(m.controller.getState().targetPlan?.outcomes["P19D3-A"].status).toBe("passed");
-    expect(m.controller.getState().targetPlan?.outcomes["P20-A"].status).not.toBe("passed");
+    expect(m.controller.getState().targetPlan?.outcomes["P20-A"].status).toBe("failed");
+    expect(m.controller.getState().targetPlan?.currentTargetId).toBeUndefined();
+    expect(Object.values(m.store.store.load(m.controller.getRunId())?.targetPlan?.outcomes ?? {}).some((outcome) => outcome.status === "active")).toBe(false);
     m.store.cleanup();
   });
 
-  it("stops an incomplete Engineer before target verification or the dependent target", async () => {
-    const m = make("lean");
+  it.each(["lean", "verified_execution"] as const)("persists failed and blocked outcomes for an incomplete Engineer in %s", async (mode) => {
+    const m = make(mode);
     await start(m);
     await complete(m, contract);
+    const agentId = m.controller.getState().inFlight?.agentId;
     await complete(m, { ...engineer("wp-1"), status: "partially_completed", remainingWork: ["finish implementation"] });
-    expect(m.controller.getState().state).toBe("STOPPED");
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toContain("Engineer did not complete wp-1");
+    expect(state.targetPlan?.currentTargetId).toBeUndefined();
+    expect(state.targetPlan?.outcomes["wp-1"]).toMatchObject({ status: "failed", engineerAgentId: agentId, reason: state.stoppedReason });
+    expect(state.targetPlan?.outcomes["wp-2"]).toMatchObject({ status: "blocked", blockedBy: ["wp-1"] });
+    expect(state.results.engineers.at(-1)?.outcome.packet).toMatchObject({ status: "partially_completed", remainingWork: ["finish implementation"] });
+    expect(m.store.store.load(state.runId)?.targetPlan).toEqual(state.targetPlan);
+    expect(formatFactoryReport(state)).toContain("1 failed · 1 blocked");
     expect(m.verified).toEqual([]);
     expect(phases(m).filter((phase) => phase === "execution.engineer")).toHaveLength(1);
+    expect(phases(m)).not.toContain("integrated.review");
     m.store.cleanup();
   });
+  it.each(["lean", "verified_execution"] as const)("terminalizes an active target when %s is manually stopped", async (mode) => {
+    const m = make(mode);
+    await start(m);
+    await complete(m, contract);
+    m.controller.stop("Owner stopped execution");
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.stoppedReason).toBe("Owner stopped execution");
+    expect(state.targetPlan?.currentTargetId).toBeUndefined();
+    expect(state.targetPlan?.outcomes["wp-1"].status).toBe("failed");
+    expect(state.targetPlan?.outcomes["wp-2"].status).toBe("blocked");
+    expect(Object.values(m.store.store.load(state.runId)?.targetPlan?.outcomes ?? {}).some((outcome) => outcome.status === "active")).toBe(false);
+    m.store.cleanup();
+  });
+
   it("completes LEAN without an invented Architect gate and verifies both dependent targets", async () => {
     const m = make("lean");
     await start(m);
@@ -1127,6 +1264,7 @@ describe("execution workflows", () => {
     expect(phases(m)).not.toContain("conformance.architect");
     await complete(m, packets.finalReport);
     expect(m.controller.getState().state).toBe("DONE");
+    expect(Object.values(m.store.store.load(m.controller.getRunId())?.targetPlan?.outcomes ?? {}).some((outcome) => outcome.status === "active")).toBe(false);
     expect(phases(m)).not.toContain("initial.architect");
     expect(phases(m)).not.toContain("review.reviewer");
     expect(phases(m)).not.toContain("conformance.architect");
@@ -1184,6 +1322,25 @@ describe("execution workflows", () => {
     await complete(m, integratedPass);
     await complete(m, { ...conformanceRejectT2, blockingIssues: ["still broken"] });
     expect(m.controller.getState().state).toBe("STOPPED");
+    m.store.cleanup();
+  });
+
+  it("invalidates a remediated target when its Engineer reports remaining work", async () => {
+    const m = make("verified_execution");
+    await start(m);
+    await completeTwoTargets(m);
+    await complete(m, integratedPass);
+    await complete(m, packets.integration);
+    await complete(m, conformanceRejectT2);
+    await complete(m, { ...engineer("wp-2"), status: "partially_completed", remainingWork: ["finish remediation"] });
+    const state = m.controller.getState();
+    expect(state.state).toBe("STOPPED");
+    expect(state.targetPlan?.currentTargetId).toBeUndefined();
+    expect(state.targetPlan?.outcomes["wp-1"].status).toBe("passed");
+    expect(state.targetPlan?.outcomes["wp-2"]).toMatchObject({ status: "failed", reason: "Scoped remediation failed: Engineer did not complete wp-2" });
+    expect(state.results.remediation?.engineer?.packet).toMatchObject({ status: "partially_completed", remainingWork: ["finish remediation"] });
+    expect(m.verified).toEqual(["wp-1", "wp-2"]);
+    expect(phases(m)).not.toContain("conformance.recheck");
     m.store.cleanup();
   });
 

@@ -61,6 +61,7 @@ import {
   ROLE_NAMES,
   type RoleName,
 } from "./types.js";
+import { validateVerificationConstraints } from "./verification-constraints.js";
 import { verifyFactoryTarget } from "./verifier.js";
 import { type FactoryWorkflowMode, workflowMode, workflowPolicy } from "./workflow-policy.js";
 
@@ -602,7 +603,14 @@ export class FactoryController {
         return;
       }
       if ((packet as { status: string }).status !== "completed") {
-        this.stop(`Engineer did not complete ${this.state.targetPlan?.currentTargetId ?? "the target"}`);
+        const reason = `Engineer did not complete ${this.state.targetPlan?.currentTargetId ?? "the target"}`;
+        if (phase === "execution.engineer") {
+          this.markIncompleteExecutionTarget(reason);
+          this.stop(reason);
+        } else {
+          const action = this.failRemediation(reason);
+          this.applyTransition(action.to, action.note);
+        }
         return;
       }
       if (phase === "remediation.engineer" && this.state.results.finalArchitect?.packet.integrationOnly) void this.drive();
@@ -901,7 +909,11 @@ export class FactoryController {
         const engineer = lastExecutionEngineer(s);
         const outcome = plan.outcomes[plan.currentTargetId];
         if (!engineer || engineer.round !== s.repairRound || engineer.outcome.agentId !== outcome.engineerAgentId) return { kind: "spawn", phase: "execution.engineer" };
-        if (engineer.outcome.packet.status !== "completed") return { kind: "transition", to: "STOPPED", note: `Engineer did not complete target ${plan.currentTargetId}` };
+        if (engineer.outcome.packet.status !== "completed") {
+          const reason = `Engineer did not complete target ${plan.currentTargetId}`;
+          this.markIncompleteExecutionTarget(reason);
+          return { kind: "transition", to: "STOPPED", note: reason };
+        }
         if (engineer.outcome.packet.architecturalEscalationRequired) return { kind: "transition", to: "STOPPED", note: `Engineer flagged an architectural escalation for ${plan.currentTargetId}; ${workflowPolicy(this.workflow).displayName} has no per-target Architect gate, so execution stopped with the workspace preserved` };
         const verification = plan.outcomes[plan.currentTargetId].verification;
         if (!verification && !this.verificationPending) {
@@ -909,7 +921,11 @@ export class FactoryController {
           return undefined;
         }
         if (!verification) return undefined;
-        if (verification.status !== "passed") return { kind: "transition", to: "STOPPED", note: `Target ${plan.currentTargetId} verification ${verification.status}; owner approval is not automatic` };
+        if (verification.status !== "passed") {
+          const reason = `Target ${plan.currentTargetId} verification ${verification.status}: ${verification.evidence}; owner approval is not automatic`;
+          this.markIncompleteExecutionTarget(reason);
+          return { kind: "transition", to: "STOPPED", note: reason };
+        }
         plan.outcomes[plan.currentTargetId].status = "passed";
         plan.currentTargetId = undefined;
         return { kind: "transition", to: "EXECUTION" };
@@ -1065,6 +1081,22 @@ export class FactoryController {
     return undefined;
   }
 
+  /** A validated incomplete packet is terminal in execution profiles, not an active target awaiting dispatch. */
+  private markIncompleteExecutionTarget(reason: string): void {
+    const plan = this.state.targetPlan;
+    const id = plan?.currentTargetId;
+    if (!plan || !id) return;
+    plan.outcomes[id] = { ...plan.outcomes[id], status: "failed", reason };
+    for (const dependent of dependentsInOrder(plan, id)) {
+      if (plan.outcomes[dependent.id].status === "passed") {
+        plan.outcomes[dependent.id] = { status: "blocked", blockedBy: [id], reason: `Prerequisite ${id} did not pass` };
+      }
+    }
+    plan.currentTargetId = undefined;
+    plan.revalidationIds = undefined;
+    blockFailedDependencies(plan);
+  }
+
   /** Mark a single exhausted target without discarding independent work. */
   private failTargetOrStop(reason: string): { kind: "transition"; to: FactoryRunState["state"]; note: string } {
     const plan = this.state.targetPlan;
@@ -1102,7 +1134,7 @@ export class FactoryController {
   }
 
   /** Invalidate stale target PASS evidence when scoped remediation fails. */
-  private failRemediation(reason: string): Action {
+  private failRemediation(reason: string): { kind: "transition"; to: "STOPPED"; note: string } {
     const plan = this.state.targetPlan;
     const id = this.state.results.finalArchitect?.packet.affectedTargetIds?.[0]
       ?? plan?.currentTargetId
@@ -1747,6 +1779,7 @@ export class FactoryController {
         }
         if (Object.keys(contract.verification).length !== targets.length || targets.some((target) => !contract.verification[target.id])) errors.push("Execution contract must define verification for every target");
         if (Object.keys(contract.verification).some((id) => !ids.has(id))) errors.push("Execution contract contains verification for an unknown target");
+        errors.push(...validateVerificationConstraints(s.task, contract));
         const runVerificationNames = (contract.runVerification ?? []).map((check) => check.name.trim().toLowerCase());
         if (new Set(runVerificationNames).size !== runVerificationNames.length) errors.push("Execution contract contains duplicate run-level verification names");
         for (const [targetId, reason] of Object.entries(contract.blockingHumanDependencies ?? {})) {
@@ -1981,6 +2014,26 @@ export class FactoryController {
     assertTransition(from, to, this.workflow);
     if (to === "ARCHITECT_ESCALATION") this.state.results.escalationArchitect = undefined;
     if (to === "STOPPED" && note?.trim()) this.state.stoppedReason = note.trim();
+    if (isTerminal(to) && this.state.targetPlan) {
+      const plan = this.state.targetPlan;
+      const active = plan.targets.filter((target) => plan.outcomes[target.id].status === "active");
+      if (to === "DONE" && active.length > 0) throw new Error(`Cannot complete Factory run with active targets: ${active.map((target) => target.id).join(", ")}`);
+      for (const target of active) {
+        const reason = this.state.stoppedReason ?? `Run ${to} while target ${target.id} was active`;
+        plan.outcomes[target.id] = { ...plan.outcomes[target.id], status: "failed", reason };
+        for (const dependent of dependentsInOrder(plan, target.id)) {
+          if (plan.outcomes[dependent.id].status === "passed") {
+            plan.outcomes[dependent.id] = { status: "blocked", blockedBy: [target.id], reason: `Prerequisite ${target.id} did not pass` };
+          }
+        }
+      }
+      if (active.length > 0) {
+        plan.currentTargetId = undefined;
+        plan.revalidationIds = undefined;
+        blockFailedDependencies(plan);
+        if (to === "STOPPED" && !this.state.stoppedReason) this.state.stoppedReason = `Run stopped with incomplete targets: ${active.map((target) => target.id).join(", ")}`;
+      }
+    }
     if (from === "WAITING_CAPACITY") {
       this.state.waiting = undefined;
       this.state.parked = false;

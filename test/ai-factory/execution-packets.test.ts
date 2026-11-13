@@ -283,6 +283,10 @@ describe("execution workflow packets and prompts", () => {
     expect(execution).toContain("invent pseudo-target IDs such as live-preview");
     expect(execution).toContain("Integrated Reviewer is a configured LLM gate, not owner/manual sign-off");
     expect(execution).toContain("missionRequirements");
+    expect(execution).toContain("Copy a concrete requested command verbatim");
+    expect(execution).toContain("including its environment assignments, quoted paths, arguments, and executable");
+    expect(execution).toContain("Never replace a specific owner command with a generic npm test");
+    expect(execution).toContain("include that environment in every applicable planned verification command");
     expect(execution).toContain("scoped to their target");
     expect(execution).toContain("no initial or per-target Architect gate");
     expect(execution).toContain("Final integrated acceptance belongs to the configured final Architect");
